@@ -1,0 +1,7 @@
+[
+{
+  "directory": "D:/TFC/SunProject_100825/SunProject/app/.cxx/Debug/t4f2n4r6/arm64-v8a",
+  "command": "C:\\Users\\CRISTI~1\\AppData\\Local\\Android\\Sdk\\ndk\\270~1.120\\TOOLCH~1\\llvm\\prebuilt\\WINDOW~1\\bin\\CLANG_~1.EXE --target=aarch64-none-linux-android24 --sysroot=\"C:/Users/Cristian Bedia/AppData/Local/Android/Sdk/ndk/27.0.12077973/toolchains/llvm/prebuilt/windows-x86_64/sysroot\" -Dpanorama_lib_EXPORTS -ID:/TFC/SunProject_100825/SunProject/third_party/opencv/sdk/native/jni/include -g -DANDROID -fdata-sections -ffunction-sections -funwind-tables -fstack-protector-strong -no-canonical-prefixes -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security  -std=c++17 -O3 -fno-limit-debug-info  -fPIC -fexceptions -frtti -o CMakeFiles\\panorama-lib.dir\\native-lib.cpp.o -c D:\\TFC\\SunProject_100825\\SunProject\\app\\src\\main\\cpp\\native-lib.cpp",
+  "file": "D:\\TFC\\SunProject_100825\\SunProject\\app\\src\\main\\cpp\\native-lib.cpp"
+}
+]

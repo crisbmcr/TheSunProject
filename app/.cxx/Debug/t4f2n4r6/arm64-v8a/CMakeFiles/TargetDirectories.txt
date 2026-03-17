@@ -1,0 +1,3 @@
+D:/TFC/SunProject_100825/SunProject/app/.cxx/Debug/t4f2n4r6/arm64-v8a/CMakeFiles/panorama-lib.dir
+D:/TFC/SunProject_100825/SunProject/app/.cxx/Debug/t4f2n4r6/arm64-v8a/CMakeFiles/edit_cache.dir
+D:/TFC/SunProject_100825/SunProject/app/.cxx/Debug/t4f2n4r6/arm64-v8a/CMakeFiles/rebuild_cache.dir

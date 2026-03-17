@@ -1,0 +1,27 @@
+{
+  "buildFiles": [
+    "D:\\TFC\\SunProject_100825\\SunProject\\app\\src\\main\\cpp\\CMakeLists.txt"
+  ],
+  "cleanCommandsComponents": [
+    [
+      "C:\\Users\\Cristian Bedia\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+      "-C",
+      "D:\\TFC\\SunProject_100825\\SunProject\\app\\.cxx\\Debug\\t4f2n4r6\\arm64-v8a",
+      "clean"
+    ]
+  ],
+  "buildTargetsCommandComponents": [
+    "C:\\Users\\Cristian Bedia\\AppData\\Local\\Android\\Sdk\\cmake\\3.22.1\\bin\\ninja.exe",
+    "-C",
+    "D:\\TFC\\SunProject_100825\\SunProject\\app\\.cxx\\Debug\\t4f2n4r6\\arm64-v8a",
+    "{LIST_OF_TARGETS_TO_BUILD}"
+  ],
+  "libraries": {
+    "panorama-lib::@6890427a1f51a3e7e1df": {
+      "artifactName": "panorama-lib",
+      "abi": "arm64-v8a",
+      "output": "D:\\TFC\\SunProject_100825\\SunProject\\app\\build\\intermediates\\cxx\\Debug\\t4f2n4r6\\obj\\arm64-v8a\\libpanorama-lib.so",
+      "runtimeFiles": []
+    }
+  }
+}

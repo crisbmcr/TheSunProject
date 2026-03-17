@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Usamos un CoordinatorLayout para alinear correctamente el botón flotante -->
+<androidx.coordinatorlayout.widget.CoordinatorLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    tools:context=".MainActivity">
+
+    <!-- Un texto simple para dar la bienvenida al usuario -->
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:text="Listo para iniciar la captura 360"
+        android:textColor="@android:color/white"
+        android:textSize="20sp"
+        android:textAlignment="center"
+        android:layout_marginBottom="40dp"/>
+
+    <!-- El botón flotante para iniciar la CaptureActivity -->
+    <com.google.android.material.floatingactionbutton.FloatingActionButton
+        android:id="@+id/startCaptureButton"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_margin="24dp"
+        android:src="@android:drawable/ic_menu_camera"
+        app:tint="@android:color/white"
+        android:contentDescription="Iniciar captura 360" />
+
+</androidx.coordinatorlayout.widget.CoordinatorLayout>
