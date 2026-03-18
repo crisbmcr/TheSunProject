@@ -44,4 +44,18 @@ class AtlasBuildUseCase(
         atlas.writePng(out)
         return out
     }
+
+    fun buildProjectedAtlas(sessionDir: File): File {
+        val paths = store.createSessionPaths(sessionDir)
+        val frames = store.loadFrames(paths).sortedBy { it.shotIndex }
+
+        require(frames.isNotEmpty()) { "No hay frames en la sesión." }
+
+        val atlas = newAtlas()
+        AtlasProjector.projectFramesToAtlas(frames, atlas)
+
+        val out = File(paths.atlasDir, "atlas_projected_all.png")
+        atlas.writePng(out)
+        return out
+    }
 }

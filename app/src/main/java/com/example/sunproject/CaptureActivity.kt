@@ -113,6 +113,23 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var sessionPitchAnchorDeg: Float? = null
     private var sessionRollAnchorDeg: Float? = null
 
+    private data class AngleFilterState(
+        var yawX: Float = 1f,
+        var yawY: Float = 0f,
+        var pitch: Float = 0f,
+        var roll: Float = 0f,
+        var initialized: Boolean = false
+    )
+
+    private val displayFilter = AngleFilterState()
+    private val captureFilter = AngleFilterState()
+
+    private var lastSensorTsNs: Long = 0L
+
+    private var displayAzimuth = 0f
+    private var displayPitchDeg = 0f
+    private var displayRollDeg = 0f
+
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
@@ -194,7 +211,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             if (capturedFiles.isEmpty()) {
                 Toast.makeText(this, "Captura al menos una foto primero", Toast.LENGTH_SHORT).show()
             } else {
-                openProjectedSingleFrame(0)
+                openProjectedAtlasAll()
             }
             true
         }
@@ -762,6 +779,33 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         else -> "H0"
     }
 
+    private fun openProjectedAtlasAll() {
+        val dir = sessionDir ?: ensureSessionDir()
+
+        cameraExecutor.execute {
+            try {
+                val atlasFile = atlasBuildUseCase.buildProjectedAtlas(dir)
+
+                runOnUiThread {
+                    Toast.makeText(this, "Atlas multi-frame generado", Toast.LENGTH_SHORT).show()
+                    startActivity(
+                        Intent(this, AnalysisActivity::class.java).apply {
+                            putExtra("panorama_path", atlasFile.absolutePath)
+                        }
+                    )
+                }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Error generando atlas multi-frame: ${t.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
@@ -804,6 +848,53 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
             }
         }
+    }
+
+    private fun normalize360(deg: Float): Float {
+        var v = deg % 360f
+        if (v < 0f) v += 360f
+        return v
+    }
+
+    private fun angleDeltaDeg(a: Float, b: Float): Float {
+        var d = normalize360(a) - normalize360(b)
+        if (d > 180f) d -= 360f
+        if (d < -180f) d += 360f
+        return d
+    }
+
+    private fun adaptiveAlpha(dtSec: Float, tauSec: Float): Float {
+        return (1f - kotlin.math.exp(-dtSec / tauSec)).coerceIn(0.01f, 1f)
+    }
+
+    private fun filterAngles(
+        state: AngleFilterState,
+        rawAzimuth: Float,
+        rawPitch: Float,
+        rawRoll: Float,
+        alpha: Float
+    ): FloatArray {
+        val rawYawX = kotlin.math.cos(Math.toRadians(rawAzimuth.toDouble())).toFloat()
+        val rawYawY = kotlin.math.sin(Math.toRadians(rawAzimuth.toDouble())).toFloat()
+
+        if (!state.initialized) {
+            state.yawX = rawYawX
+            state.yawY = rawYawY
+            state.pitch = rawPitch
+            state.roll = rawRoll
+            state.initialized = true
+        } else {
+            state.yawX += alpha * (rawYawX - state.yawX)
+            state.yawY += alpha * (rawYawY - state.yawY)
+            state.pitch += alpha * (rawPitch - state.pitch)
+            state.roll += alpha * (rawRoll - state.roll)
+        }
+
+        val yaw = normalize360(
+            Math.toDegrees(kotlin.math.atan2(state.yawY.toDouble(), state.yawX.toDouble())).toFloat()
+        )
+
+        return floatArrayOf(yaw, state.pitch, state.roll)
     }
 
     private fun openProjectedSingleFrame(frameIndex: Int = 0) {

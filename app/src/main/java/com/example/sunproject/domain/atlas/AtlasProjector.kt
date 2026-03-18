@@ -1,5 +1,6 @@
 package com.example.sunproject.domain.atlas
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import com.example.sunproject.data.model.FrameRecord
 import kotlin.math.abs
@@ -36,6 +37,33 @@ object AtlasProjector {
 
     fun projectSingleFrameToAtlas(frame: FrameRecord, atlas: SkyAtlas) {
         val src = BitmapFactory.decodeFile(frame.originalPath) ?: return
+        try {
+            val frameWeight = qualityWeightForFrame(frame)
+            projectBitmapToAtlas(frame, src, atlas, frameWeight)
+        } finally {
+            src.recycle()
+        }
+    }
+
+    fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
+        frames.sortedBy { it.shotIndex }.forEach { frame ->
+            val src = BitmapFactory.decodeFile(frame.originalPath) ?: return@forEach
+            try {
+                val frameWeight = qualityWeightForFrame(frame)
+                projectBitmapToAtlas(frame, src, atlas, frameWeight)
+            } finally {
+                src.recycle()
+            }
+        }
+    }
+
+    private fun projectBitmapToAtlas(
+        frame: FrameRecord,
+        src: Bitmap,
+        atlas: SkyAtlas,
+        frameWeight: Float
+    ) {
+        if (frameWeight <= 0f) return
 
         val hfov = (frame.hfovDeg ?: 65f).coerceIn(1f, 179f)
         val vfov = (frame.vfovDeg ?: 50f).coerceIn(1f, 179f)
@@ -49,8 +77,7 @@ object AtlasProjector {
 
         val pitchRad = Math.toRadians(frame.measuredPitchDeg.toDouble()).toFloat()
 
-        // En esta primera versión conviene invertir el signo para compensar la forma
-        // en que ya estás nivelando el overlay visual con canvas.rotate(-cameraRoll).
+        // Mantengo la misma convención de la fase 2
         val rollRad = Math.toRadians((-frame.measuredRollDeg).toDouble()).toFloat()
 
         val forward = worldDirectionRad(yawRad, pitchRad)
@@ -70,46 +97,85 @@ object AtlasProjector {
         val right = normalize(add(scale(right0, cosR), scale(up0, sinR)))
         val up = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
 
-        for (y in 0 until atlas.height) {
-            val altDeg = AtlasMath.yToAltitude(y, atlas.config)
-            val altRad = Math.toRadians(altDeg.toDouble()).toFloat()
+        val fp = approximateFootprint(frame)
+        val yTop = AtlasMath.altitudeToY(fp.maxAltitudeDeg, atlas.config)
+        val yBottom = AtlasMath.altitudeToY(fp.minAltitudeDeg, atlas.config)
 
-            for (x in 0 until atlas.width) {
-                val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
-                val azRad = Math.toRadians(azDeg.toDouble()).toFloat()
+        val srcW = src.width
+        val srcH = src.height
+        val srcPixels = IntArray(srcW * srcH)
+        src.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
 
-                val dir = worldDirectionRad(azRad, altRad)
+        val xSpans = AtlasMath.splitAzimuthSpan(
+            fp.minAzimuthDeg,
+            fp.maxAzimuthDeg,
+            atlas.config
+        )
 
-                val camX = dot(dir, right)
-                val camY = dot(dir, up)
-                val camZ = dot(dir, forward)
+        for ((x0, x1) in xSpans) {
+            for (y in yTop..yBottom) {
+                val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+                val altRad = Math.toRadians(altDeg.toDouble()).toFloat()
 
-                if (camZ <= 0f) continue
+                for (x in x0..x1) {
+                    val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
+                    val azRad = Math.toRadians(azDeg.toDouble()).toFloat()
 
-                val nx = (camX / camZ) / tanHalfH
-                val ny = (camY / camZ) / tanHalfV
+                    val dir = worldDirectionRad(azRad, altRad)
 
-                if (abs(nx) > 1f || abs(ny) > 1f) continue
+                    val camX = dot(dir, right)
+                    val camY = dot(dir, up)
+                    val camZ = dot(dir, forward)
 
-                val u = (((nx + 1f) * 0.5f) * (src.width - 1))
-                    .roundToInt()
-                    .coerceIn(0, src.width - 1)
+                    if (camZ <= 0f) continue
 
-                val v = ((1f - ((ny + 1f) * 0.5f)) * (src.height - 1))
-                    .roundToInt()
-                    .coerceIn(0, src.height - 1)
+                    val nx = (camX / camZ) / tanHalfH
+                    val ny = (camY / camZ) / tanHalfV
 
-                val color = src.getPixel(u, v)
+                    if (abs(nx) > 1f || abs(ny) > 1f) continue
 
-                val centerWeight = max(
-                    0.001f,
-                    (1f - abs(nx)).coerceIn(0f, 1f) *
-                            (1f - abs(ny)).coerceIn(0f, 1f)
-                )
+                    val u = (((nx + 1f) * 0.5f) * (srcW - 1))
+                        .roundToInt()
+                        .coerceIn(0, srcW - 1)
 
-                atlas.blendPixel(x, y, color, centerWeight)
+                    val v = ((1f - ((ny + 1f) * 0.5f)) * (srcH - 1))
+                        .roundToInt()
+                        .coerceIn(0, srcH - 1)
+
+                    val color = srcPixels[v * srcW + u]
+
+                    val wx = (1f - abs(nx)).coerceIn(0f, 1f)
+                    val wy = (1f - abs(ny)).coerceIn(0f, 1f)
+
+                    val localWeight = max(
+                        0.001f,
+                        (wx * wx) * (wy * wy)
+                    )
+
+                    val finalWeight = frameWeight * localWeight
+                    atlas.blendPixel(x, y, color, finalWeight)
+                }
             }
         }
+    }
+
+    private fun qualityWeightForFrame(frame: FrameRecord): Float {
+        val azErr = angleDiffDeg(frame.targetAzimuthDeg, frame.measuredAzimuthDeg)
+        val pitchErr = abs(frame.targetPitchDeg - frame.measuredPitchDeg)
+        val rollAbs = abs(frame.measuredRollDeg)
+
+        val azScore = (1f - azErr / 20f).coerceIn(0.15f, 1f)
+        val pitchScore = (1f - pitchErr / 15f).coerceIn(0.15f, 1f)
+        val rollScore = (1f - rollAbs / 35f).coerceIn(0.30f, 1f)
+
+        return 0.25f + 0.75f * azScore * pitchScore * rollScore
+    }
+
+    private fun angleDiffDeg(a: Float, b: Float): Float {
+        var d = AtlasMath.normalizeAzimuthDeg(a) - AtlasMath.normalizeAzimuthDeg(b)
+        if (d > 180f) d -= 360f
+        if (d < -180f) d += 360f
+        return abs(d)
     }
 
     private fun worldDirectionRad(azimuthRad: Float, altitudeRad: Float): FloatArray {
