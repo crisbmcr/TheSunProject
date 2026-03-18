@@ -62,6 +62,7 @@ class GuideView @JvmOverloads constructor(
     }
 
     fun getActiveCapturePoint(): CapturePoint? = activePoint
+    fun getCapturePlanSize(): Int = capturePoints.size
 
     fun resetAllCaptured() {
         capturePoints.forEach { it.isCaptured = false }

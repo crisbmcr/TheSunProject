@@ -40,6 +40,8 @@ import com.example.sunproject.data.model.FrameRecord
 import com.example.sunproject.data.model.SessionRecord
 import com.example.sunproject.data.storage.JsonSessionStore
 import com.example.sunproject.data.storage.SessionPaths
+import android.content.Intent
+import com.example.sunproject.domain.atlas.AtlasBuildUseCase
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
@@ -79,7 +81,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
     // --- Auto-captura ---
     private var autoCaptureEnabled = true
-    private val maxShots = 12
+    private var maxShots = 0
+    private val atlasBuildUseCase = AtlasBuildUseCase()
     private val azTolDeg = 6f
     private val pitchTolDeg = 3f
     private val rollTolDeg = 3f
@@ -158,6 +161,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         debugCaptureCount = findViewById(R.id.debugCaptureCount)
         btnCapture = findViewById(R.id.btnCapture)
         btnAuto = findViewById(R.id.btnAuto)
+        maxShots = guideView.getCapturePlanSize()
+        updateCaptureCountUi()
 
         cameraExecutor = Executors.newSingleThreadExecutor()
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
@@ -183,6 +188,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 "Auto capture: ${if (autoCaptureEnabled) "ON" else "OFF"}",
                 Toast.LENGTH_SHORT
             ).show()
+        }
+
+        btnAuto.setOnLongClickListener {
+            if (capturedFiles.isEmpty()) {
+                Toast.makeText(this, "Captura al menos una foto primero", Toast.LENGTH_SHORT).show()
+            } else {
+                openProjectedSingleFrame(0)
+            }
+            true
         }
 
         updateAutoButton()
@@ -444,10 +458,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                             updateAutoButton()
                             Toast.makeText(
                                 this@CaptureActivity,
-                                "Listo: ${capturedFiles.size} fotos.\nHaciendo stitch...",
+                                "Listo: ${capturedFiles.size} fotos.\nGenerando atlas angular...",
                                 Toast.LENGTH_LONG
                             ).show()
-                            stitchCurrentSessionIfReady(force = false)
+                            openAngularAtlasDebug()
                         }
                     }
                 }
@@ -721,7 +735,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val frame = FrameRecord(
             frameId = file.nameWithoutExtension,
             sessionId = currentSessionId ?: "unknown_session",
-            ringId = "H0",
+            ringId = ringIdForTarget(target),
             shotIndex = shotIndex,
             originalPath = file.absolutePath,
             capturedAtUtcMs = System.currentTimeMillis(),
@@ -742,6 +756,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         sessionStore.appendFrame(frame, paths)
     }
 
+    private fun ringIdForTarget(target: GuideView.CapturePoint): String = when {
+        target.pitch >= 80f -> "Z0"
+        target.pitch >= 30f -> "H45"
+        else -> "H0"
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<String>,
@@ -755,6 +775,60 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             } else {
                 Toast.makeText(this, "Permissions not granted.", Toast.LENGTH_SHORT).show()
                 finish()
+            }
+        }
+    }
+
+    private fun openAngularAtlasDebug() {
+        val dir = sessionDir ?: ensureSessionDir()
+
+        cameraExecutor.execute {
+            try {
+                val atlasFile = atlasBuildUseCase.buildDebugAtlas(dir)
+
+                runOnUiThread {
+                    Toast.makeText(this, "Atlas debug generado", Toast.LENGTH_SHORT).show()
+                    startActivity(
+                        Intent(this, AnalysisActivity::class.java).apply {
+                            putExtra("panorama_path", atlasFile.absolutePath)
+                        }
+                    )
+                }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Error generando atlas debug: ${t.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun openProjectedSingleFrame(frameIndex: Int = 0) {
+        val dir = sessionDir ?: ensureSessionDir()
+
+        cameraExecutor.execute {
+            try {
+                val atlasFile = atlasBuildUseCase.buildSingleFrameProjection(dir, frameIndex)
+
+                runOnUiThread {
+                    Toast.makeText(this, "Atlas proyectado generado", Toast.LENGTH_SHORT).show()
+                    startActivity(
+                        Intent(this, AnalysisActivity::class.java).apply {
+                            putExtra("panorama_path", atlasFile.absolutePath)
+                        }
+                    )
+                }
+            } catch (t: Throwable) {
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Error proyectando frame: ${t.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             }
         }
     }

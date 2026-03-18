@@ -6,19 +6,42 @@ import java.io.File
 class AtlasBuildUseCase(
     private val store: JsonSessionStore = JsonSessionStore()
 ) {
-    fun buildDebugAtlas(sessionDir: File): File {
-        val paths = store.createSessionPaths(sessionDir)
-        val frames = store.loadFrames(paths)
-
-        val atlas = SkyAtlas(
+    private fun newAtlas(): SkyAtlas =
+        SkyAtlas(
             AtlasConfig(
                 widthPx = 3600,
                 heightPx = 900
             )
         )
 
+    fun buildDebugAtlas(sessionDir: File): File {
+        val paths = store.createSessionPaths(sessionDir)
+        val frames = store.loadFrames(paths).sortedBy { it.shotIndex }
+
+        val atlas = newAtlas()
         val out = File(paths.atlasDir, "atlas_debug.png")
+
         AtlasDebugRenderer.renderFootprints(frames, atlas, out)
+        return out
+    }
+
+    fun buildSingleFrameProjection(sessionDir: File, frameIndex: Int = 0): File {
+        val paths = store.createSessionPaths(sessionDir)
+        val frames = store.loadFrames(paths).sortedBy { it.shotIndex }
+
+        require(frames.isNotEmpty()) { "No hay frames en la sesión." }
+
+        val selected = frames[frameIndex.coerceIn(0, frames.lastIndex)]
+        val atlas = newAtlas()
+
+        AtlasProjector.projectSingleFrameToAtlas(selected, atlas)
+
+        val out = File(
+            paths.atlasDir,
+            "atlas_projected_${selected.shotIndex.toString().padStart(2, '0')}.png"
+        )
+
+        atlas.writePng(out)
         return out
     }
 }

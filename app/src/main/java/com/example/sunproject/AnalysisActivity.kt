@@ -4,9 +4,9 @@ import android.net.Uri
 import android.os.Bundle
 import android.widget.ImageView
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
 
 class AnalysisActivity : AppCompatActivity() {
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_analysis)
@@ -15,7 +15,7 @@ class AnalysisActivity : AppCompatActivity() {
         val imagePath = intent.getStringExtra("panorama_path")
 
         if (imagePath != null) {
-            panoramaImageView.setImageURI(Uri.parse(imagePath))
+            panoramaImageView.setImageURI(Uri.fromFile(File(imagePath)))
         }
     }
 }
