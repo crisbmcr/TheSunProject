@@ -36,6 +36,10 @@ import kotlin.math.atan2
 import kotlin.math.atan
 import kotlin.math.roundToInt
 import android.view.WindowManager
+import com.example.sunproject.data.model.FrameRecord
+import com.example.sunproject.data.model.SessionRecord
+import com.example.sunproject.data.storage.JsonSessionStore
+import com.example.sunproject.data.storage.SessionPaths
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
@@ -93,6 +97,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
     private var stitchInProgress = false
     private var stitchDone = false
+
+    private val sessionStore = JsonSessionStore()
+    private var sessionPaths: SessionPaths? = null
+    private var currentSessionId: String? = null
+
+    private var currentCameraId: String? = null
+    private var currentHfovDeg: Float? = null
+    private var currentVfovDeg: Float? = null
+
+    private var sessionYawAnchorDeg: Float? = null
+    private var sessionPitchAnchorDeg: Float? = null
+    private var sessionRollAnchorDeg: Float? = null
 
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
@@ -331,13 +347,39 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         dir.mkdirs()
 
         sessionDir = dir
+        currentSessionId = dir.name
+        sessionPaths = sessionStore.createSessionPaths(dir)
+
         Log.i("PanoramaCAP", "Session dir: ${dir.absolutePath}")
         runOnUiThread { Toast.makeText(this, "Sesión: ${dir.name}", Toast.LENGTH_SHORT).show() }
+
+        val loc = lastLocation
+
+        if (sessionYawAnchorDeg == null) sessionYawAnchorDeg = lastAzimuth
+        if (sessionPitchAnchorDeg == null) sessionPitchAnchorDeg = lastPitch
+        if (sessionRollAnchorDeg == null) sessionRollAnchorDeg = lastRoll
+
+        val session = SessionRecord(
+            sessionId = dir.name,
+            startedAtUtcMs = System.currentTimeMillis(),
+            latitudeDeg = loc?.latitude,
+            longitudeDeg = loc?.longitude,
+            altitudeM = loc?.altitude,
+            declinationDeg = null,
+            cameraId = currentCameraId ?: "widest_back_camera",
+            sensorMode = "rotation_vector",
+            sessionYawAnchorDeg = sessionYawAnchorDeg,
+            sessionPitchAnchorDeg = sessionPitchAnchorDeg,
+            sessionRollAnchorDeg = sessionRollAnchorDeg,
+            notes = null
+        )
+        sessionStore.saveSession(session, sessionPaths!!)
 
         val meta = File(dir, "metadata.csv")
         if (!meta.exists()) meta.writeText("filename,timestamp_ms,azimuth,pitch,roll,lat,lon,alt\n")
         return dir
     }
+
 
     private fun appendMetadata(fileName: String) {
         val dir = ensureSessionDir()
@@ -383,6 +425,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     capturedFiles.add(file)
                     appendMetadata(file.name)
+                    appendFrameRecord(file, target, capturedFiles.size)
 
                     target.isCaptured = true
                     guideView.postInvalidate()
@@ -472,7 +515,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     @OptIn(ExperimentalCamera2Interop::class)
     private fun bindPreview(cameraProvider: ProcessCameraProvider) {
         cameraPreview.scaleType = PreviewView.ScaleType.FIT_CENTER
-        //cameraPreview.scaleType = PreviewView.ScaleType.FILL_CENTER
+        // cameraPreview.scaleType = PreviewView.ScaleType.FILL_CENTER
+
         val rotation = cameraPreview.display.rotation
 
         val preview = Preview.Builder()
@@ -496,6 +540,13 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         try { camera.cameraControl.setLinearZoom(0f) } catch (_: Throwable) {}
 
         val characteristics = camera.cameraInfo.getCameraCharacteristics()
+
+        currentCameraId = try {
+            Camera2CameraInfo.from(camera.cameraInfo).cameraId
+        } catch (_: Throwable) {
+            "widest_back_camera"
+        }
+
         val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         val sensorSize: SizeF? = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
         val focalLengths: FloatArray? = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
@@ -504,12 +555,23 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             var minFocal = focalLengths[0]
             for (v in focalLengths) if (v < minFocal) minFocal = v
 
-            val activeSensorDimension =
+            val sensorWidthMm =
                 if (sensorOrientation == 90 || sensorOrientation == 270) sensorSize.height else sensorSize.width
+            val sensorHeightMm =
+                if (sensorOrientation == 90 || sensorOrientation == 270) sensorSize.width else sensorSize.height
 
-            val fov = 2.0 * atan((activeSensorDimension / (2.0 * minFocal)).toDouble())
-            val fovDegrees = Math.toDegrees(fov).toFloat()
-            guideView.setCameraFov(fovDegrees)
+            val hfov = 2.0 * atan((sensorWidthMm / (2.0 * minFocal)).toDouble())
+            val vfov = 2.0 * atan((sensorHeightMm / (2.0 * minFocal)).toDouble())
+
+            currentHfovDeg = Math.toDegrees(hfov).toFloat()
+            currentVfovDeg = Math.toDegrees(vfov).toFloat()
+
+            guideView.setCameraFov(currentHfovDeg ?: 0f)
+
+            Log.i(
+                "PanoramaCAP",
+                "CameraId=$currentCameraId HFOV=${currentHfovDeg} VFOV=${currentVfovDeg}"
+            )
         }
     }
 
@@ -635,6 +697,49 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 stitchInProgress = false
             }
         }
+    }
+
+    private fun readImageSize(file: File): Pair<Int?, Int?> {
+        return try {
+            val opts = android.graphics.BitmapFactory.Options().apply {
+                inJustDecodeBounds = true
+            }
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, opts)
+            val w = opts.outWidth.takeIf { it > 0 }
+            val h = opts.outHeight.takeIf { it > 0 }
+            w to h
+        } catch (_: Throwable) {
+            null to null
+        }
+    }
+
+    private fun appendFrameRecord(file: File, target: GuideView.CapturePoint, shotIndex: Int) {
+        val paths = sessionPaths ?: return
+        val loc = lastLocation
+        val (imgW, imgH) = readImageSize(file)
+
+        val frame = FrameRecord(
+            frameId = file.nameWithoutExtension,
+            sessionId = currentSessionId ?: "unknown_session",
+            ringId = "H0",
+            shotIndex = shotIndex,
+            originalPath = file.absolutePath,
+            capturedAtUtcMs = System.currentTimeMillis(),
+            targetAzimuthDeg = target.azimuth,
+            targetPitchDeg = target.pitch,
+            measuredAzimuthDeg = lastAzimuth,
+            measuredPitchDeg = lastPitch,
+            measuredRollDeg = lastRoll,
+            latitudeDeg = loc?.latitude,
+            longitudeDeg = loc?.longitude,
+            altitudeM = loc?.altitude,
+            imageWidthPx = imgW,
+            imageHeightPx = imgH,
+            hfovDeg = currentHfovDeg,
+            vfovDeg = currentVfovDeg
+        )
+
+        sessionStore.appendFrame(frame, paths)
     }
 
     override fun onRequestPermissionsResult(
