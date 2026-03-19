@@ -12,6 +12,8 @@ import android.view.View
 import kotlin.math.abs
 import kotlin.math.tan
 import kotlin.math.hypot
+import android.os.SystemClock
+import android.util.Log
 
 class GuideView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -24,7 +26,15 @@ class GuideView @JvmOverloads constructor(
     private val activeRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.YELLOW; strokeWidth = 10f; style = Paint.Style.STROKE }
     private val capturedPointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.GREEN; style = Paint.Style.FILL }
     private val reticlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; style = Paint.Style.FILL }
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = 32f; textAlign = Paint.Align.CENTER; setShadowLayer(5f, 2f, 2f, Color.BLACK) }
+    private val textPaint = Paint(
+        Paint.ANTI_ALIAS_FLAG or Paint.SUBPIXEL_TEXT_FLAG or Paint.DITHER_FLAG
+    ).apply {
+        color = Color.WHITE
+        textSize = 32f
+        textAlign = Paint.Align.CENTER
+        isLinearText = true
+        setShadowLayer(5f, 2f, 2f, Color.BLACK)
+    }
 
     private val horizonPath = android.graphics.Path()
     private val textMeasureRect = Rect()
@@ -45,9 +55,14 @@ class GuideView @JvmOverloads constructor(
     private var pendingActivePoint: CapturePoint? = null
     private var pendingActiveFrames: Int = 0
 
-    private val switchConfirmFrames = 4
-    private val switchMarginPx = 28f
-    private val centerLockRadiusPx = 72f
+    private val switchConfirmFrames = 6
+    private val switchMarginPx = 36f
+    private val activeKeepRadiusPx = 52f
+    private val activeReleaseRadiusPx = 128f
+    private val activeSwitchCooldownMs = 250L
+
+    private var lastSwitchAtMs = 0L
+    private var lastTargetLogMs = 0L
 
     init {
         setupCapturePoints()
@@ -103,27 +118,33 @@ class GuideView @JvmOverloads constructor(
         val centerY = height / 2f
 
         canvas.save()
-        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
+        val appliedRoll = if (zenithMode) cameraRoll * 0.10f else cameraRoll
         canvas.rotate(-appliedRoll, centerX, centerY)
 
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
         drawHorizon(canvas)
         drawAzimuthDivisions(canvas)
-        drawAzimuthLabels(canvas)
         drawCapturePoints(canvas)
 
         canvas.restore()
 
+        // Etiquetas fuera de la rotación para que no se difuminen
+        drawAzimuthLabels(canvas)
         drawReticle(canvas)
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
+        if (zenithMode && targetPitch >= 80f) {
+            return Pair(width / 2f, height / 2f)
+        }
+
         val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540f) % 360f - 180f
         val deltaPitch = targetPitch - cameraPitch
 
         val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
         val azimuthWeight = if (zenithMode) {
-            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
+            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.05f, 0.30f)
         } else {
             1f
         }
@@ -133,7 +154,7 @@ class GuideView @JvmOverloads constructor(
         val projectedX = tan(Math.toRadians(effectiveDeltaAzimuth.toDouble())).toFloat()
         val projectedY = tan(Math.toRadians(deltaPitch.toDouble())).toFloat()
 
-        if (kotlin.math.abs(projectedX) > tanHorizontalFovHalf || kotlin.math.abs(projectedY) > tanVerticalFovHalf) {
+        if (abs(projectedX) > tanHorizontalFovHalf || abs(projectedY) > tanVerticalFovHalf) {
             return null
         }
 
@@ -167,56 +188,51 @@ class GuideView @JvmOverloads constructor(
 
     // CORREGIDO: Lógica para dibujar las divisiones cada 10°
     private fun drawAzimuthDivisions(canvas: Canvas) {
-        for (az in 0 until 360 step 10) {
+        for (az in 0 until 360 step 30) {
             projectToScreen(az.toFloat(), 0f)?.let { (x, y) ->
-                val deltaAz = abs((az.toFloat() - cameraAzimuth + 540) % 360 - 180)
-                val alpha = (1.0f - (deltaAz / 90f)).coerceIn(0f, 1f) * 255
-                divisionPaint.alpha = alpha.toInt()
+                val deltaAz = abs((az.toFloat() - cameraAzimuth + 540f) % 360f - 180f)
+                val alpha = ((1.0f - (deltaAz / 95f)).coerceIn(0f, 1f) * 180f).toInt()
 
-                // Línea larga para múltiplos de 30
-                if (az % 30 == 0) {
-                    canvas.drawLine(x, y - 20, x, y + 20, divisionPaint)
-                } else { // Línea corta para los demás (10, 20, 40, 50...)
-                    canvas.drawLine(x, y - 10, x, y + 10, divisionPaint)
-                }
+                divisionPaint.alpha = alpha
+                val halfLen = if (az % 90 == 0) 14f else 9f
+                canvas.drawLine(x, y - halfLen, x, y + halfLen, divisionPaint)
             }
         }
     }
 
     private fun drawAzimuthLabels(canvas: Canvas) {
         val drawnLabels = mutableListOf<Rect>()
-        for (az in 0 until 360 step 15) {
+
+        for (az in 0 until 360 step 30) {
             projectToScreen(az.toFloat(), 0f)?.let { (x, y) ->
-                val label = when {
-                    az == 0 -> "N"
-                    az == 90 -> "E"
-                    az == 180 -> "S"
-                    az == 270 -> "O"
-                    az % 30 == 0 -> "$az°"
-                    else -> null
+                val label = when (az) {
+                    0 -> "N"
+                    90 -> "E"
+                    180 -> "S"
+                    270 -> "O"
+                    else -> "$az°"
                 }
 
-                if (label != null) {
-                    val deltaAz = abs((az.toFloat() - cameraAzimuth + 540) % 360 - 180)
-                    val alpha = (1.0f - (deltaAz / 90f)).coerceIn(0f, 1f) * 255
-                    textPaint.alpha = alpha.toInt()
+                val deltaAz = abs((az.toFloat() - cameraAzimuth + 540f) % 360f - 180f)
+                val alpha = ((1.0f - (deltaAz / 95f)).coerceIn(0f, 1f) * 255f).toInt()
+                textPaint.alpha = alpha
 
-                    textPaint.getTextBounds(label, 0, label.length, textMeasureRect)
-                    // CORREGIDO: Ajustamos el espaciado para evitar superposiciones
-                    val labelRect = Rect((x - textMeasureRect.width()/2).toInt(), (y + 45).toInt(), (x + textMeasureRect.width()/2).toInt(), (y + 80).toInt())
+                textPaint.getTextBounds(label, 0, label.length, textMeasureRect)
 
-                    var canDraw = true
-                    for (drawnRect in drawnLabels) {
-                        if (Rect.intersects(labelRect, drawnRect)) {
-                            canDraw = false
-                            break
-                        }
-                    }
-                    if (canDraw) {
-                        // CORREGIDO: Posición Y ajustada para dibujar DEBAJO de los anillos
-                        canvas.drawText(label, x, y + 75f, textPaint)
-                        drawnLabels.add(labelRect)
-                    }
+                val labelTop = y + 44f
+                val labelBottom = y + 82f
+
+                val labelRect = Rect(
+                    (x - textMeasureRect.width() / 2f - 8f).toInt(),
+                    labelTop.toInt(),
+                    (x + textMeasureRect.width() / 2f + 8f).toInt(),
+                    labelBottom.toInt()
+                )
+
+                val overlaps = drawnLabels.any { Rect.intersects(it, labelRect) }
+                if (!overlaps) {
+                    canvas.drawText(label, x, y + 72f, textPaint)
+                    drawnLabels.add(labelRect)
                 }
             }
         }
@@ -226,7 +242,13 @@ class GuideView @JvmOverloads constructor(
         val activePoint = activePoint
         val ringRadius = 40f
 
-        capturePoints.forEach { point ->
+        val pointsToDraw = if (zenithMode) {
+            capturePoints.filter { it.pitch >= 80f || it.isCaptured }
+        } else {
+            capturePoints
+        }
+
+        pointsToDraw.forEach { point ->
             projectToScreen(point.azimuth, point.pitch)?.let { (x, y) ->
                 if (point.isCaptured) {
                     canvas.drawCircle(x, y, ringRadius, capturedPointPaint)
@@ -283,6 +305,54 @@ class GuideView @JvmOverloads constructor(
         return dist <= radiusPx
     }
 
+    private data class VisibleCandidate(
+        val point: CapturePoint,
+        val screenX: Float,
+        val screenY: Float,
+        val distPx: Float
+    )
+
+    private fun screenDistancePx(point: CapturePoint): Float? {
+        val proj = projectToScreen(point.azimuth, point.pitch) ?: return null
+        val cx = width / 2f
+        val cy = height / 2f
+        val dx = proj.first - cx
+        val dy = proj.second - cy
+        return hypot(dx.toDouble(), dy.toDouble()).toFloat()
+    }
+
+    private fun visibleCandidates(): List<VisibleCandidate> {
+        val cx = width / 2f
+        val cy = height / 2f
+
+        return capturePoints
+            .filter { !it.isCaptured }
+            .mapNotNull { point ->
+                val proj = projectToScreen(point.azimuth, point.pitch) ?: return@mapNotNull null
+                val dx = proj.first - cx
+                val dy = proj.second - cy
+                VisibleCandidate(
+                    point = point,
+                    screenX = proj.first,
+                    screenY = proj.second,
+                    distPx = hypot(dx.toDouble(), dy.toDouble()).toFloat()
+                )
+            }
+            .sortedBy { it.distPx }
+    }
+
+    private fun logTargetChange(prev: CapturePoint?, next: CapturePoint?, reason: String) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTargetLogMs < 120L) return
+        lastTargetLogMs = now
+
+        Log.d(
+            "SunGuideTarget",
+            "reason=$reason prev=${prev?.azimuth}/${prev?.pitch} next=${next?.azimuth}/${next?.pitch} " +
+                    "camAz=${"%.2f".format(cameraAzimuth)} camPitch=${"%.2f".format(cameraPitch)} camRoll=${"%.2f".format(cameraRoll)}"
+        )
+    }
+
     private fun updateActivePoint() {
         val candidates = capturePoints.filter { !it.isCaptured }
 
@@ -293,52 +363,72 @@ class GuideView @JvmOverloads constructor(
             return
         }
 
-        val best = candidates.minByOrNull { candidateScore(it) }
+        val now = SystemClock.elapsedRealtime()
+        val visible = visibleCandidates()
+        val bestVisible = visible.firstOrNull()
 
-        if (best == null) {
-            activePoint = null
+        val current = activePoint?.takeUnless { it.isCaptured }
+        if (current == null) {
+            val initial = bestVisible?.point ?: candidates.minByOrNull { candidateScore(it) }
+            activePoint = initial
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            lastSwitchAtMs = now
+            logTargetChange(null, initial, "init")
+            return
+        }
+
+        val currentDist = screenDistancePx(current)
+        val bestPoint = bestVisible?.point ?: candidates.minByOrNull { candidateScore(it) }
+        val bestDist = bestVisible?.distPx ?: candidateScore(bestPoint!!)
+
+        if (bestPoint == null) return
+
+        if (current == bestPoint) {
             pendingActivePoint = null
             pendingActiveFrames = 0
             return
         }
 
-        val current = activePoint
-
-        if (current == null || current.isCaptured) {
-            activePoint = best
+        if (currentDist != null && currentDist <= activeKeepRadiusPx) {
             pendingActivePoint = null
             pendingActiveFrames = 0
             return
         }
 
-        if (current == best) {
+        val currentScore = currentDist ?: candidateScore(current)
+        val bestScore = bestDist
+        val margin = if (zenithMode) 14f else switchMarginPx
+
+        val immediateSwitch =
+            (currentDist == null || currentScore >= activeReleaseRadiusPx) &&
+                    (now - lastSwitchAtMs) >= activeSwitchCooldownMs
+
+        if (immediateSwitch) {
+            val prev = activePoint
+            activePoint = bestPoint
             pendingActivePoint = null
             pendingActiveFrames = 0
+            lastSwitchAtMs = now
+            logTargetChange(prev, bestPoint, "release")
             return
         }
 
-        if (isNearCenter(current, centerLockRadiusPx)) {
-            pendingActivePoint = null
-            pendingActiveFrames = 0
-            return
-        }
-
-        val currentScore = candidateScore(current)
-        val bestScore = candidateScore(best)
-        val margin = if (zenithMode) 18f else switchMarginPx
-
-        if (bestScore + margin < currentScore) {
-            if (pendingActivePoint == best) {
+        if (bestScore + margin < currentScore && (now - lastSwitchAtMs) >= activeSwitchCooldownMs) {
+            if (pendingActivePoint == bestPoint) {
                 pendingActiveFrames++
             } else {
-                pendingActivePoint = best
+                pendingActivePoint = bestPoint
                 pendingActiveFrames = 1
             }
 
             if (pendingActiveFrames >= switchConfirmFrames) {
-                activePoint = best
+                val prev = activePoint
+                activePoint = bestPoint
                 pendingActivePoint = null
                 pendingActiveFrames = 0
+                lastSwitchAtMs = now
+                logTargetChange(prev, bestPoint, "better")
             }
         } else {
             pendingActivePoint = null

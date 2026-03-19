@@ -42,6 +42,10 @@ import com.example.sunproject.data.storage.JsonSessionStore
 import com.example.sunproject.data.storage.SessionPaths
 import android.content.Intent
 import com.example.sunproject.domain.atlas.AtlasBuildUseCase
+import kotlin.math.acos
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
@@ -70,6 +74,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     //private var smoothedAngles = FloatArray(3)
     //private val alpha = 0.08f
     //private var isFirstReading = true
+    private data class Vec3(var x: Float, var y: Float, var z: Float)
+
+    private var guidePoseInitialized = false
+    private var guideForward = Vec3(0f, 1f, 0f)
+    private var guideUp = Vec3(0f, 0f, 1f)
+
+    private var guideAzimuthDeg = 0f
+    private var guidePitchDeg = 0f
+    private var guideRollDeg = 0f
+
+    private var lastGuideLogMs = 0L
 
     // Ubicación
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -282,15 +297,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
         lastSensorTsNs = event.timestamp
 
-        val displayAlpha = adaptiveAlpha(dtSec, tauSec = 0.28f)
-        val captureAlpha = adaptiveAlpha(dtSec, tauSec = 0.12f)
-
-        val displayAngles = filterAngles(displayFilter, rawAzimuth, rawPitch, rawRoll, displayAlpha)
-        val captureAngles = filterAngles(captureFilter, rawAzimuth, rawPitch, rawRoll, captureAlpha)
-
-        var displayAz = displayAngles[0]
-        var captureAz = captureAngles[0]
-
+        var correctedAzimuth = rawAzimuth
         lastLocation?.let {
             val geomagneticField = GeomagneticField(
                 it.latitude.toFloat(),
@@ -298,21 +305,33 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 it.altitude.toFloat(),
                 System.currentTimeMillis()
             )
-            displayAz = normalize360(displayAz + geomagneticField.declination)
-            captureAz = normalize360(captureAz + geomagneticField.declination)
+            correctedAzimuth = normalize360(correctedAzimuth + geomagneticField.declination)
         }
 
-        val zenithMode = isZenithTarget(guideView.getActiveCapturePoint())
+        // Ruta de medición: esta se sigue guardando en metadata/atlas
+        val captureAlpha = adaptiveAlpha(dtSec, tauSec = 0.10f)
+        val measuredAngles = filterAngles(
+            captureFilter,
+            correctedAzimuth,
+            rawPitch,
+            rawRoll,
+            captureAlpha
+        )
 
-        // medición real para metadata / atlas
-        lastAzimuth = captureAz
-        lastPitch = captureAngles[1]
-        lastRoll = captureAngles[2]
+        lastAzimuth = measuredAngles[0]
+        lastPitch = measuredAngles[1]
+        lastRoll = measuredAngles[2]
 
-        // solo display
-        displayAzimuth = displayAz
-        displayPitchDeg = displayAngles[1]
-        displayRollDeg = effectiveGuideRoll(displayAngles[2], zenithMode)
+        // Ruta de guía: estable para UI y auto-captura
+        val displayAlpha = adaptiveAlpha(dtSec, tauSec = 0.32f)
+        updateGuidePose(correctedAzimuth, rawPitch, rawRoll, displayAlpha)
+
+        val zenithMode =
+            isZenithTarget(guideView.getActiveCapturePoint()) || guidePitchDeg >= 72f
+
+        displayAzimuth = guideAzimuthDeg
+        displayPitchDeg = guidePitchDeg
+        displayRollDeg = if (zenithMode) guideRollDeg * 0.10f else guideRollDeg
 
         guideView.setZenithMode(zenithMode)
         guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
@@ -329,28 +348,28 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             alignmentStartMs = 0L
             return
         }
+
         if (capturedFiles.size >= maxShots) {
             autoCaptureEnabled = false
             updateAutoButton()
             return
         }
+
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
+        val zenithMode = isZenithTarget(target) || guidePitchDeg >= 72f
 
-        val zenithMode = isZenithTarget(target)
-
-        val dAz = absAngleDiff(lastAzimuth, target.azimuth)
-        val dPitch = abs(lastPitch - target.pitch)
-        val dRoll = abs(lastRoll)
+        val dirErr = if (zenithMode) zenithErrorDeg() else directionErrorDeg(target.azimuth, target.pitch)
+        val zenErr = zenithErrorDeg()
 
         val aligned = if (zenithMode) {
-            dPitch <= (pitchTolDeg + 1.0f)
+            dirErr <= 2.4f
         } else {
-            dAz <= azTolDeg &&
-                    dPitch <= pitchTolDeg &&
-                    dRoll <= rollTolDeg
+            dirErr <= 4.2f
         }
+
+        maybeLogGuide(target, aligned, dirErr, zenErr)
 
         val now = SystemClock.elapsedRealtime()
 
@@ -891,6 +910,144 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
     private fun deadbandLinear(prev: Float, next: Float, bandDeg: Float): Float {
         return if (kotlin.math.abs(next - prev) < bandDeg) prev else next
+    }
+
+    private fun vec3(x: Float, y: Float, z: Float) = Vec3(x, y, z)
+
+    private fun dot(a: Vec3, b: Vec3): Float =
+        a.x * b.x + a.y * b.y + a.z * b.z
+
+    private fun cross(a: Vec3, b: Vec3): Vec3 =
+        Vec3(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x
+        )
+
+    private fun norm(v: Vec3): Float =
+        sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+
+    private fun normalize(v: Vec3): Vec3 {
+        val n = norm(v)
+        if (n < 1e-6f) return Vec3(0f, 0f, 0f)
+        return Vec3(v.x / n, v.y / n, v.z / n)
+    }
+
+    private fun add(a: Vec3, b: Vec3): Vec3 =
+        Vec3(a.x + b.x, a.y + b.y, a.z + b.z)
+
+    private fun scale(v: Vec3, s: Float): Vec3 =
+        Vec3(v.x * s, v.y * s, v.z * s)
+
+    private fun worldForwardFromAngles(azDeg: Float, pitchDeg: Float): Vec3 {
+        val az = Math.toRadians(azDeg.toDouble())
+        val alt = Math.toRadians(pitchDeg.toDouble())
+        val cosAlt = cos(alt).toFloat()
+        return normalize(
+            Vec3(
+                (cosAlt * sin(az)).toFloat(),
+                (cosAlt * cos(az)).toFloat(),
+                sin(alt).toFloat()
+            )
+        )
+    }
+
+    private fun worldUpFromAngles(azDeg: Float, pitchDeg: Float, rollDeg: Float): Vec3 {
+        val forward = worldForwardFromAngles(azDeg, pitchDeg)
+        var right0 = cross(forward, Vec3(0f, 0f, 1f))
+        if (norm(right0) < 1e-4f) right0 = Vec3(1f, 0f, 0f)
+        right0 = normalize(right0)
+
+        val up0 = normalize(cross(right0, forward))
+
+        val roll = Math.toRadians(rollDeg.toDouble())
+        val cosR = cos(roll).toFloat()
+        val sinR = sin(roll).toFloat()
+
+        return normalize(
+            add(
+                scale(up0, cosR),
+                scale(right0, -sinR)
+            )
+        )
+    }
+
+    private fun rollFromBasis(forward: Vec3, up: Vec3): Float {
+        var right0 = cross(forward, Vec3(0f, 0f, 1f))
+        if (norm(right0) < 1e-4f) right0 = Vec3(1f, 0f, 0f)
+        right0 = normalize(right0)
+
+        val up0 = normalize(cross(right0, forward))
+
+        val sinR = -dot(up, right0)
+        val cosR = dot(up, up0)
+
+        return Math.toDegrees(atan2(sinR.toDouble(), cosR.toDouble())).toFloat()
+    }
+
+    private fun updateGuidePose(rawAzDeg: Float, rawPitchDeg: Float, rawRollDeg: Float, alpha: Float) {
+        val rawForward = worldForwardFromAngles(rawAzDeg, rawPitchDeg)
+        val rawUp = worldUpFromAngles(rawAzDeg, rawPitchDeg, rawRollDeg)
+
+        if (!guidePoseInitialized) {
+            guideForward = rawForward
+            guideUp = rawUp
+            guidePoseInitialized = true
+        } else {
+            guideForward = normalize(
+                add(
+                    scale(guideForward, 1f - alpha),
+                    scale(rawForward, alpha)
+                )
+            )
+
+            val upCandidate = normalize(
+                add(
+                    scale(guideUp, 1f - alpha),
+                    scale(rawUp, alpha)
+                )
+            )
+
+            var right = cross(guideForward, upCandidate)
+            if (norm(right) < 1e-4f) {
+                right = cross(guideForward, Vec3(0f, 0f, 1f))
+            }
+            right = normalize(right)
+            guideUp = normalize(cross(right, guideForward))
+        }
+
+        guideAzimuthDeg = normalize360(
+            Math.toDegrees(atan2(guideForward.x.toDouble(), guideForward.y.toDouble())).toFloat()
+        )
+        guidePitchDeg = Math.toDegrees(
+            asin(guideForward.z.coerceIn(-1f, 1f).toDouble())
+        ).toFloat()
+        guideRollDeg = rollFromBasis(guideForward, guideUp)
+    }
+
+    private fun directionErrorDeg(targetAzDeg: Float, targetPitchDeg: Float): Float {
+        val targetDir = worldForwardFromAngles(targetAzDeg, targetPitchDeg)
+        val d = dot(guideForward, targetDir).coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(d.toDouble())).toFloat()
+    }
+
+    private fun zenithErrorDeg(): Float {
+        val d = guideForward.z.coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(d.toDouble())).toFloat()
+    }
+
+    private fun maybeLogGuide(target: GuideView.CapturePoint?, aligned: Boolean, dirErr: Float, zenErr: Float) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastGuideLogMs < 250L) return
+        lastGuideLogMs = now
+
+        Log.d(
+            "SunGuide",
+            "target=${target?.azimuth}/${target?.pitch} " +
+                    "guideAz=${"%.2f".format(guideAzimuthDeg)} guidePitch=${"%.2f".format(guidePitchDeg)} guideRoll=${"%.2f".format(guideRollDeg)} " +
+                    "measuredAz=${"%.2f".format(lastAzimuth)} measuredPitch=${"%.2f".format(lastPitch)} measuredRoll=${"%.2f".format(lastRoll)} " +
+                    "dirErr=${"%.2f".format(dirErr)} zenErr=${"%.2f".format(zenErr)} aligned=$aligned"
+        )
     }
 
     private fun filterAngles(
