@@ -67,9 +67,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val rotationMatrix = FloatArray(9)
     private val remappedRotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
-    private var smoothedAngles = FloatArray(3)
-    private val alpha = 0.15f
-    private var isFirstReading = true
+    //private var smoothedAngles = FloatArray(3)
+    //private val alpha = 0.08f
+    //private var isFirstReading = true
 
     // Ubicación
     private lateinit var fusedLocationClient: FusedLocationProviderClient
@@ -254,6 +254,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
 
         SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+
         SensorManager.remapCoordinateSystem(
             rotationMatrix,
             SensorManager.AXIS_X,
@@ -268,25 +269,27 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 ) % 360f
 
         val rawPitch = Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
-        val rawRoll = Math.toDegrees(-atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()).toFloat()
+        val rawRoll = Math.toDegrees(
+            -atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()
+        ).toFloat()
 
-        if (isFirstReading) {
-            smoothedAngles[0] = rawAzimuth
-            smoothedAngles[1] = rawPitch
-            smoothedAngles[2] = rawRoll
-            isFirstReading = false
+        val dtSec = if (lastSensorTsNs == 0L) {
+            0.016f
         } else {
-            var deltaAz = rawAzimuth - smoothedAngles[0]
-            if (deltaAz > 180) deltaAz -= 360f
-            if (deltaAz < -180) deltaAz += 360f
-            smoothedAngles[0] = (smoothedAngles[0] + alpha * deltaAz + 360f) % 360f
-            smoothedAngles[1] += alpha * (rawPitch - smoothedAngles[1])
-            smoothedAngles[2] += alpha * (rawRoll - smoothedAngles[2])
+            ((event.timestamp - lastSensorTsNs).toDouble() / 1_000_000_000.0)
+                .toFloat()
+                .coerceIn(0.001f, 0.05f)
         }
+        lastSensorTsNs = event.timestamp
 
-        var azimuth = smoothedAngles[0]
-        val pitch = smoothedAngles[1]
-        val roll = smoothedAngles[2]
+        val displayAlpha = adaptiveAlpha(dtSec, tauSec = 0.28f)
+        val captureAlpha = adaptiveAlpha(dtSec, tauSec = 0.12f)
+
+        val displayAngles = filterAngles(displayFilter, rawAzimuth, rawPitch, rawRoll, displayAlpha)
+        val captureAngles = filterAngles(captureFilter, rawAzimuth, rawPitch, rawRoll, captureAlpha)
+
+        var displayAz = displayAngles[0]
+        var captureAz = captureAngles[0]
 
         lastLocation?.let {
             val geomagneticField = GeomagneticField(
@@ -295,17 +298,28 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 it.altitude.toFloat(),
                 System.currentTimeMillis()
             )
-            azimuth = (azimuth + geomagneticField.declination + 360f) % 360f
+            displayAz = normalize360(displayAz + geomagneticField.declination)
+            captureAz = normalize360(captureAz + geomagneticField.declination)
         }
 
-        lastAzimuth = azimuth
-        lastPitch = pitch
-        lastRoll = roll
+        val zenithMode = isZenithTarget(guideView.getActiveCapturePoint())
 
-        guideView.updateOrientation(azimuth, pitch, roll)
-        debugAzimuth.text = "Azimuth: ${azimuth.toInt()}°"
-        debugPitch.text = "Pitch: ${pitch.toInt()}°"
-        debugRoll.text = "Roll: ${roll.toInt()}°"
+        // medición real para metadata / atlas
+        lastAzimuth = captureAz
+        lastPitch = captureAngles[1]
+        lastRoll = captureAngles[2]
+
+        // solo display
+        displayAzimuth = displayAz
+        displayPitchDeg = displayAngles[1]
+        displayRollDeg = effectiveGuideRoll(displayAngles[2], zenithMode)
+
+        guideView.setZenithMode(zenithMode)
+        guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+
+        debugAzimuth.text = "Azimuth: ${displayAzimuth.toInt()}°"
+        debugPitch.text = "Pitch: ${displayPitchDeg.toInt()}°"
+        debugRoll.text = "Roll: ${displayRollDeg.toInt()}°"
 
         checkAutoCapture()
     }
@@ -324,15 +338,19 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val target = guideView.getActiveCapturePoint() ?: return
 
+        val zenithMode = isZenithTarget(target)
+
         val dAz = absAngleDiff(lastAzimuth, target.azimuth)
         val dPitch = abs(lastPitch - target.pitch)
-        val dRoll = abs(lastRoll)   // para el anillo horizontal queremos roll ~ 0°
+        val dRoll = abs(lastRoll)
 
-        val aligned = (
-                dAz <= azTolDeg &&
-                        dPitch <= pitchTolDeg &&
-                        dRoll <= rollTolDeg
-                )
+        val aligned = if (zenithMode) {
+            dPitch <= (pitchTolDeg + 1.0f)
+        } else {
+            dAz <= azTolDeg &&
+                    dPitch <= pitchTolDeg &&
+                    dRoll <= rollTolDeg
+        }
 
         val now = SystemClock.elapsedRealtime()
 
@@ -867,6 +885,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         return (1f - kotlin.math.exp(-dtSec / tauSec)).coerceIn(0.01f, 1f)
     }
 
+    private fun deadbandCircular(prev: Float, next: Float, bandDeg: Float): Float {
+        return if (kotlin.math.abs(angleDeltaDeg(next, prev)) < bandDeg) prev else next
+    }
+
+    private fun deadbandLinear(prev: Float, next: Float, bandDeg: Float): Float {
+        return if (kotlin.math.abs(next - prev) < bandDeg) prev else next
+    }
+
     private fun filterAngles(
         state: AngleFilterState,
         rawAzimuth: Float,
@@ -895,6 +921,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         )
 
         return floatArrayOf(yaw, state.pitch, state.roll)
+    }
+
+    private fun isZenithTarget(target: GuideView.CapturePoint?): Boolean {
+        return target?.pitch?.let { it >= 80f } == true
+    }
+
+    private fun effectiveGuideRoll(rollDeg: Float, zenithMode: Boolean): Float {
+        return if (zenithMode) rollDeg * 0.18f else rollDeg
     }
 
     private fun openProjectedSingleFrame(frameIndex: Int = 0) {

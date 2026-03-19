@@ -11,6 +11,7 @@ import android.util.AttributeSet
 import android.view.View
 import kotlin.math.abs
 import kotlin.math.tan
+import kotlin.math.hypot
 
 class GuideView @JvmOverloads constructor(
     context: Context, attrs: AttributeSet? = null, defStyleAttr: Int = 0
@@ -39,6 +40,14 @@ class GuideView @JvmOverloads constructor(
     private var tanVerticalFovHalf = 0f
     private var activePoint: CapturePoint? = null
 
+    private var zenithMode: Boolean = false
+
+    private var pendingActivePoint: CapturePoint? = null
+    private var pendingActiveFrames: Int = 0
+
+    private val switchConfirmFrames = 4
+    private val switchMarginPx = 28f
+    private val centerLockRadiusPx = 72f
 
     init {
         setupCapturePoints()
@@ -48,6 +57,13 @@ class GuideView @JvmOverloads constructor(
         this.horizontalFov = fov
         if (width > 0 && height > 0) {
             onSizeChanged(width, height, width, height)
+        }
+    }
+
+    fun setZenithMode(enabled: Boolean) {
+        if (zenithMode != enabled) {
+            zenithMode = enabled
+            invalidate()
         }
     }
 
@@ -87,7 +103,8 @@ class GuideView @JvmOverloads constructor(
         val centerY = height / 2f
 
         canvas.save()
-        canvas.rotate(-cameraRoll, centerX, centerY)
+        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
+        canvas.rotate(-appliedRoll, centerX, centerY)
 
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
         drawHorizon(canvas)
@@ -101,19 +118,32 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
-        val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540) % 360 - 180
+        val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540f) % 360f - 180f
         val deltaPitch = targetPitch - cameraPitch
 
-        val projectedX = tan(Math.toRadians(deltaAzimuth.toDouble())).toFloat()
+        val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
+        val azimuthWeight = if (zenithMode) {
+            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
+        } else {
+            1f
+        }
+
+        val effectiveDeltaAzimuth = deltaAzimuth * azimuthWeight
+
+        val projectedX = tan(Math.toRadians(effectiveDeltaAzimuth.toDouble())).toFloat()
         val projectedY = tan(Math.toRadians(deltaPitch.toDouble())).toFloat()
 
-        val screenX = (width / 2f) * (1 + projectedX / tanHorizontalFovHalf)
-        val screenY = (height / 2f) * (1 - projectedY / tanVerticalFovHalf)
+        if (kotlin.math.abs(projectedX) > tanHorizontalFovHalf || kotlin.math.abs(projectedY) > tanVerticalFovHalf) {
+            return null
+        }
 
-        if (abs(deltaAzimuth) > 90) return null
-        if (screenX.isFinite() && screenY.isFinite()) return Pair(screenX, screenY)
+        val centerX = width / 2f
+        val centerY = height / 2f
 
-        return null
+        val screenX = centerX + (projectedX / tanHorizontalFovHalf) * centerX
+        val screenY = centerY - (projectedY / tanVerticalFovHalf) * centerY
+
+        return Pair(screenX, screenY)
     }
 
     private fun setupCapturePoints() {
@@ -227,45 +257,92 @@ class GuideView @JvmOverloads constructor(
         return kotlin.math.abs(d)
     }
 
-    private fun updateActivePoint() {
-        val candidates = capturePoints.filter { !it.isCaptured }
-        if (candidates.isEmpty()) {
-            activePoint = null
-            return
-        }
-
+    private fun candidateScore(point: CapturePoint): Float {
         val cx = width / 2f
         val cy = height / 2f
 
-        var best: CapturePoint? = null
-        var bestScore = Float.MAX_VALUE
-
-        // 1) Preferimos candidatos VISIBLES (projectToScreen != null) y más cerca del centro
-        for (p in candidates) {
-            val proj = projectToScreen(p.azimuth, p.pitch) ?: continue
+        val proj = projectToScreen(point.azimuth, point.pitch)
+        return if (proj != null) {
             val dx = proj.first - cx
             val dy = proj.second - cy
-            val dist2 = dx * dx + dy * dy
-            if (dist2 < bestScore) {
-                bestScore = dist2
-                best = p
-            }
+            kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        } else {
+            5000f +
+                    absAngleDiff(point.azimuth, cameraAzimuth) * 20f +
+                    kotlin.math.abs(point.pitch - cameraPitch) * 35f
+        }
+    }
+
+    private fun isNearCenter(point: CapturePoint, radiusPx: Float): Boolean {
+        val cx = width / 2f
+        val cy = height / 2f
+        val proj = projectToScreen(point.azimuth, point.pitch) ?: return false
+        val dx = proj.first - cx
+        val dy = proj.second - cy
+        val dist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
+        return dist <= radiusPx
+    }
+
+    private fun updateActivePoint() {
+        val candidates = capturePoints.filter { !it.isCaptured }
+
+        if (candidates.isEmpty()) {
+            activePoint = null
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
         }
 
-        // 2) Fallback: si ninguno es visible, elegimos por error angular
+        val best = candidates.minByOrNull { candidateScore(it) }
+
         if (best == null) {
-            bestScore = Float.MAX_VALUE
-            for (p in candidates) {
-                val dAz = absAngleDiff(p.azimuth, cameraAzimuth)
-                val dPi = kotlin.math.abs(p.pitch - cameraPitch)
-                val score = dAz + (2f * dPi)
-                if (score < bestScore) {
-                    bestScore = score
-                    best = p
-                }
-            }
+            activePoint = null
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
         }
 
-        activePoint = best
+        val current = activePoint
+
+        if (current == null || current.isCaptured) {
+            activePoint = best
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
+        }
+
+        if (current == best) {
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
+        }
+
+        if (isNearCenter(current, centerLockRadiusPx)) {
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
+        }
+
+        val currentScore = candidateScore(current)
+        val bestScore = candidateScore(best)
+        val margin = if (zenithMode) 18f else switchMarginPx
+
+        if (bestScore + margin < currentScore) {
+            if (pendingActivePoint == best) {
+                pendingActiveFrames++
+            } else {
+                pendingActivePoint = best
+                pendingActiveFrames = 1
+            }
+
+            if (pendingActiveFrames >= switchConfirmFrames) {
+                activePoint = best
+                pendingActivePoint = null
+                pendingActiveFrames = 0
+            }
+        } else {
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+        }
     }
 }
