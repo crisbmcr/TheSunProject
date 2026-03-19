@@ -63,6 +63,14 @@ class GuideView @JvmOverloads constructor(
 
     private var lastSwitchAtMs = 0L
     private var lastTargetLogMs = 0L
+    private data class Vec3(val x: Float, val y: Float, val z: Float)
+
+    private var camForward = Vec3(0f, 1f, 0f)
+    private var camRight = Vec3(1f, 0f, 0f)
+    private var camUp = Vec3(0f, 0f, 1f)
+
+    private var latchedProjectionYawDeg = 0f
+
 
     init {
         setupCapturePoints()
@@ -85,9 +93,12 @@ class GuideView @JvmOverloads constructor(
     data class CapturePoint(val azimuth: Float, val pitch: Float, var isCaptured: Boolean = false)
 
     fun updateOrientation(azimuth: Float, pitch: Float, roll: Float) {
-        this.cameraAzimuth = azimuth
-        this.cameraPitch = pitch
-        this.cameraRoll = roll
+        cameraAzimuth = azimuth
+        cameraPitch = pitch
+        cameraRoll = roll
+
+        buildCameraBasis(azimuth, pitch, roll)
+
         updateActivePoint()
         invalidate()
     }
@@ -114,58 +125,36 @@ class GuideView @JvmOverloads constructor(
         super.onDraw(canvas)
         if (tanVerticalFovHalf == 0f) return
 
-        val centerX = width / 2f
-        val centerY = height / 2f
-
-        canvas.save()
-        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
-        canvas.rotate(-appliedRoll, centerX, centerY)
-
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
-        // Esto sí debe rotar con el teléfono
         drawHorizon(canvas)
         drawAzimuthDivisions(canvas)
         drawCapturePoints(canvas)
-
-        canvas.restore()
-
-        // Esto NO debe rotar, para evitar texto borroso
         drawAzimuthLabels(canvas)
         drawReticle(canvas)
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
-        if (zenithMode && targetPitch >= 80f) {
-            return Pair(width / 2f, height / 2f)
-        }
+        val dir = worldDir(targetAzimuth, targetPitch)
 
-        val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540f) % 360f - 180f
-        val deltaPitch = targetPitch - cameraPitch
+        val camX = dot(dir, camRight)
+        val camY = dot(dir, camUp)
+        val camZ = dot(dir, camForward)
 
-        val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
-        val azimuthWeight = if (zenithMode) {
-            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
-        } else {
-            1f
-        }
+        if (camZ <= 0f) return null
 
-        val effectiveDeltaAzimuth = deltaAzimuth * azimuthWeight
+        val nx = (camX / camZ) / tanHorizontalFovHalf
+        val ny = (camY / camZ) / tanVerticalFovHalf
 
-        val projectedX = tan(Math.toRadians(effectiveDeltaAzimuth.toDouble())).toFloat()
-        val projectedY = tan(Math.toRadians(deltaPitch.toDouble())).toFloat()
+        if (abs(nx) > 1f || abs(ny) > 1f) return null
 
-        if (abs(projectedX) > tanHorizontalFovHalf || abs(projectedY) > tanVerticalFovHalf) {
-            return null
-        }
+        val cx = width / 2f
+        val cy = height / 2f
 
-        val centerX = width / 2f
-        val centerY = height / 2f
+        val x = cx + nx * cx
+        val y = cy - ny * cy
 
-        val screenX = centerX + (projectedX / tanHorizontalFovHalf) * centerX
-        val screenY = centerY - (projectedY / tanVerticalFovHalf) * centerY
-
-        return Pair(screenX, screenY)
+        return Pair(x, y)
     }
 
     private fun setupCapturePoints() {
@@ -350,7 +339,68 @@ class GuideView @JvmOverloads constructor(
                     "camAz=${"%.2f".format(cameraAzimuth)} camPitch=${"%.2f".format(cameraPitch)} camRoll=${"%.2f".format(cameraRoll)}"
         )
     }
+    private fun vec3(x: Float, y: Float, z: Float) = Vec3(x, y, z)
 
+    private fun dot(a: Vec3, b: Vec3): Float =
+        a.x * b.x + a.y * b.y + a.z * b.z
+
+    private fun cross(a: Vec3, b: Vec3): Vec3 =
+        Vec3(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x
+        )
+
+    private fun norm(v: Vec3): Float =
+        hypot(v.x.toDouble(), hypot(v.y.toDouble(), v.z.toDouble())).toFloat()
+
+    private fun normalize(v: Vec3): Vec3 {
+        val n = norm(v)
+        if (n < 1e-6f) return Vec3(0f, 0f, 0f)
+        return Vec3(v.x / n, v.y / n, v.z / n)
+    }
+
+    private fun add(a: Vec3, b: Vec3): Vec3 =
+        Vec3(a.x + b.x, a.y + b.y, a.z + b.z)
+
+    private fun scale(v: Vec3, s: Float): Vec3 =
+        Vec3(v.x * s, v.y * s, v.z * s)
+
+    private fun worldDir(azimuthDeg: Float, altitudeDeg: Float): Vec3 {
+        val az = Math.toRadians(azimuthDeg.toDouble())
+        val alt = Math.toRadians(altitudeDeg.toDouble())
+
+        val cosAlt = kotlin.math.cos(alt).toFloat()
+        val xEast = (cosAlt * kotlin.math.sin(az)).toFloat()
+        val yNorth = (cosAlt * kotlin.math.cos(az)).toFloat()
+        val zUp = kotlin.math.sin(alt).toFloat()
+
+        return normalize(Vec3(xEast, yNorth, zUp))
+    }
+
+    private fun buildCameraBasis(azimuthDeg: Float, pitchDeg: Float, rollDeg: Float) {
+        val projectionYaw = if (zenithMode || pitchDeg >= 72f) {
+            latchedProjectionYawDeg
+        } else {
+            azimuthDeg.also { latchedProjectionYawDeg = it }
+        }
+
+        val forward = worldDir(projectionYaw, pitchDeg)
+
+        var right0 = cross(forward, Vec3(0f, 0f, 1f))
+        if (norm(right0) < 1e-4f) right0 = Vec3(1f, 0f, 0f)
+        right0 = normalize(right0)
+
+        val up0 = normalize(cross(right0, forward))
+
+        val r = Math.toRadians(rollDeg.toDouble()).toFloat()
+        val cosR = kotlin.math.cos(r)
+        val sinR = kotlin.math.sin(r)
+
+        camRight = normalize(add(scale(right0, cosR), scale(up0, sinR)))
+        camUp = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
+        camForward = forward
+    }
     private fun updateActivePoint() {
         val candidates = capturePoints.filter { !it.isCaptured }
 

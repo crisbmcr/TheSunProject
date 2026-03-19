@@ -75,6 +75,24 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     //private val alpha = 0.08f
     //private var isFirstReading = true
     private data class Vec3(var x: Float, var y: Float, var z: Float)
+    private var gameRotationVectorSensor: Sensor? = null
+    private var magneticFieldSensor: Sensor? = null
+
+    private var magneticAccuracy: Int = SensorManager.SENSOR_STATUS_UNRELIABLE
+    private var magneticFieldNormUt: Float = 0f
+
+    private var gameYawDeg = 0f
+    private var gamePitchDeg = 0f
+    private var gameRollDeg = 0f
+
+    private var absoluteYawDeg = 0f
+    private var displayNorthOffsetDeg = 0f
+    private var displayOffsetInitialized = false
+
+    private var lastAbsTsNs: Long = 0L
+    private var lastGameTsNs: Long = 0L
+
+    private val gameDisplayFilter = AngleFilterState()
 
     private var guidePoseInitialized = false
     private var guideForward = Vec3(0f, 1f, 0f)
@@ -202,7 +220,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-
+        gameRotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+        magneticFieldSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
         btnCapture.setOnClickListener { takePhotoManual() }
 
         // Long-press para FORZAR stitch con 2+ fotos (debug)
@@ -250,6 +269,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         rotationVectorSensor?.also { sensor ->
             sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
         }
+
+        rotationVectorSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+
+        gameRotationVectorSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+
+        magneticFieldSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
     }
 
     override fun onPause() {
@@ -263,84 +294,109 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         try { cameraExecutor.shutdown() } catch (_: Throwable) {}
     }
 
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
+        if (sensor?.type == Sensor.TYPE_MAGNETIC_FIELD) {
+            magneticAccuracy = accuracy
+            Log.d(
+                "SunSensors",
+                "magAccuracy=$accuracy fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT"
+            )
+        }
+    }
 
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
+        when (event.sensor.type) {
+            Sensor.TYPE_MAGNETIC_FIELD -> {
+                val x = event.values[0]
+                val y = event.values[1]
+                val z = event.values[2]
+                magneticFieldNormUt = sqrt(x * x + y * y + z * z)
+            }
 
-        SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+            Sensor.TYPE_ROTATION_VECTOR -> {
+                val raw = extractAnglesFromRotationVector(event.values)
 
-        SensorManager.remapCoordinateSystem(
-            rotationMatrix,
-            SensorManager.AXIS_X,
-            SensorManager.AXIS_Z,
-            remappedRotationMatrix
-        )
+                val rawAz = applyDeclination(raw[0])
+                val rawPitch = raw[1]
+                val rawRoll = raw[2]
 
-        val rawAzimuth = (
-                Math.toDegrees(
-                    SensorManager.getOrientation(remappedRotationMatrix, orientationAngles)[0].toDouble()
-                ).toFloat() + 360f
-                ) % 360f
+                val dtSec = sensorDtSec(event.timestamp, lastAbsTsNs)
+                lastAbsTsNs = event.timestamp
 
-        val rawPitch = Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
-        val rawRoll = Math.toDegrees(
-            -atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()
-        ).toFloat()
+                val alpha = adaptiveAlpha(dtSec, tauSec = 0.10f)
+                val captureAngles = filterAngles(captureFilter, rawAz, rawPitch, rawRoll, alpha)
 
-        val dtSec = if (lastSensorTsNs == 0L) {
-            0.016f
-        } else {
-            ((event.timestamp - lastSensorTsNs).toDouble() / 1_000_000_000.0)
-                .toFloat()
-                .coerceIn(0.001f, 0.05f)
+                lastAzimuth = captureAngles[0]
+                lastPitch = captureAngles[1]
+                lastRoll = captureAngles[2]
+
+                absoluteYawDeg = lastAzimuth
+
+                if (!displayOffsetInitialized && gameRotationVectorSensor == null) {
+                    displayAzimuth = lastAzimuth
+                    displayPitchDeg = lastPitch
+                    displayRollDeg = lastRoll
+                    guideView.setZenithMode(isZenithTarget(guideView.getActiveCapturePoint()))
+                    guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+                    checkAutoCapture()
+                }
+            }
+
+            Sensor.TYPE_GAME_ROTATION_VECTOR -> {
+                val raw = extractAnglesFromRotationVector(event.values)
+
+                val dtSec = sensorDtSec(event.timestamp, lastGameTsNs)
+                lastGameTsNs = event.timestamp
+
+                val alpha = adaptiveAlpha(dtSec, tauSec = 0.22f)
+                val displayAngles = filterAngles(gameDisplayFilter, raw[0], raw[1], raw[2], alpha)
+
+                gameYawDeg = displayAngles[0]
+                gamePitchDeg = displayAngles[1]
+                gameRollDeg = displayAngles[2]
+
+                if (!displayOffsetInitialized && absoluteYawDeg != 0f) {
+                    displayNorthOffsetDeg = normalize360(absoluteYawDeg - gameYawDeg)
+                    displayOffsetInitialized = true
+                }
+
+                val zenithMode =
+                    isZenithTarget(guideView.getActiveCapturePoint()) || gamePitchDeg >= 72f
+
+                if (displayOffsetInitialized && headingReliable() && !zenithMode) {
+                    val targetOffset = normalize360(absoluteYawDeg - gameYawDeg)
+                    displayNorthOffsetDeg = blendAngleDeg(displayNorthOffsetDeg, targetOffset, 0.03f)
+                }
+
+                displayAzimuth = if (displayOffsetInitialized) {
+                    normalize360(gameYawDeg + displayNorthOffsetDeg)
+                } else {
+                    absoluteYawDeg
+                }
+
+                displayPitchDeg = gamePitchDeg
+                displayRollDeg = if (zenithMode) gameRollDeg * 0.15f else gameRollDeg
+
+                guideView.setZenithMode(zenithMode)
+                guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+
+                debugAzimuth.text = "Azimuth: ${displayAzimuth.toInt()}°"
+                debugPitch.text = "Pitch: ${displayPitchDeg.toInt()}°"
+                debugRoll.text = "Roll: ${displayRollDeg.toInt()}°"
+
+                Log.d(
+                    "SunSensors",
+                    "absYaw=${"%.2f".format(absoluteYawDeg)} " +
+                            "gameYaw=${"%.2f".format(gameYawDeg)} " +
+                            "offset=${"%.2f".format(displayNorthOffsetDeg)} " +
+                            "dispYaw=${"%.2f".format(displayAzimuth)} " +
+                            "magAcc=$magneticAccuracy " +
+                            "field=${"%.1f".format(magneticFieldNormUt)}uT"
+                )
+
+                checkAutoCapture()
+            }
         }
-        lastSensorTsNs = event.timestamp
-
-        var correctedAzimuth = rawAzimuth
-        lastLocation?.let {
-            val geomagneticField = GeomagneticField(
-                it.latitude.toFloat(),
-                it.longitude.toFloat(),
-                it.altitude.toFloat(),
-                System.currentTimeMillis()
-            )
-            correctedAzimuth = normalize360(correctedAzimuth + geomagneticField.declination)
-        }
-
-        // Ruta de medición: esta se sigue guardando en metadata/atlas
-        val captureAlpha = adaptiveAlpha(dtSec, tauSec = 0.10f)
-        val measuredAngles = filterAngles(
-            captureFilter,
-            correctedAzimuth,
-            rawPitch,
-            rawRoll,
-            captureAlpha
-        )
-
-        lastAzimuth = measuredAngles[0]
-        lastPitch = measuredAngles[1]
-        lastRoll = measuredAngles[2]
-
-        // Ruta de guía: estable para UI y auto-captura
-        val displayAlpha = adaptiveAlpha(dtSec, tauSec = 0.32f)
-        updateGuidePose(correctedAzimuth, rawPitch, rawRoll, displayAlpha)
-
-        val zenithMode =
-            isZenithTarget(guideView.getActiveCapturePoint()) || guidePitchDeg >= 72f
-
-        displayAzimuth = guideAzimuthDeg
-        displayPitchDeg = guidePitchDeg
-        displayRollDeg = if (zenithMode) guideRollDeg * 0.10f else guideRollDeg
-
-        guideView.setZenithMode(zenithMode)
-        guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
-
-        debugAzimuth.text = "Azimuth: ${displayAzimuth.toInt()}°"
-        debugPitch.text = "Pitch: ${displayPitchDeg.toInt()}°"
-        debugRoll.text = "Roll: ${displayRollDeg.toInt()}°"
-
-        checkAutoCapture()
     }
 
     private fun checkAutoCapture() {
@@ -358,30 +414,34 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
-        val zenithMode = isZenithTarget(target)
+        val zenithMode = isZenithTarget(target) || displayPitchDeg >= 72f
 
-        val alignAz = displayAzimuth
-        val alignPitch = displayPitchDeg
-        val alignRoll = displayRollDeg
+        if (!zenithMode && !headingReliable()) {
+            alignmentStartMs = 0L
+            Log.d("SunGuideAuto", "paused: magnetic accuracy too low")
+            return
+        }
 
-        val dAz = absAngleDiff(alignAz, target.azimuth)
-        val dPitch = abs(alignPitch - target.pitch)
-        val dRoll = abs(alignRoll)
+        val dirErr = directionErrorDeg(
+            displayAzimuth,
+            displayPitchDeg,
+            target.azimuth,
+            target.pitch
+        )
 
         val aligned = if (zenithMode) {
-            dPitch <= (pitchTolDeg + 1.0f)
+            dirErr <= 2.5f
         } else {
-            dAz <= azTolDeg &&
-                    dPitch <= pitchTolDeg &&
-                    dRoll <= rollTolDeg
+            dirErr <= 3.8f
         }
 
         Log.d(
             "SunGuideAuto",
             "target=${target.azimuth}/${target.pitch} " +
-                    "alignAz=$alignAz alignPitch=$alignPitch alignRoll=$alignRoll " +
-                    "metaAz=$lastAzimuth metaPitch=$lastPitch metaRoll=$lastRoll " +
-                    "dAz=$dAz dPitch=$dPitch dRoll=$dRoll aligned=$aligned"
+                    "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
+                    "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
+                    "dirErr=${"%.2f".format(dirErr)} " +
+                    "zenith=$zenithMode magAcc=$magneticAccuracy aligned=$aligned"
         )
 
         val now = SystemClock.elapsedRealtime()
@@ -952,19 +1012,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private fun scale(v: Vec3, s: Float): Vec3 =
         Vec3(v.x * s, v.y * s, v.z * s)
 
-    private fun worldForwardFromAngles(azDeg: Float, pitchDeg: Float): Vec3 {
-        val az = Math.toRadians(azDeg.toDouble())
-        val alt = Math.toRadians(pitchDeg.toDouble())
-        val cosAlt = cos(alt).toFloat()
-        return normalize(
-            Vec3(
-                (cosAlt * sin(az)).toFloat(),
-                (cosAlt * cos(az)).toFloat(),
-                sin(alt).toFloat()
-            )
-        )
-    }
-
     private fun worldUpFromAngles(azDeg: Float, pitchDeg: Float, rollDeg: Float): Vec3 {
         val forward = worldForwardFromAngles(azDeg, pitchDeg)
         var right0 = cross(forward, Vec3(0f, 0f, 1f))
@@ -1126,6 +1173,86 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
             }
         }
+    }
+
+    private fun sensorDtSec(tsNs: Long, lastTsNs: Long): Float {
+        return if (lastTsNs == 0L) {
+            0.016f
+        } else {
+            ((tsNs - lastTsNs).toDouble() / 1_000_000_000.0)
+                .toFloat()
+                .coerceIn(0.001f, 0.05f)
+        }
+    }
+
+    private fun extractAnglesFromRotationVector(values: FloatArray): FloatArray {
+        SensorManager.getRotationMatrixFromVector(rotationMatrix, values)
+
+        SensorManager.remapCoordinateSystem(
+            rotationMatrix,
+            SensorManager.AXIS_X,
+            SensorManager.AXIS_Z,
+            remappedRotationMatrix
+        )
+
+        val azimuth = (
+                Math.toDegrees(
+                    SensorManager.getOrientation(remappedRotationMatrix, orientationAngles)[0].toDouble()
+                ).toFloat() + 360f
+                ) % 360f
+
+        val pitch = Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
+        val roll = Math.toDegrees(
+            -atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()
+        ).toFloat()
+
+        return floatArrayOf(azimuth, pitch, roll)
+    }
+
+    private fun applyDeclination(azimuthDeg: Float): Float {
+        var out = azimuthDeg
+        lastLocation?.let {
+            val geomagneticField = GeomagneticField(
+                it.latitude.toFloat(),
+                it.longitude.toFloat(),
+                it.altitude.toFloat(),
+                System.currentTimeMillis()
+            )
+            out = normalize360(out + geomagneticField.declination)
+        }
+        return out
+    }
+
+    private fun blendAngleDeg(current: Float, target: Float, alpha: Float): Float {
+        return normalize360(current + alpha * angleDeltaDeg(target, current))
+    }
+
+    private fun headingReliable(): Boolean {
+        return magneticAccuracy >= SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM
+    }
+
+    private fun worldForwardFromAngles(azDeg: Float, pitchDeg: Float): FloatArray {
+        val az = Math.toRadians(azDeg.toDouble())
+        val alt = Math.toRadians(pitchDeg.toDouble())
+        val cosAlt = cos(alt).toFloat()
+        return floatArrayOf(
+            (cosAlt * sin(az)).toFloat(),
+            (cosAlt * cos(az)).toFloat(),
+            kotlin.math.sin(alt).toFloat()
+        )
+    }
+
+    private fun directionErrorDeg(
+        camAz: Float,
+        camPitch: Float,
+        targetAz: Float,
+        targetPitch: Float
+    ): Float {
+        val a = worldForwardFromAngles(camAz, camPitch)
+        val b = worldForwardFromAngles(targetAz, targetPitch)
+
+        val d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(d.toDouble())).toFloat()
     }
 
     companion object {
