@@ -1231,14 +1231,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         return magneticAccuracy >= SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM
     }
 
-    private fun worldForwardFromAngles(azDeg: Float, pitchDeg: Float): FloatArray {
+    private fun worldForwardFromAngles(azDeg: Float, pitchDeg: Float): Vec3 {
         val az = Math.toRadians(azDeg.toDouble())
         val alt = Math.toRadians(pitchDeg.toDouble())
         val cosAlt = cos(alt).toFloat()
-        return floatArrayOf(
-            (cosAlt * sin(az)).toFloat(),
-            (cosAlt * cos(az)).toFloat(),
-            kotlin.math.sin(alt).toFloat()
+
+        return normalize(
+            Vec3(
+                (cosAlt * sin(az)).toFloat(),
+                (cosAlt * cos(az)).toFloat(),
+                kotlin.math.sin(alt).toFloat()
+            )
         )
     }
 
@@ -1251,7 +1254,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val a = worldForwardFromAngles(camAz, camPitch)
         val b = worldForwardFromAngles(targetAz, targetPitch)
 
-        val d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).coerceIn(-1f, 1f)
+        val d = dot(a, b).coerceIn(-1f, 1f)
         return Math.toDegrees(acos(d.toDouble())).toFloat()
     }
 
