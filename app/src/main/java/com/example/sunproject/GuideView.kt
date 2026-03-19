@@ -118,18 +118,19 @@ class GuideView @JvmOverloads constructor(
         val centerY = height / 2f
 
         canvas.save()
-        val appliedRoll = if (zenithMode) cameraRoll * 0.10f else cameraRoll
+        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
         canvas.rotate(-appliedRoll, centerX, centerY)
 
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
+        // Esto sí debe rotar con el teléfono
         drawHorizon(canvas)
         drawAzimuthDivisions(canvas)
         drawCapturePoints(canvas)
 
         canvas.restore()
 
-        // Etiquetas fuera de la rotación para que no se difuminen
+        // Esto NO debe rotar, para evitar texto borroso
         drawAzimuthLabels(canvas)
         drawReticle(canvas)
     }
@@ -144,7 +145,7 @@ class GuideView @JvmOverloads constructor(
 
         val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
         val azimuthWeight = if (zenithMode) {
-            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.05f, 0.30f)
+            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
         } else {
             1f
         }
@@ -219,20 +220,17 @@ class GuideView @JvmOverloads constructor(
 
                 textPaint.getTextBounds(label, 0, label.length, textMeasureRect)
 
-                val labelTop = y + 44f
-                val labelBottom = y + 82f
-
-                val labelRect = Rect(
+                val rect = Rect(
                     (x - textMeasureRect.width() / 2f - 8f).toInt(),
-                    labelTop.toInt(),
+                    (y + 44f).toInt(),
                     (x + textMeasureRect.width() / 2f + 8f).toInt(),
-                    labelBottom.toInt()
+                    (y + 82f).toInt()
                 )
 
-                val overlaps = drawnLabels.any { Rect.intersects(it, labelRect) }
+                val overlaps = drawnLabels.any { Rect.intersects(it, rect) }
                 if (!overlaps) {
                     canvas.drawText(label, x, y + 72f, textPaint)
-                    drawnLabels.add(labelRect)
+                    drawnLabels.add(rect)
                 }
             }
         }

@@ -358,18 +358,31 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
-        val zenithMode = isZenithTarget(target) || guidePitchDeg >= 72f
+        val zenithMode = isZenithTarget(target)
 
-        val dirErr = if (zenithMode) zenithErrorDeg() else directionErrorDeg(target.azimuth, target.pitch)
-        val zenErr = zenithErrorDeg()
+        val alignAz = displayAzimuth
+        val alignPitch = displayPitchDeg
+        val alignRoll = displayRollDeg
+
+        val dAz = absAngleDiff(alignAz, target.azimuth)
+        val dPitch = abs(alignPitch - target.pitch)
+        val dRoll = abs(alignRoll)
 
         val aligned = if (zenithMode) {
-            dirErr <= 2.4f
+            dPitch <= (pitchTolDeg + 1.0f)
         } else {
-            dirErr <= 4.2f
+            dAz <= azTolDeg &&
+                    dPitch <= pitchTolDeg &&
+                    dRoll <= rollTolDeg
         }
 
-        maybeLogGuide(target, aligned, dirErr, zenErr)
+        Log.d(
+            "SunGuideAuto",
+            "target=${target.azimuth}/${target.pitch} " +
+                    "alignAz=$alignAz alignPitch=$alignPitch alignRoll=$alignRoll " +
+                    "metaAz=$lastAzimuth metaPitch=$lastPitch metaRoll=$lastRoll " +
+                    "dAz=$dAz dPitch=$dPitch dRoll=$dRoll aligned=$aligned"
+        )
 
         val now = SystemClock.elapsedRealtime()
 
