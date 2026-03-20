@@ -97,6 +97,8 @@ class GuideView @JvmOverloads constructor(
         this.cameraPitch = pitch
         this.cameraRoll = roll
 
+        buildCameraBasis(azimuth, pitch, roll)
+
         Log.d(
             "SunGuidePose",
             "az=${"%.2f".format(azimuth)} pitch=${"%.2f".format(pitch)} roll=${"%.2f".format(roll)} zenith=$zenithMode"
