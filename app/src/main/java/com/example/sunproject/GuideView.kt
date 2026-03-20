@@ -154,7 +154,14 @@ class GuideView @JvmOverloads constructor(
 
         val nx = (camX / camZ) / tanHorizontalFovHalf
         val ny = (camY / camZ) / tanVerticalFovHalf
-
+        if (targetPitch == 45f || targetPitch >= 80f || targetPitch == 0f) {
+            Log.d(
+                "SunProjectToScreen",
+                "target=$targetAzimuth/$targetPitch camZ=${"%.3f".format(camZ)} " +
+                        "camX=${"%.3f".format(camX)} camY=${"%.3f".format(camY)} " +
+                        "nx=${"%.3f".format(nx)} ny=${"%.3f".format(ny)} zenith=$zenithMode"
+            )
+        }
         if (abs(nx) > 1f || abs(ny) > 1f) return null
 
         val cx = width / 2f
@@ -401,7 +408,7 @@ class GuideView @JvmOverloads constructor(
 
         val up0 = normalize(cross(right0, forward))
 
-        val r = Math.toRadians(rollDeg.toDouble()).toFloat()
+        val r = Math.toRadians((-rollDeg).toDouble()).toFloat()
         val cosR = kotlin.math.cos(r)
         val sinR = kotlin.math.sin(r)
 
@@ -415,8 +422,17 @@ class GuideView @JvmOverloads constructor(
                     "camRight=(${String.format("%.3f", camRight.x)}, ${String.format("%.3f", camRight.y)}, ${String.format("%.3f", camRight.z)})"
         )
     }
+    private fun stageCandidates(): List<CapturePoint> {
+        val uncaptured = capturePoints.filter { !it.isCaptured }
+
+        return when {
+            uncaptured.any { it.pitch == 0f } -> uncaptured.filter { it.pitch == 0f }
+            uncaptured.any { it.pitch == 45f } -> uncaptured.filter { it.pitch == 45f }
+            else -> uncaptured.filter { it.pitch >= 80f }
+        }
+    }
     private fun updateActivePoint() {
-        val candidates = capturePoints.filter { !it.isCaptured }
+        val candidates = stageCandidates()
 
         if (candidates.isEmpty()) {
             activePoint = null

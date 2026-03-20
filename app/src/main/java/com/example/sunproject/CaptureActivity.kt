@@ -336,9 +336,20 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     displayAzimuth = lastAzimuth
                     displayPitchDeg = lastPitch
                     displayRollDeg = lastRoll
+                    Log.d(
+                        "SunSensorFusion",
+                        "gameYaw=${"%.2f".format(gameYawDeg)} " +
+                                "gamePitch=${"%.2f".format(gamePitchDeg)} " +
+                                "gameRoll=${"%.2f".format(gameRollDeg)} " +
+                                "dispYaw=${"%.2f".format(displayAzimuth)} " +
+                                "dispPitch=${"%.2f".format(displayPitchDeg)} " +
+                                "dispRoll=${"%.2f".format(displayRollDeg)} " +
+                                "zenith="
+                    )
                     guideView.setZenithMode(isZenithTarget(guideView.getActiveCapturePoint()))
                     guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
                     checkAutoCapture()
+
                 }
             }
 
@@ -360,22 +371,31 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     displayOffsetInitialized = true
                 }
 
-                val zenithMode =
-                    isZenithTarget(guideView.getActiveCapturePoint()) || displayPitchDeg >= 68f
+                val currentPitch = gamePitchDeg
+                val activeTarget = guideView.getActiveCapturePoint()
+                val zenithMode = isZenithTarget(activeTarget)
+                val nearZenith = kotlin.math.abs(gamePitchDeg) >= 75f
 
-                if (displayOffsetInitialized && headingReliable() && !zenithMode) {
-                    val targetOffset = normalize360(absoluteYawDeg - gameYawDeg)
-                    displayNorthOffsetDeg = blendAngleDeg(displayNorthOffsetDeg, targetOffset, 0.03f)
-                }
-
-                displayAzimuth = if (displayOffsetInitialized) {
+                displayAzimuth = if (absoluteYawDeg != 0f) {
+                    absoluteYawDeg
+                } else if (displayOffsetInitialized) {
                     normalize360(gameYawDeg + displayNorthOffsetDeg)
                 } else {
-                    absoluteYawDeg
+                    gameYawDeg
                 }
 
                 displayPitchDeg = gamePitchDeg
-                displayRollDeg = if (zenithMode) gameRollDeg * 0.15f else gameRollDeg
+                displayRollDeg = if (nearZenith) gameRollDeg * 0.15f else gameRollDeg
+
+                guideView.setZenithMode(zenithMode)
+                guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+
+                Log.d(
+                    "SunSensorFusion",
+                    "absYaw=${"%.2f".format(absoluteYawDeg)} gameYaw=${"%.2f".format(gameYawDeg)} " +
+                            "dispYaw=${"%.2f".format(displayAzimuth)} dispPitch=${"%.2f".format(displayPitchDeg)} " +
+                            "dispRoll=${"%.2f".format(displayRollDeg)} zenith=$zenithMode nearZenith=$nearZenith"
+                )
 
                 guideView.setZenithMode(zenithMode)
                 guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
@@ -414,7 +434,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
-        val zenithMode = isZenithTarget(target) || displayPitchDeg >= 68f
+        val zenithMode = isZenithTarget(target)
 
         val dirErr = directionErrorDeg(
             displayAzimuth,
@@ -1198,7 +1218,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 ).toFloat() + 360f
                 ) % 360f
 
-        val pitch = -Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
+        val pitch = Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
         val roll = Math.toDegrees(
             -atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()
         ).toFloat()
