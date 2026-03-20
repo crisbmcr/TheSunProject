@@ -93,11 +93,14 @@ class GuideView @JvmOverloads constructor(
     data class CapturePoint(val azimuth: Float, val pitch: Float, var isCaptured: Boolean = false)
 
     fun updateOrientation(azimuth: Float, pitch: Float, roll: Float) {
-        cameraAzimuth = azimuth
-        cameraPitch = pitch
-        cameraRoll = roll
+        this.cameraAzimuth = azimuth
+        this.cameraPitch = pitch
+        this.cameraRoll = roll
 
-        buildCameraBasis(azimuth, pitch, roll)
+        Log.d(
+            "SunGuidePose",
+            "az=${"%.2f".format(azimuth)} pitch=${"%.2f".format(pitch)} roll=${"%.2f".format(roll)} zenith=$zenithMode"
+        )
 
         updateActivePoint()
         invalidate()
@@ -125,36 +128,56 @@ class GuideView @JvmOverloads constructor(
         super.onDraw(canvas)
         if (tanVerticalFovHalf == 0f) return
 
+        val centerX = width / 2f
+        val centerY = height / 2f
+
+        canvas.save()
+        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
+        canvas.rotate(appliedRoll, centerX, centerY)
+
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
         drawHorizon(canvas)
         drawAzimuthDivisions(canvas)
         drawCapturePoints(canvas)
+
+        canvas.restore()
+
         drawAzimuthLabels(canvas)
         drawReticle(canvas)
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
-        val dir = worldDir(targetAzimuth, targetPitch)
+        if (zenithMode && targetPitch >= 80f) {
+            return Pair(width / 2f, height / 2f)
+        }
 
-        val camX = dot(dir, camRight)
-        val camY = dot(dir, camUp)
-        val camZ = dot(dir, camForward)
+        val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540f) % 360f - 180f
+        val deltaPitch = targetPitch - cameraPitch
 
-        if (camZ <= 0f) return null
+        val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
+        val azimuthWeight = if (zenithMode) {
+            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
+        } else {
+            1f
+        }
 
-        val nx = (camX / camZ) / tanHorizontalFovHalf
-        val ny = (camY / camZ) / tanVerticalFovHalf
+        val effectiveDeltaAzimuth = deltaAzimuth * azimuthWeight
 
-        if (abs(nx) > 1f || abs(ny) > 1f) return null
+        val projectedX = tan(Math.toRadians(effectiveDeltaAzimuth.toDouble())).toFloat()
+        val projectedY = tan(Math.toRadians(deltaPitch.toDouble())).toFloat()
 
-        val cx = width / 2f
-        val cy = height / 2f
+        if (abs(projectedX) > tanHorizontalFovHalf || abs(projectedY) > tanVerticalFovHalf) {
+            return null
+        }
 
-        val x = cx + nx * cx
-        val y = cy - ny * cy
+        val centerX = width / 2f
+        val centerY = height / 2f
 
-        return Pair(x, y)
+        val screenX = centerX + (projectedX / tanHorizontalFovHalf) * centerX
+        val screenY = centerY - (projectedY / tanVerticalFovHalf) * centerY
+
+        return Pair(screenX, screenY)
     }
 
     private fun setupCapturePoints() {
@@ -176,7 +199,6 @@ class GuideView @JvmOverloads constructor(
         canvas.drawPath(horizonPath, horizonPaint)
     }
 
-    // CORREGIDO: Lógica para dibujar las divisiones cada 10°
     private fun drawAzimuthDivisions(canvas: Canvas) {
         for (az in 0 until 360 step 30) {
             projectToScreen(az.toFloat(), 0f)?.let { (x, y) ->

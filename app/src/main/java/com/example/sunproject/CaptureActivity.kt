@@ -414,34 +414,30 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
-        val zenithMode = isZenithTarget(target) || displayPitchDeg >= 72f
+        val zenithMode = isZenithTarget(target)
 
-        if (!zenithMode && !headingReliable()) {
-            alignmentStartMs = 0L
-            Log.d("SunGuideAuto", "paused: magnetic accuracy too low")
-            return
-        }
+        val alignAz = displayAzimuth
+        val alignPitch = displayPitchDeg
+        val alignRoll = displayRollDeg
 
-        val dirErr = directionErrorDeg(
-            displayAzimuth,
-            displayPitchDeg,
-            target.azimuth,
-            target.pitch
-        )
+        val dAz = absAngleDiff(alignAz, target.azimuth)
+        val dPitch = abs(alignPitch - target.pitch)
+        val dRoll = abs(alignRoll)
 
         val aligned = if (zenithMode) {
-            dirErr <= 2.5f
+            dPitch <= (pitchTolDeg + 1.0f)
         } else {
-            dirErr <= 3.8f
+            dAz <= azTolDeg &&
+                    dPitch <= pitchTolDeg &&
+                    dRoll <= rollTolDeg
         }
 
         Log.d(
             "SunGuideAuto",
             "target=${target.azimuth}/${target.pitch} " +
-                    "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
-                    "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
-                    "dirErr=${"%.2f".format(dirErr)} " +
-                    "zenith=$zenithMode magAcc=$magneticAccuracy aligned=$aligned"
+                    "alignAz=$alignAz alignPitch=$alignPitch alignRoll=$alignRoll " +
+                    "metaAz=$lastAzimuth metaPitch=$lastPitch metaRoll=$lastRoll " +
+                    "dAz=$dAz dPitch=$dPitch dRoll=$dRoll aligned=$aligned"
         )
 
         val now = SystemClock.elapsedRealtime()
@@ -569,7 +565,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     appendFrameRecord(file, target, capturedFiles.size)
 
                     target.isCaptured = true
-                    guideView.postInvalidate()
+
+                    runOnUiThread {
+                        guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+                        guideView.invalidate()
+                    }
 
                     Log.i("PanoramaCAP", "Saved: ${file.absolutePath} (${capturedFiles.size}/$maxShots)")
                     runOnUiThread {
