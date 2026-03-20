@@ -372,8 +372,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val currentPitch = gamePitchDeg
-                val activeTarget = guideView.getActiveCapturePoint()
-                val zenithMode = isZenithTarget(activeTarget)
                 val nearZenith = kotlin.math.abs(gamePitchDeg) >= 75f
 
                 displayAzimuth = if (absoluteYawDeg != 0f) {
@@ -387,18 +385,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 displayPitchDeg = gamePitchDeg
                 displayRollDeg = if (nearZenith) gameRollDeg * 0.15f else gameRollDeg
 
-                guideView.setZenithMode(zenithMode)
                 guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
 
                 Log.d(
                     "SunSensorFusion",
                     "absYaw=${"%.2f".format(absoluteYawDeg)} gameYaw=${"%.2f".format(gameYawDeg)} " +
                             "dispYaw=${"%.2f".format(displayAzimuth)} dispPitch=${"%.2f".format(displayPitchDeg)} " +
-                            "dispRoll=${"%.2f".format(displayRollDeg)} zenith=$zenithMode nearZenith=$nearZenith"
+                            "dispRoll=${"%.2f".format(displayRollDeg)} nearZenith=$nearZenith"
                 )
-
-                guideView.setZenithMode(zenithMode)
-                guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
 
                 debugAzimuth.text = "Azimuth: ${displayAzimuth.toInt()}°"
                 debugPitch.text = "Pitch: ${displayPitchDeg.toInt()}°"
@@ -443,10 +437,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             target.pitch
         )
 
-        val aligned = if (zenithMode) {
-            dirErr <= 2.5f
-        } else {
-            dirErr <= 4.0f
+        val aligned = when {
+            zenithMode -> dirErr <= 2.5f
+            target.pitch >= 40f -> dirErr <= 7.5f
+            else -> dirErr <= 4.0f
         }
 
         Log.d(
@@ -582,7 +576,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     appendFrameRecord(file, target, capturedFiles.size)
 
                     target.isCaptured = true
-
+                    Log.d("SunGuideStage", "after_save ${guideView.getStageDebugString()}")
                     runOnUiThread {
                         guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
                         guideView.invalidate()

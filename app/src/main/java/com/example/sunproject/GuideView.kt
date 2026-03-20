@@ -323,12 +323,11 @@ class GuideView @JvmOverloads constructor(
         return hypot(dx.toDouble(), dy.toDouble()).toFloat()
     }
 
-    private fun visibleCandidates(): List<VisibleCandidate> {
+    private fun visibleCandidates(candidates: List<CapturePoint>): List<VisibleCandidate> {
         val cx = width / 2f
         val cy = height / 2f
 
-        return capturePoints
-            .filter { !it.isCaptured }
+        return candidates
             .mapNotNull { point ->
                 val proj = projectToScreen(point.azimuth, point.pitch) ?: return@mapNotNull null
                 val dx = proj.first - cx
@@ -431,9 +430,16 @@ class GuideView @JvmOverloads constructor(
             else -> uncaptured.filter { it.pitch >= 80f }
         }
     }
+    fun getStageDebugString(): String {
+        val h0 = capturePoints.count { !it.isCaptured && it.pitch == 0f }
+        val h45 = capturePoints.count { !it.isCaptured && it.pitch == 45f }
+        val z0 = capturePoints.count { !it.isCaptured && it.pitch >= 80f }
+        return "H0=$h0 H45=$h45 Z0=$z0 active=${activePoint?.azimuth}/${activePoint?.pitch} zenithMode=$zenithMode"
+    }
+
     private fun updateActivePoint() {
         val candidates = stageCandidates()
-
+        zenithMode = candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
         if (candidates.isEmpty()) {
             activePoint = null
             pendingActivePoint = null
@@ -442,7 +448,7 @@ class GuideView @JvmOverloads constructor(
         }
 
         val now = SystemClock.elapsedRealtime()
-        val visible = visibleCandidates()
+        val visible = visibleCandidates(candidates)
         val bestVisible = visible.firstOrNull()
 
         val current = activePoint?.takeUnless { it.isCaptured }
@@ -512,5 +518,6 @@ class GuideView @JvmOverloads constructor(
             pendingActivePoint = null
             pendingActiveFrames = 0
         }
+        Log.d("SunGuideStage", "update ${getStageDebugString()}")
     }
 }
