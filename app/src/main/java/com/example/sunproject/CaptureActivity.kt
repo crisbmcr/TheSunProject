@@ -361,7 +361,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val zenithMode =
-                    isZenithTarget(guideView.getActiveCapturePoint()) || gamePitchDeg >= 72f
+                    isZenithTarget(guideView.getActiveCapturePoint()) || displayPitchDeg >= 68f
 
                 if (displayOffsetInitialized && headingReliable() && !zenithMode) {
                     val targetOffset = normalize360(absoluteYawDeg - gameYawDeg)
@@ -414,30 +414,27 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (imageCapture == null) return
 
         val target = guideView.getActiveCapturePoint() ?: return
-        val zenithMode = isZenithTarget(target)
+        val zenithMode = isZenithTarget(target) || displayPitchDeg >= 68f
 
-        val alignAz = displayAzimuth
-        val alignPitch = displayPitchDeg
-        val alignRoll = displayRollDeg
-
-        val dAz = absAngleDiff(alignAz, target.azimuth)
-        val dPitch = abs(alignPitch - target.pitch)
-        val dRoll = abs(alignRoll)
+        val dirErr = directionErrorDeg(
+            displayAzimuth,
+            displayPitchDeg,
+            target.azimuth,
+            target.pitch
+        )
 
         val aligned = if (zenithMode) {
-            dPitch <= (pitchTolDeg + 1.0f)
+            dirErr <= 2.5f
         } else {
-            dAz <= azTolDeg &&
-                    dPitch <= pitchTolDeg &&
-                    dRoll <= rollTolDeg
+            dirErr <= 4.0f
         }
 
         Log.d(
             "SunGuideAuto",
             "target=${target.azimuth}/${target.pitch} " +
-                    "alignAz=$alignAz alignPitch=$alignPitch alignRoll=$alignRoll " +
-                    "metaAz=$lastAzimuth metaPitch=$lastPitch metaRoll=$lastRoll " +
-                    "dAz=$dAz dPitch=$dPitch dRoll=$dRoll aligned=$aligned"
+                    "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
+                    "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
+                    "dirErr=${"%.2f".format(dirErr)} zenith=$zenithMode aligned=$aligned"
         )
 
         val now = SystemClock.elapsedRealtime()
@@ -1201,11 +1198,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 ).toFloat() + 360f
                 ) % 360f
 
-        val pitch = Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
+        val pitch = -Math.toDegrees(asin(remappedRotationMatrix[7].toDouble())).toFloat()
         val roll = Math.toDegrees(
             -atan2(remappedRotationMatrix[6], remappedRotationMatrix[8]).toDouble()
         ).toFloat()
-
+        Log.d(
+            "SunAnglesRaw",
+            "az=${"%.2f".format(azimuth)} pitch=${"%.2f".format(pitch)} roll=${"%.2f".format(roll)}"
+        )
         return floatArrayOf(azimuth, pitch, roll)
     }
 

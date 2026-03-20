@@ -130,21 +130,11 @@ class GuideView @JvmOverloads constructor(
         super.onDraw(canvas)
         if (tanVerticalFovHalf == 0f) return
 
-        val centerX = width / 2f
-        val centerY = height / 2f
-
-        canvas.save()
-        val appliedRoll = if (zenithMode) cameraRoll * 0.18f else cameraRoll
-        canvas.rotate(appliedRoll, centerX, centerY)
-
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
         drawHorizon(canvas)
         drawAzimuthDivisions(canvas)
         drawCapturePoints(canvas)
-
-        canvas.restore()
-
         drawAzimuthLabels(canvas)
         drawReticle(canvas)
     }
@@ -154,32 +144,26 @@ class GuideView @JvmOverloads constructor(
             return Pair(width / 2f, height / 2f)
         }
 
-        val deltaAzimuth = (targetAzimuth - cameraAzimuth + 540f) % 360f - 180f
-        val deltaPitch = targetPitch - cameraPitch
+        val dir = worldDir(targetAzimuth, targetPitch)
 
-        val avgPitch = ((targetPitch + cameraPitch) * 0.5f).coerceIn(0f, 89f)
-        val azimuthWeight = if (zenithMode) {
-            kotlin.math.cos(Math.toRadians(avgPitch.toDouble())).toFloat().coerceIn(0.08f, 0.35f)
-        } else {
-            1f
-        }
+        val camX = dot(dir, camRight)
+        val camY = dot(dir, camUp)
+        val camZ = dot(dir, camForward)
 
-        val effectiveDeltaAzimuth = deltaAzimuth * azimuthWeight
+        if (camZ <= 0f) return null
 
-        val projectedX = tan(Math.toRadians(effectiveDeltaAzimuth.toDouble())).toFloat()
-        val projectedY = tan(Math.toRadians(deltaPitch.toDouble())).toFloat()
+        val nx = (camX / camZ) / tanHorizontalFovHalf
+        val ny = (camY / camZ) / tanVerticalFovHalf
 
-        if (abs(projectedX) > tanHorizontalFovHalf || abs(projectedY) > tanVerticalFovHalf) {
-            return null
-        }
+        if (abs(nx) > 1f || abs(ny) > 1f) return null
 
-        val centerX = width / 2f
-        val centerY = height / 2f
+        val cx = width / 2f
+        val cy = height / 2f
 
-        val screenX = centerX + (projectedX / tanHorizontalFovHalf) * centerX
-        val screenY = centerY - (projectedY / tanVerticalFovHalf) * centerY
+        val x = cx + nx * cx
+        val y = cy - ny * cy
 
-        return Pair(screenX, screenY)
+        return Pair(x, y)
     }
 
     private fun setupCapturePoints() {
@@ -424,6 +408,12 @@ class GuideView @JvmOverloads constructor(
         camRight = normalize(add(scale(right0, cosR), scale(up0, sinR)))
         camUp = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
         camForward = forward
+        Log.d(
+            "SunGuideBasis",
+            "camForward=(${String.format("%.3f", camForward.x)}, ${String.format("%.3f", camForward.y)}, ${String.format("%.3f", camForward.z)}) " +
+                    "camUp=(${String.format("%.3f", camUp.x)}, ${String.format("%.3f", camUp.y)}, ${String.format("%.3f", camUp.z)}) " +
+                    "camRight=(${String.format("%.3f", camRight.x)}, ${String.format("%.3f", camRight.y)}, ${String.format("%.3f", camRight.z)})"
+        )
     }
     private fun updateActivePoint() {
         val candidates = capturePoints.filter { !it.isCaptured }
