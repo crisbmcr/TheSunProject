@@ -393,7 +393,7 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun buildCameraBasis(azimuthDeg: Float, pitchDeg: Float, rollDeg: Float) {
-        val projectionYaw = if (zenithMode || pitchDeg >= 72f) {
+        val projectionYaw = if (zenithMode) {
             latchedProjectionYawDeg
         } else {
             azimuthDeg.also { latchedProjectionYawDeg = it }

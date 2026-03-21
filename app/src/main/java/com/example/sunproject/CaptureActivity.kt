@@ -435,8 +435,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             target.pitch
         )
 
+        val zenErr = zenithErrorDeg()
+
         val aligned = when {
-            zenithMode -> dirErr <= 2.5f
+            zenithMode -> zenErr <= 3.0f
             target.pitch >= 40f -> dirErr <= 7.5f
             else -> dirErr <= 4.0f
         }
@@ -446,7 +448,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             "target=${target.azimuth}/${target.pitch} " +
                     "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
                     "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
-                    "dirErr=${"%.2f".format(dirErr)} zenith=$zenithMode aligned=$aligned"
+                    "dirErr=${"%.2f".format(dirErr)} zenErr=${"%.2f".format(zenErr)} " +
+                    "zenith=$zenithMode aligned=$aligned"
         )
 
         val now = SystemClock.elapsedRealtime()
