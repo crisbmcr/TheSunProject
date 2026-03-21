@@ -71,6 +71,9 @@ class GuideView @JvmOverloads constructor(
 
     private var latchedProjectionYawDeg = 0f
 
+    private var visualZenithLatched = false
+    private val visualZenithEnterDeg = 70f
+    private val visualZenithExitDeg = 64f
 
     init {
         setupCapturePoints()
@@ -96,7 +99,7 @@ class GuideView @JvmOverloads constructor(
         this.cameraAzimuth = azimuth
         this.cameraPitch = pitch
         this.cameraRoll = roll
-
+        updateVisualZenithLatch()
         buildCameraBasis(azimuth, pitch, roll)
 
         Log.d(
@@ -437,15 +440,27 @@ class GuideView @JvmOverloads constructor(
         return "H0=$h0 H45=$h45 Z0=$z0 active=${activePoint?.azimuth}/${activePoint?.pitch} zenithMode=$zenithMode"
     }
 
-    private fun isVisualZenithMode(): Boolean {
-        return zenithMode && cameraPitch >= 72f
+    private fun isVisualZenithMode(): Boolean = visualZenithLatched
+
+    private fun updateVisualZenithLatch() {
+        if (!zenithMode) {
+            visualZenithLatched = false
+            return
+        }
+
+        val absPitch = kotlin.math.abs(cameraPitch)
+        visualZenithLatched = if (visualZenithLatched) {
+            absPitch >= visualZenithExitDeg
+        } else {
+            absPitch >= visualZenithEnterDeg
+        }
     }
 
     private fun updateActivePoint() {
         val candidates = stageCandidates()
 
         zenithMode = candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
-
+        updateVisualZenithLatch()
         if (candidates.isEmpty()) {
             activePoint = null
             pendingActivePoint = null

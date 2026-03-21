@@ -163,6 +163,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var displayPitchDeg = 0f
     private var displayRollDeg = 0f
 
+    private var zenithPitchSmoothedDeg = 0f
+    private var zenithRollSmoothedDeg = 0f
+    private var zenithDisplayInitialized = false
+    private var zenithYawLockedDeg = 0f
+    private var zenithYawLocked = false
+
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
@@ -370,17 +376,46 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     displayOffsetInitialized = true
                 }
 
-                val currentPitch = gamePitchDeg
-                val nearZenith = kotlin.math.abs(gamePitchDeg) >= 75f
+                val zenithTargetActive = isZenithTarget(guideView.getActiveCapturePoint())
+                val nearZenith = zenithTargetActive && kotlin.math.abs(gamePitchDeg) >= 68f
 
-                displayAzimuth = if (displayOffsetInitialized) {
+                val baseDisplayYaw = if (displayOffsetInitialized) {
                     normalize360(gameYawDeg + displayNorthOffsetDeg)
                 } else {
                     absoluteYawDeg
                 }
 
-                displayPitchDeg = gamePitchDeg
-                displayRollDeg = if (nearZenith) gameRollDeg * 0.15f else gameRollDeg
+                if (nearZenith) {
+                    if (!zenithYawLocked) {
+                        zenithYawLockedDeg = baseDisplayYaw
+                        zenithYawLocked = true
+                    }
+
+                    val zenAlpha = adaptiveAlpha(dtSec, tauSec = 0.45f)
+
+                    if (!zenithDisplayInitialized) {
+                        zenithPitchSmoothedDeg = gamePitchDeg
+                        zenithRollSmoothedDeg = gameRollDeg * 0.08f
+                        zenithDisplayInitialized = true
+                    } else {
+                        zenithPitchSmoothedDeg =
+                            lowPassScalar(zenithPitchSmoothedDeg, gamePitchDeg, zenAlpha)
+                        zenithRollSmoothedDeg =
+                            lowPassScalar(zenithRollSmoothedDeg, gameRollDeg * 0.08f, zenAlpha)
+                    }
+
+                    displayAzimuth = zenithYawLockedDeg
+                    displayPitchDeg = zenithPitchSmoothedDeg
+                    displayRollDeg = zenithRollSmoothedDeg
+                } else {
+                    zenithDisplayInitialized = false
+                    zenithYawLocked = false
+
+                    displayAzimuth = baseDisplayYaw
+                    displayPitchDeg = gamePitchDeg
+                    displayRollDeg =
+                        if (kotlin.math.abs(gamePitchDeg) >= 70f) gameRollDeg * 0.10f else gameRollDeg
+                }
 
                 guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
 
@@ -435,9 +470,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         )
 
         val zenErr = kotlin.math.abs(88f - displayPitchDeg)
+        val zenithTolDeg = 4.5f
+        val requiredHoldMs = if (zenithMode) 350L else holdMs
 
         val aligned = when {
-            zenithMode -> zenErr <= 3.0f
+            zenithMode -> zenErr <= zenithTolDeg
             target.pitch >= 40f -> dirErr <= 7.5f
             else -> dirErr <= 4.0f
         }
@@ -460,7 +497,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         if (alignmentStartMs == 0L) alignmentStartMs = now
 
-        val held = (now - alignmentStartMs) >= holdMs
+        val held = (now - alignmentStartMs) >= requiredHoldMs
         val cooled = (now - lastShotMs) >= cooldownMs
 
         if (held && cooled) {
@@ -1271,7 +1308,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val d = dot(a, b).coerceIn(-1f, 1f)
         return Math.toDegrees(acos(d.toDouble())).toFloat()
     }
-
+    private fun lowPassScalar(prev: Float, current: Float, alpha: Float): Float {
+        return prev + alpha * (current - prev)
+    }
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS =
