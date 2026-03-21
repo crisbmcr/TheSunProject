@@ -169,6 +169,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var zenithYawLockedDeg = 0f
     private var zenithYawLocked = false
 
+    private var zenithAssistLatched = false
+    private val zenithAssistEnterDeg = 66f
+    private val zenithAssistExitDeg = 60f
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
@@ -377,7 +380,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val zenithTargetActive = isZenithTarget(guideView.getActiveCapturePoint())
-                val nearZenith = zenithTargetActive && kotlin.math.abs(gamePitchDeg) >= 68f
+                val nearZenith = updateZenithAssistLatch(zenithTargetActive, gamePitchDeg)
 
                 val baseDisplayYaw = if (displayOffsetInitialized) {
                     normalize360(gameYawDeg + displayNorthOffsetDeg)
@@ -391,17 +394,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                         zenithYawLocked = true
                     }
 
-                    val zenAlpha = adaptiveAlpha(dtSec, tauSec = 0.45f)
+                    val zenAlpha = adaptiveAlpha(dtSec, tauSec = 0.60f)
 
                     if (!zenithDisplayInitialized) {
                         zenithPitchSmoothedDeg = gamePitchDeg
-                        zenithRollSmoothedDeg = gameRollDeg * 0.08f
+                        zenithRollSmoothedDeg = gameRollDeg * 0.05f
                         zenithDisplayInitialized = true
                     } else {
                         zenithPitchSmoothedDeg =
                             lowPassScalar(zenithPitchSmoothedDeg, gamePitchDeg, zenAlpha)
                         zenithRollSmoothedDeg =
-                            lowPassScalar(zenithRollSmoothedDeg, gameRollDeg * 0.08f, zenAlpha)
+                            lowPassScalar(zenithRollSmoothedDeg, gameRollDeg * 0.05f, zenAlpha)
                     }
 
                     displayAzimuth = zenithYawLockedDeg
@@ -1294,6 +1297,21 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 kotlin.math.sin(alt).toFloat()
             )
         )
+    }
+
+    private fun updateZenithAssistLatch(zenithTargetActive: Boolean, pitchDeg: Float): Boolean {
+        if (!zenithTargetActive) {
+            zenithAssistLatched = false
+            return false
+        }
+
+        val absPitch = kotlin.math.abs(pitchDeg)
+        zenithAssistLatched = if (zenithAssistLatched) {
+            absPitch >= zenithAssistExitDeg
+        } else {
+            absPitch >= zenithAssistEnterDeg
+        }
+        return zenithAssistLatched
     }
 
     private fun directionErrorDeg(
