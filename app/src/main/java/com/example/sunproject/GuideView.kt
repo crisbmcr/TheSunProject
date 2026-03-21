@@ -140,7 +140,7 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
-        if (zenithMode && targetPitch >= 80f) {
+        if (isVisualZenithMode() && targetPitch >= 80f) {
             return Pair(width / 2f, height / 2f)
         }
 
@@ -244,7 +244,7 @@ class GuideView @JvmOverloads constructor(
         val activePoint = activePoint
         val ringRadius = 40f
 
-        val pointsToDraw = if (zenithMode) {
+        val pointsToDraw = if (isVisualZenithMode()) {
             capturePoints.filter { it.pitch >= 80f || it.isCaptured }
         } else {
             capturePoints
@@ -393,7 +393,7 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun buildCameraBasis(azimuthDeg: Float, pitchDeg: Float, rollDeg: Float) {
-        val projectionYaw = if (zenithMode) {
+        val projectionYaw = if (isVisualZenithMode()) {
             latchedProjectionYawDeg
         } else {
             azimuthDeg.also { latchedProjectionYawDeg = it }
@@ -435,6 +435,10 @@ class GuideView @JvmOverloads constructor(
         val h45 = capturePoints.count { !it.isCaptured && it.pitch == 45f }
         val z0 = capturePoints.count { !it.isCaptured && it.pitch >= 80f }
         return "H0=$h0 H45=$h45 Z0=$z0 active=${activePoint?.azimuth}/${activePoint?.pitch} zenithMode=$zenithMode"
+    }
+
+    private fun isVisualZenithMode(): Boolean {
+        return zenithMode && cameraPitch >= 72f
     }
 
     private fun updateActivePoint() {

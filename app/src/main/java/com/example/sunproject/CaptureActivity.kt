@@ -346,7 +346,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                                 "dispRoll=${"%.2f".format(displayRollDeg)} " +
                                 "zenith="
                     )
-                    guideView.setZenithMode(isZenithTarget(guideView.getActiveCapturePoint()))
                     guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
                     checkAutoCapture()
 
@@ -435,7 +434,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             target.pitch
         )
 
-        val zenErr = zenithErrorDeg()
+        val zenErr = kotlin.math.abs(88f - displayPitchDeg)
 
         val aligned = when {
             zenithMode -> zenErr <= 3.0f
