@@ -439,7 +439,9 @@ class GuideView @JvmOverloads constructor(
 
     private fun updateActivePoint() {
         val candidates = stageCandidates()
+
         zenithMode = candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
+
         if (candidates.isEmpty()) {
             activePoint = null
             pendingActivePoint = null

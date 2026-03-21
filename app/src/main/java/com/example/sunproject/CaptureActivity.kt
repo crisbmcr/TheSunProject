@@ -374,12 +374,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 val currentPitch = gamePitchDeg
                 val nearZenith = kotlin.math.abs(gamePitchDeg) >= 75f
 
-                displayAzimuth = if (absoluteYawDeg != 0f) {
-                    absoluteYawDeg
-                } else if (displayOffsetInitialized) {
+                displayAzimuth = if (displayOffsetInitialized) {
                     normalize360(gameYawDeg + displayNorthOffsetDeg)
                 } else {
-                    gameYawDeg
+                    absoluteYawDeg
                 }
 
                 displayPitchDeg = gamePitchDeg
