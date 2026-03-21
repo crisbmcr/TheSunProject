@@ -26,12 +26,37 @@ object AtlasProjector {
 
         val centerAz = AtlasMath.normalizeAzimuthDeg(frame.measuredAzimuthDeg)
         val centerAlt = frame.measuredPitchDeg.coerceIn(0f, 90f)
+        val rollAbs = abs(frame.measuredRollDeg)
+
+        val cosAlt = cos(Math.toRadians(centerAlt.toDouble())).toFloat().coerceAtLeast(0.08f)
+
+        val azHalf = when {
+            centerAlt >= 80f -> 180f
+            centerAlt >= 60f -> (hfov * 0.5f * (1f / cosAlt).coerceAtMost(2.2f) + (rollAbs * 0.15f).coerceAtMost(6f))
+                .coerceIn(hfov * 0.5f, 180f)
+            centerAlt >= 40f -> (hfov * 0.5f * (1f / cosAlt).coerceAtMost(1.6f) + (rollAbs * 0.10f).coerceAtMost(4f))
+                .coerceIn(hfov * 0.5f, 180f)
+            else -> (hfov * 0.5f + (rollAbs * 0.05f).coerceAtMost(2f))
+                .coerceIn(hfov * 0.5f, 180f)
+        }
+
+        val altHalf = (
+                vfov * 0.5f +
+                        when {
+                            centerAlt >= 80f -> 6f
+                            centerAlt >= 60f -> 3f
+                            else -> 0f
+                        } +
+                        (rollAbs * 0.08f).coerceAtMost(3f)
+                ).coerceIn(vfov * 0.5f, 90f)
+
+        val fullAzimuth = centerAlt >= 80f || azHalf >= 179.5f
 
         return FrameFootprint(
-            minAzimuthDeg = centerAz - hfov / 2f,
-            maxAzimuthDeg = centerAz + hfov / 2f,
-            minAltitudeDeg = (centerAlt - vfov / 2f).coerceIn(0f, 90f),
-            maxAltitudeDeg = (centerAlt + vfov / 2f).coerceIn(0f, 90f)
+            minAzimuthDeg = if (fullAzimuth) -180f else centerAz - azHalf,
+            maxAzimuthDeg = if (fullAzimuth) 180f else centerAz + azHalf,
+            minAltitudeDeg = (centerAlt - altHalf).coerceIn(0f, 90f),
+            maxAltitudeDeg = (centerAlt + altHalf).coerceIn(0f, 90f)
         )
     }
 
@@ -106,11 +131,20 @@ object AtlasProjector {
         val srcPixels = IntArray(srcW * srcH)
         src.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
 
-        val xSpans = AtlasMath.splitAzimuthSpan(
-            fp.minAzimuthDeg,
-            fp.maxAzimuthDeg,
-            atlas.config
-        )
+        val coversAllAzimuth =
+            frame.targetPitchDeg >= 80f ||
+                    frame.measuredPitchDeg >= 80f ||
+                    (fp.maxAzimuthDeg - fp.minAzimuthDeg) >= 359f
+
+        val xSpans = if (coversAllAzimuth) {
+            listOf(0 to (atlas.width - 1))
+        } else {
+            AtlasMath.splitAzimuthSpan(
+                fp.minAzimuthDeg,
+                fp.maxAzimuthDeg,
+                atlas.config
+            )
+        }
 
         for ((x0, x1) in xSpans) {
             for (y in yTop..yBottom) {
@@ -160,15 +194,33 @@ object AtlasProjector {
     }
 
     private fun qualityWeightForFrame(frame: FrameRecord): Float {
-        val azErr = angleDiffDeg(frame.targetAzimuthDeg, frame.measuredAzimuthDeg)
+        val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
+
+        val azErr = if (zenithLike) 0f
+        else angleDiffDeg(frame.targetAzimuthDeg, frame.measuredAzimuthDeg)
+
         val pitchErr = abs(frame.targetPitchDeg - frame.measuredPitchDeg)
         val rollAbs = abs(frame.measuredRollDeg)
 
-        val azScore = (1f - azErr / 20f).coerceIn(0.15f, 1f)
-        val pitchScore = (1f - pitchErr / 15f).coerceIn(0.15f, 1f)
-        val rollScore = (1f - rollAbs / 35f).coerceIn(0.30f, 1f)
+        val maxAzErr = when {
+            zenithLike -> Float.MAX_VALUE
+            frame.targetPitchDeg >= 40f -> 4.5f
+            else -> 4.0f
+        }
+        val maxPitchErr = if (zenithLike) 2.0f else 2.75f
+        val maxRollErr = if (zenithLike) 4.5f else 3.5f
 
-        return 0.25f + 0.75f * azScore * pitchScore * rollScore
+        if (!zenithLike && azErr > maxAzErr) return 0f
+        if (pitchErr > maxPitchErr) return 0f
+        if (rollAbs > maxRollErr) return 0f
+
+        val azScore = if (zenithLike) 1f
+        else (1f - azErr / maxAzErr).coerceIn(0f, 1f)
+
+        val pitchScore = (1f - pitchErr / maxPitchErr).coerceIn(0f, 1f)
+        val rollScore = (1f - rollAbs / maxRollErr).coerceIn(0f, 1f)
+
+        return 0.15f + 0.85f * azScore * pitchScore * rollScore
     }
 
     private fun angleDiffDeg(a: Float, b: Float): Float {

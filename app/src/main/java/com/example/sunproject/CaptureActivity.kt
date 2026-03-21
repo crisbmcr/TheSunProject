@@ -116,10 +116,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var autoCaptureEnabled = true
     private var maxShots = 0
     private val atlasBuildUseCase = AtlasBuildUseCase()
-    private val azTolDeg = 6f
-    private val pitchTolDeg = 3f
+    private val azTolDeg = 4f
+    private val pitchTolDeg = 2.5f
     private val rollTolDeg = 3f
-    private val holdMs = 650L
+    private val zenithPitchTolDeg = 2f
+    private val zenithRollTolDeg = 4f
+    private val holdMs = 800L
     private val cooldownMs = 1200L
     private var alignmentStartMs = 0L
     private var lastShotMs = 0L
@@ -465,6 +467,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val target = guideView.getActiveCapturePoint() ?: return
         val zenithMode = isZenithTarget(target)
 
+        val azErr = if (zenithMode) 0f else absAngleDiff(displayAzimuth, target.azimuth)
+        val pitchErr = abs(displayPitchDeg - target.pitch)
+        val rollErr = abs(displayRollDeg)
+
         val dirErr = directionErrorDeg(
             displayAzimuth,
             displayPitchDeg,
@@ -472,14 +478,21 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             target.pitch
         )
 
-        val zenErr = kotlin.math.abs(88f - displayPitchDeg)
-        val zenithTolDeg = 4.5f
-        val requiredHoldMs = if (zenithMode) 350L else holdMs
-
         val aligned = when {
-            zenithMode -> zenErr <= zenithTolDeg
-            target.pitch >= 40f -> dirErr <= 7.5f
-            else -> dirErr <= 4.0f
+            zenithMode -> {
+                pitchErr <= zenithPitchTolDeg &&
+                        rollErr <= zenithRollTolDeg
+            }
+            target.pitch >= 40f -> {
+                azErr <= azTolDeg &&
+                        pitchErr <= pitchTolDeg &&
+                        rollErr <= rollTolDeg
+            }
+            else -> {
+                azErr <= azTolDeg &&
+                        pitchErr <= pitchTolDeg &&
+                        rollErr <= rollTolDeg
+            }
         }
 
         Log.d(
@@ -487,7 +500,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             "target=${target.azimuth}/${target.pitch} " +
                     "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
                     "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
-                    "dirErr=${"%.2f".format(dirErr)} zenErr=${"%.2f".format(zenErr)} " +
+                    "dirErr=${"%.2f".format(dirErr)} " +
+                    "azErr=${"%.2f".format(azErr)} " +
+                    "pitchErr=${"%.2f".format(pitchErr)} " +
+                    "rollErr=${"%.2f".format(rollErr)} " +
                     "zenith=$zenithMode aligned=$aligned"
         )
 
@@ -500,7 +516,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         if (alignmentStartMs == 0L) alignmentStartMs = now
 
-        val held = (now - alignmentStartMs) >= requiredHoldMs
+        val held = (now - alignmentStartMs) >= holdMs
         val cooled = (now - lastShotMs) >= cooldownMs
 
         if (held && cooled) {
