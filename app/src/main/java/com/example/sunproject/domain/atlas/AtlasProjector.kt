@@ -10,6 +10,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
+import android.util.Log
 
 data class FrameFootprint(
     val minAzimuthDeg: Float,
@@ -72,9 +73,22 @@ object AtlasProjector {
 
     fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
         frames.sortedBy { it.shotIndex }.forEach { frame ->
-            val src = BitmapFactory.decodeFile(frame.originalPath) ?: return@forEach
+            val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
+                Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
+                return@forEach
+            }
+
             try {
                 val frameWeight = qualityWeightForFrame(frame)
+
+                Log.d(
+                    "AtlasProjector",
+                    "frame=${frame.frameId} ring=${frame.ringId} " +
+                            "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                            "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                            "weight=${"%.3f".format(frameWeight)}"
+                )
+
                 projectBitmapToAtlas(frame, src, atlas, frameWeight)
             } finally {
                 src.recycle()
@@ -146,6 +160,16 @@ object AtlasProjector {
             )
         }
 
+        Log.d(
+            "AtlasFootprint",
+            "frame=${frame.frameId} ring=${frame.ringId} " +
+                    "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                    "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                    "fpAz=${"%.2f".format(fp.minAzimuthDeg)}..${"%.2f".format(fp.maxAzimuthDeg)} " +
+                    "fpAlt=${"%.2f".format(fp.minAltitudeDeg)}..${"%.2f".format(fp.maxAltitudeDeg)} " +
+                    "coversAll=$coversAllAzimuth spans=${xSpans.joinToString()}"
+        )
+
         for ((x0, x1) in xSpans) {
             for (y in yTop..yBottom) {
                 val altDeg = AtlasMath.yToAltitude(y, atlas.config)
@@ -210,9 +234,38 @@ object AtlasProjector {
         val maxPitchErr = if (zenithLike) 2.0f else 2.75f
         val maxRollErr = if (zenithLike) 4.5f else 3.5f
 
-        if (!zenithLike && azErr > maxAzErr) return 0f
-        if (pitchErr > maxPitchErr) return 0f
-        if (rollAbs > maxRollErr) return 0f
+        if (!zenithLike && azErr > maxAzErr) {
+            Log.d(
+                "AtlasWeight",
+                "reject frame=${frame.frameId} reason=azErr " +
+                        "target=${frame.targetAzimuthDeg}/${frame.targetPitchDeg} " +
+                        "measured=${frame.measuredAzimuthDeg}/${frame.measuredPitchDeg}/${frame.measuredRollDeg} " +
+                        "azErr=${"%.2f".format(azErr)} max=${"%.2f".format(maxAzErr)}"
+            )
+            return 0f
+        }
+
+        if (pitchErr > maxPitchErr) {
+            Log.d(
+                "AtlasWeight",
+                "reject frame=${frame.frameId} reason=pitchErr " +
+                        "target=${frame.targetAzimuthDeg}/${frame.targetPitchDeg} " +
+                        "measured=${frame.measuredAzimuthDeg}/${frame.measuredPitchDeg}/${frame.measuredRollDeg} " +
+                        "pitchErr=${"%.2f".format(pitchErr)} max=${"%.2f".format(maxPitchErr)}"
+            )
+            return 0f
+        }
+
+        if (rollAbs > maxRollErr) {
+            Log.d(
+                "AtlasWeight",
+                "reject frame=${frame.frameId} reason=rollErr " +
+                        "target=${frame.targetAzimuthDeg}/${frame.targetPitchDeg} " +
+                        "measured=${frame.measuredAzimuthDeg}/${frame.measuredPitchDeg}/${frame.measuredRollDeg} " +
+                        "roll=${"%.2f".format(rollAbs)} max=${"%.2f".format(maxRollErr)}"
+            )
+            return 0f
+        }
 
         val azScore = if (zenithLike) 1f
         else (1f - azErr / maxAzErr).coerceIn(0f, 1f)
@@ -220,7 +273,18 @@ object AtlasProjector {
         val pitchScore = (1f - pitchErr / maxPitchErr).coerceIn(0f, 1f)
         val rollScore = (1f - rollAbs / maxRollErr).coerceIn(0f, 1f)
 
-        return 0.15f + 0.85f * azScore * pitchScore * rollScore
+        val weight = 0.15f + 0.85f * azScore * pitchScore * rollScore
+
+        Log.d(
+            "AtlasWeight",
+            "accept frame=${frame.frameId} ring=${frame.ringId} " +
+                    "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                    "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                    "azErr=${"%.2f".format(azErr)} pitchErr=${"%.2f".format(pitchErr)} roll=${"%.2f".format(rollAbs)} " +
+                    "weight=${"%.3f".format(weight)}"
+        )
+
+        return weight
     }
 
     private fun angleDiffDeg(a: Float, b: Float): Float {

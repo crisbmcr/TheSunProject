@@ -156,6 +156,13 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         var initialized: Boolean = false
     )
 
+    private data class CapturedPose(
+        val azimuthDeg: Float,
+        val pitchDeg: Float,
+        val rollDeg: Float,
+        val capturedAtUtcMs: Long
+    )
+
     private val displayFilter = AngleFilterState()
     private val captureFilter = AngleFilterState()
 
@@ -559,9 +566,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val loc = lastLocation
 
-        if (sessionYawAnchorDeg == null) sessionYawAnchorDeg = lastAzimuth
-        if (sessionPitchAnchorDeg == null) sessionPitchAnchorDeg = lastPitch
-        if (sessionRollAnchorDeg == null) sessionRollAnchorDeg = lastRoll
+        if (sessionYawAnchorDeg == null) sessionYawAnchorDeg = displayAzimuth
+        if (sessionPitchAnchorDeg == null) sessionPitchAnchorDeg = displayPitchDeg
+        if (sessionRollAnchorDeg == null) sessionRollAnchorDeg = displayRollDeg
 
         val session = SessionRecord(
             sessionId = dir.name,
@@ -585,14 +592,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     }
 
 
-    private fun appendMetadata(fileName: String) {
+    private fun appendMetadata(fileName: String, pose: CapturedPose) {
         val dir = ensureSessionDir()
         val meta = File(dir, "metadata.csv")
+
         val loc = lastLocation
         val lat = loc?.latitude ?: Double.NaN
         val lon = loc?.longitude ?: Double.NaN
         val alt = loc?.altitude ?: Double.NaN
-        val line = "${fileName},${System.currentTimeMillis()},${lastAzimuth},${lastPitch},${lastRoll},${lat},${lon},${alt}\n"
+
+        val line =
+            "${fileName},${pose.capturedAtUtcMs},${pose.azimuthDeg},${pose.pitchDeg},${pose.rollDeg},${lat},${lon},${alt}\n"
+
         meta.appendText(line)
     }
 
@@ -617,7 +628,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val fileName = "img_%02d_az%03d_p%+03d_%s.jpg".format(index, safeAz, safePi, reason)
         val file = File(dir, fileName)
 
-        Log.i("PanoramaCAP", "Capturing -> ${file.name} (az=$safeAz p=$safePi)")
+        val frozenPose = CapturedPose(
+            azimuthDeg = displayAzimuth,
+            pitchDeg = displayPitchDeg,
+            rollDeg = displayRollDeg,
+            capturedAtUtcMs = System.currentTimeMillis()
+        )
+
+        Log.i(
+            "PanoramaCAP",
+            "Capturing -> ${file.name} (az=$safeAz p=$safePi) " +
+                    "pose=${"%.2f".format(frozenPose.azimuthDeg)}/${"%.2f".format(frozenPose.pitchDeg)}/${"%.2f".format(frozenPose.rollDeg)}"
+        )
 
         val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
         lastShotMs = SystemClock.elapsedRealtime()
@@ -628,19 +650,23 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
                     capturedFiles.add(file)
-                    appendMetadata(file.name)
-                    appendFrameRecord(file, target, capturedFiles.size)
+
+                    appendMetadata(file.name, frozenPose)
+                    appendFrameRecord(file, target, capturedFiles.size, frozenPose)
 
                     target.isCaptured = true
                     Log.d("SunGuideStage", "after_save ${guideView.getStageDebugString()}")
+
                     runOnUiThread {
                         guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
                         guideView.invalidate()
                     }
 
                     Log.i("PanoramaCAP", "Saved: ${file.absolutePath} (${capturedFiles.size}/$maxShots)")
+
                     runOnUiThread {
                         updateCaptureCountUi()
+
                         Toast.makeText(
                             this@CaptureActivity,
                             "Foto ${capturedFiles.size}/$maxShots guardada",
@@ -650,11 +676,13 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                         if (capturedFiles.size >= maxShots) {
                             autoCaptureEnabled = false
                             updateAutoButton()
+
                             Toast.makeText(
                                 this@CaptureActivity,
                                 "Listo: ${capturedFiles.size} fotos.\nGenerando atlas angular...",
                                 Toast.LENGTH_LONG
                             ).show()
+
                             openAngularAtlasDebug()
                         }
                     }
@@ -921,7 +949,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
     }
 
-    private fun appendFrameRecord(file: File, target: GuideView.CapturePoint, shotIndex: Int) {
+    private fun appendFrameRecord(
+        file: File,
+        target: GuideView.CapturePoint,
+        shotIndex: Int,
+        pose: CapturedPose
+    ) {
         val paths = sessionPaths ?: return
         val loc = lastLocation
         val (imgW, imgH) = readImageSize(file)
@@ -932,12 +965,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             ringId = ringIdForTarget(target),
             shotIndex = shotIndex,
             originalPath = file.absolutePath,
-            capturedAtUtcMs = System.currentTimeMillis(),
+            capturedAtUtcMs = pose.capturedAtUtcMs,
             targetAzimuthDeg = target.azimuth,
             targetPitchDeg = target.pitch,
-            measuredAzimuthDeg = lastAzimuth,
-            measuredPitchDeg = lastPitch,
-            measuredRollDeg = lastRoll,
+            measuredAzimuthDeg = pose.azimuthDeg,
+            measuredPitchDeg = pose.pitchDeg,
+            measuredRollDeg = pose.rollDeg,
             latitudeDeg = loc?.latitude,
             longitudeDeg = loc?.longitude,
             altitudeM = loc?.altitude,
@@ -945,6 +978,13 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             imageHeightPx = imgH,
             hfovDeg = currentHfovDeg,
             vfovDeg = currentVfovDeg
+        )
+
+        Log.d(
+            "FrameRecordSave",
+            "file=${file.name} target=${target.azimuth}/${target.pitch} " +
+                    "saved=${"%.2f".format(pose.azimuthDeg)}/${"%.2f".format(pose.pitchDeg)}/${"%.2f".format(pose.rollDeg)} " +
+                    "hfov=${currentHfovDeg} vfov=${currentVfovDeg}"
         )
 
         sessionStore.appendFrame(frame, paths)
