@@ -33,12 +33,18 @@ object AtlasProjector {
 
         val azHalf = when {
             centerAlt >= 80f -> 180f
-            centerAlt >= 60f -> (hfov * 0.5f * (1f / cosAlt).coerceAtMost(2.2f) + (rollAbs * 0.15f).coerceAtMost(6f))
-                .coerceIn(hfov * 0.5f, 180f)
-            centerAlt >= 40f -> (hfov * 0.5f * (1f / cosAlt).coerceAtMost(1.6f) + (rollAbs * 0.10f).coerceAtMost(4f))
-                .coerceIn(hfov * 0.5f, 180f)
-            else -> (hfov * 0.5f + (rollAbs * 0.05f).coerceAtMost(2f))
-                .coerceIn(hfov * 0.5f, 180f)
+            centerAlt >= 60f -> (
+                    hfov * 0.5f * (1f / cosAlt).coerceAtMost(2.2f) +
+                            (rollAbs * 0.15f).coerceAtMost(6f)
+                    ).coerceIn(hfov * 0.5f, 180f)
+            centerAlt >= 40f -> (
+                    hfov * 0.5f * (1f / cosAlt).coerceAtMost(1.6f) +
+                            (rollAbs * 0.10f).coerceAtMost(4f)
+                    ).coerceIn(hfov * 0.5f, 180f)
+            else -> (
+                    hfov * 0.5f +
+                            (rollAbs * 0.05f).coerceAtMost(2f)
+                    ).coerceIn(hfov * 0.5f, 180f)
         }
 
         val altHalf = (
@@ -53,11 +59,19 @@ object AtlasProjector {
 
         val fullAzimuth = centerAlt >= 80f || azHalf >= 179.5f
 
+        val minAlt = (centerAlt - altHalf).coerceIn(0f, 90f)
+        val maxAlt = (centerAlt + altHalf).coerceIn(0f, 90f)
+
+        val constrainedMinAlt = when {
+            frame.targetPitchDeg >= 80f || centerAlt >= 80f -> max(minAlt, 68f)
+            else -> minAlt
+        }
+
         return FrameFootprint(
             minAzimuthDeg = if (fullAzimuth) -180f else centerAz - azHalf,
             maxAzimuthDeg = if (fullAzimuth) 180f else centerAz + azHalf,
-            minAltitudeDeg = (centerAlt - altHalf).coerceIn(0f, 90f),
-            maxAltitudeDeg = (centerAlt + altHalf).coerceIn(0f, 90f)
+            minAltitudeDeg = constrainedMinAlt,
+            maxAltitudeDeg = maxAlt
         )
     }
 
