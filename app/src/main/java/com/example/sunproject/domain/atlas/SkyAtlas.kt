@@ -46,7 +46,15 @@ class SkyAtlas(val config: AtlasConfig) {
         pixels[idx] = Color.argb(255, r, g, b)
         weightSums[idx] = total
     }
+    fun hasCoverageAt(x: Int, y: Int): Boolean {
+        if (x !in 0 until width || y !in 0 until height) return false
+        return weightSums[index(x, y)] > 0f
+    }
 
+    fun weightAt(x: Int, y: Int): Float {
+        if (x !in 0 until width || y !in 0 until height) return 0f
+        return weightSums[index(x, y)]
+    }
     fun toBitmap(): Bitmap {
         val bmp = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         bmp.setPixels(pixels, 0, width, 0, 0, width, height)

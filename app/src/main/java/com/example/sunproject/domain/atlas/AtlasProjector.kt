@@ -11,6 +11,12 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 import android.util.Log
+import android.graphics.Color
+private const val ZENITH_TWIST_FALLBACK_DEG = 90f
+private const val ZENITH_OVERLAP_MIN_ALT_DEG = 68f
+private const val ZENITH_OVERLAP_MAX_ALT_DEG = 80f
+private const val ZENITH_ESTIMATE_MIN_PIXELS = 2500
+private const val ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE = 1280
 
 data class FrameFootprint(
     val minAzimuthDeg: Float,
@@ -18,7 +24,14 @@ data class FrameFootprint(
     val minAltitudeDeg: Float,
     val maxAltitudeDeg: Float
 )
-private const val ZENITH_TWIST_TEST_DEG = 90f
+
+data class ZenithTwistEstimate(
+    val twistDeg: Float,
+    val score: Float,
+    val comparedPixels: Int,
+    val confidence: Float
+)
+
 
 object AtlasProjector {
 
@@ -80,14 +93,25 @@ object AtlasProjector {
         val src = BitmapFactory.decodeFile(frame.originalPath) ?: return
         try {
             val frameWeight = qualityWeightForFrame(frame)
-            projectBitmapToAtlas(frame, src, atlas, frameWeight)
+            projectBitmapToAtlas(
+                frame = frame,
+                src = src,
+                atlas = atlas,
+                frameWeight = frameWeight,
+                zenithTwistDegOverride = null,
+                emitLogs = true
+            )
         } finally {
             src.recycle()
         }
     }
 
     fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
-        frames.sortedBy { it.shotIndex }.forEach { frame ->
+        val ordered = frames.sortedBy { it.shotIndex }
+        val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
+        val zenithFrames = ordered.filter { isZenithFrame(it) }
+
+        nonZenithFrames.forEach { frame ->
             val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
                 Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
                 return@forEach
@@ -104,7 +128,52 @@ object AtlasProjector {
                             "weight=${"%.3f".format(frameWeight)}"
                 )
 
-                projectBitmapToAtlas(frame, src, atlas, frameWeight)
+                projectBitmapToAtlas(
+                    frame = frame,
+                    src = src,
+                    atlas = atlas,
+                    frameWeight = frameWeight,
+                    zenithTwistDegOverride = null,
+                    emitLogs = true
+                )
+            } finally {
+                src.recycle()
+            }
+        }
+
+        zenithFrames.forEach { frame ->
+            val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
+                Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
+                return@forEach
+            }
+
+            try {
+                val frameWeight = qualityWeightForFrame(frame)
+
+                val twistEstimate = estimateZenithTwistDeg(
+                    frame = frame,
+                    src = src,
+                    baseAtlas = atlas,
+                    frameWeight = frameWeight
+                )
+
+                Log.d(
+                    "AtlasZenithTwist",
+                    "frame=${frame.frameId} ring=${frame.ringId} " +
+                            "twist=${"%.2f".format(twistEstimate.twistDeg)} " +
+                            "score=${"%.4f".format(twistEstimate.score)} " +
+                            "pixels=${twistEstimate.comparedPixels} " +
+                            "confidence=${"%.4f".format(twistEstimate.confidence)}"
+                )
+
+                projectBitmapToAtlas(
+                    frame = frame,
+                    src = src,
+                    atlas = atlas,
+                    frameWeight = frameWeight,
+                    zenithTwistDegOverride = twistEstimate.twistDeg,
+                    emitLogs = true
+                )
             } finally {
                 src.recycle()
             }
@@ -115,7 +184,9 @@ object AtlasProjector {
         frame: FrameRecord,
         src: Bitmap,
         atlas: SkyAtlas,
-        frameWeight: Float
+        frameWeight: Float,
+        zenithTwistDegOverride: Float? = null,
+        emitLogs: Boolean = true
     ) {
         if (frameWeight <= 0f) return
 
@@ -150,31 +221,31 @@ object AtlasProjector {
         ).toFloat()
 
         val pitchRad = Math.toRadians(projectionPitchDeg.toDouble()).toFloat()
-        // Mantengo la misma convención de la fase 2
         val rollRad = Math.toRadians((-projectionRollDeg).toDouble()).toFloat()
 
-        Log.d(
-            "AtlasPose",
-            "frame=${frame.frameId} ring=${frame.ringId} " +
-                    "zenithLike=$zenithLike " +
-                    "yawUsed=${"%.2f".format(projectionAzimuthDeg)} " +
-                    "yawMeasured=${"%.2f".format(frame.measuredAzimuthDeg)} " +
-                    "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
-                    "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
-                    "rollUsed=${"%.2f".format(projectionRollDeg)} " +
-                    "rollMeasured=${"%.2f".format(frame.measuredRollDeg)}"
-        )
+        if (emitLogs) {
+            Log.d(
+                "AtlasPose",
+                "frame=${frame.frameId} ring=${frame.ringId} " +
+                        "zenithLike=$zenithLike " +
+                        "yawUsed=${"%.2f".format(projectionAzimuthDeg)} " +
+                        "yawMeasured=${"%.2f".format(frame.measuredAzimuthDeg)} " +
+                        "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
+                        "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
+                        "rollUsed=${"%.2f".format(projectionRollDeg)} " +
+                        "rollMeasured=${"%.2f".format(frame.measuredRollDeg)}"
+            )
+        }
 
         val forward = worldDirectionRad(yawRad, pitchRad)
 
         val right0: FloatArray
         val up0: FloatArray
 
+        val effectiveZenithTwistDeg = zenithTwistDegOverride ?: ZENITH_TWIST_FALLBACK_DEG
+
         if (zenithLike && projectionPitchDeg >= 89.5f) {
-            // Base explícita para el polo.
-            // Esto evita que el cénit dependa del fallback fijo right0=(1,0,0)
-            // y nos permite probar un "twist" controlado.
-            val twistRad = Math.toRadians(ZENITH_TWIST_TEST_DEG.toDouble()).toFloat()
+            val twistRad = Math.toRadians(effectiveZenithTwistDeg.toDouble()).toFloat()
 
             right0 = normalize(
                 floatArrayOf(
@@ -211,14 +282,16 @@ object AtlasProjector {
         val right = normalize(add(scale(right0, cosR), scale(up0, sinR)))
         val up = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
 
-        Log.d(
-            "AtlasPole",
-            "frame=${frame.frameId} ring=${frame.ringId} " +
-                    "zenithLike=$zenithLike " +
-                    "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
-                    "rollUsed=${"%.2f".format(projectionRollDeg)} " +
-                    "twistTest=${"%.2f".format(ZENITH_TWIST_TEST_DEG)}"
-        )
+        if (emitLogs) {
+            Log.d(
+                "AtlasPole",
+                "frame=${frame.frameId} ring=${frame.ringId} " +
+                        "zenithLike=$zenithLike " +
+                        "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
+                        "rollUsed=${"%.2f".format(projectionRollDeg)} " +
+                        "twist=${"%.2f".format(effectiveZenithTwistDeg)}"
+            )
+        }
 
         val fp = approximateFootprint(frame)
         val yTop = AtlasMath.altitudeToY(fp.maxAltitudeDeg, atlas.config)
@@ -244,15 +317,17 @@ object AtlasProjector {
             )
         }
 
-        Log.d(
-            "AtlasFootprint",
-            "frame=${frame.frameId} ring=${frame.ringId} " +
-                    "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
-                    "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
-                    "fpAz=${"%.2f".format(fp.minAzimuthDeg)}..${"%.2f".format(fp.maxAzimuthDeg)} " +
-                    "fpAlt=${"%.2f".format(fp.minAltitudeDeg)}..${"%.2f".format(fp.maxAltitudeDeg)} " +
-                    "coversAll=$coversAllAzimuth spans=${xSpans.joinToString()}"
-        )
+        if (emitLogs) {
+            Log.d(
+                "AtlasFootprint",
+                "frame=${frame.frameId} ring=${frame.ringId} " +
+                        "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                        "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                        "fpAz=${"%.2f".format(fp.minAzimuthDeg)}..${"%.2f".format(fp.maxAzimuthDeg)} " +
+                        "fpAlt=${"%.2f".format(fp.minAltitudeDeg)}..${"%.2f".format(fp.maxAltitudeDeg)} " +
+                        "coversAll=$coversAllAzimuth spans=${xSpans.joinToString()}"
+            )
+        }
 
         for ((x0, x1) in xSpans) {
             for (y in yTop..yBottom) {
@@ -299,6 +374,272 @@ object AtlasProjector {
                 }
             }
         }
+    }
+    private fun isZenithFrame(frame: FrameRecord): Boolean {
+        return frame.ringId.equals("Z0", ignoreCase = true) ||
+                frame.targetPitchDeg >= 80f ||
+                frame.measuredPitchDeg >= 80f
+    }
+
+    private fun estimateZenithTwistDeg(
+        frame: FrameRecord,
+        src: Bitmap,
+        baseAtlas: SkyAtlas,
+        frameWeight: Float
+    ): ZenithTwistEstimate {
+        if (frameWeight <= 0f) {
+            return ZenithTwistEstimate(
+                twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                score = Float.NEGATIVE_INFINITY,
+                comparedPixels = 0,
+                confidence = 0f
+            )
+        }
+
+        val estimationSrc = downscaleForZenithEstimation(src)
+
+        try {
+            var best: ZenithTwistEstimate? = null
+            var secondBestScore = Float.NEGATIVE_INFINITY
+            val visited = HashSet<Int>()
+
+            fun considerCandidate(twistDeg: Float) {
+                val normalized = normalizeTwistDeg(twistDeg)
+                val key = (normalized * 100f).roundToInt()
+                if (!visited.add(key)) return
+
+                val candidate = evaluateZenithTwistCandidate(
+                    frame = frame,
+                    src = estimationSrc,
+                    baseAtlas = baseAtlas,
+                    frameWeight = frameWeight,
+                    twistDeg = normalized
+                )
+
+                if (best == null || candidate.score > best!!.score) {
+                    if (best != null) secondBestScore = best!!.score
+                    best = candidate
+                } else if (candidate.score > secondBestScore) {
+                    secondBestScore = candidate.score
+                }
+            }
+
+            for (deg in 0 until 360 step 10) {
+                considerCandidate(deg.toFloat())
+            }
+
+            val coarseBest = best ?: ZenithTwistEstimate(
+                twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                score = Float.NEGATIVE_INFINITY,
+                comparedPixels = 0,
+                confidence = 0f
+            )
+
+            var mid = coarseBest.twistDeg - 12f
+            while (mid <= coarseBest.twistDeg + 12f + 1e-3f) {
+                considerCandidate(mid)
+                mid += 2f
+            }
+
+            val midBest = best ?: coarseBest
+
+            var fine = midBest.twistDeg - 2f
+            while (fine <= midBest.twistDeg + 2f + 1e-3f) {
+                considerCandidate(fine)
+                fine += 0.5f
+            }
+
+            val finalBest = best ?: coarseBest
+            val confidence =
+                if (secondBestScore.isFinite()) finalBest.score - secondBestScore
+                else 0f
+
+            if (finalBest.comparedPixels < ZENITH_ESTIMATE_MIN_PIXELS || !finalBest.score.isFinite()) {
+                Log.w(
+                    "AtlasZenithTwist",
+                    "fallback twist frame=${frame.frameId} " +
+                            "pixels=${finalBest.comparedPixels} score=${finalBest.score}"
+                )
+                return ZenithTwistEstimate(
+                    twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                    score = finalBest.score,
+                    comparedPixels = finalBest.comparedPixels,
+                    confidence = 0f
+                )
+            }
+
+            return finalBest.copy(confidence = confidence)
+        } finally {
+            if (estimationSrc !== src) {
+                estimationSrc.recycle()
+            }
+        }
+    }
+
+    private fun evaluateZenithTwistCandidate(
+        frame: FrameRecord,
+        src: Bitmap,
+        baseAtlas: SkyAtlas,
+        frameWeight: Float,
+        twistDeg: Float
+    ): ZenithTwistEstimate {
+        val candidateAtlas = SkyAtlas(baseAtlas.config)
+
+        projectBitmapToAtlas(
+            frame = frame,
+            src = src,
+            atlas = candidateAtlas,
+            frameWeight = frameWeight,
+            zenithTwistDegOverride = twistDeg,
+            emitLogs = false
+        )
+
+        val (score, comparedPixels) = scoreZenithOverlap(
+            baseAtlas = baseAtlas,
+            candidateAtlas = candidateAtlas,
+            minAltitudeDeg = ZENITH_OVERLAP_MIN_ALT_DEG,
+            maxAltitudeDeg = ZENITH_OVERLAP_MAX_ALT_DEG
+        )
+
+        return ZenithTwistEstimate(
+            twistDeg = normalizeTwistDeg(twistDeg),
+            score = score,
+            comparedPixels = comparedPixels,
+            confidence = 0f
+        )
+    }
+
+    private fun scoreZenithOverlap(
+        baseAtlas: SkyAtlas,
+        candidateAtlas: SkyAtlas,
+        minAltitudeDeg: Float,
+        maxAltitudeDeg: Float
+    ): Pair<Float, Int> {
+        val yTop = AtlasMath.altitudeToY(maxAltitudeDeg, baseAtlas.config)
+        val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, baseAtlas.config)
+
+        var sumW = 0.0
+        var sumLumA = 0.0
+        var sumLumB = 0.0
+        var sumGradA = 0.0
+        var sumGradB = 0.0
+        var count = 0
+
+        for (y in yTop..yBottom) {
+            for (x in 0 until baseAtlas.width) {
+                if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
+
+                val a = luma(baseAtlas.pixels[baseAtlas.index(x, y)])
+                val b = luma(candidateAtlas.pixels[candidateAtlas.index(x, y)])
+                val ga = gradientMag(baseAtlas, x, y)
+                val gb = gradientMag(candidateAtlas, x, y)
+
+                val w = (1f + ((ga + gb) * 0.01f).coerceIn(0f, 4f)).toDouble()
+
+                sumW += w
+                sumLumA += w * a
+                sumLumB += w * b
+                sumGradA += w * ga
+                sumGradB += w * gb
+                count++
+            }
+        }
+
+        if (count < ZENITH_ESTIMATE_MIN_PIXELS || sumW <= 0.0) {
+            return Float.NEGATIVE_INFINITY to count
+        }
+
+        val meanLumA = sumLumA / sumW
+        val meanLumB = sumLumB / sumW
+        val meanGradA = sumGradA / sumW
+        val meanGradB = sumGradB / sumW
+
+        var numLum = 0.0
+        var denLumA = 0.0
+        var denLumB = 0.0
+
+        var numGrad = 0.0
+        var denGradA = 0.0
+        var denGradB = 0.0
+
+        for (y in yTop..yBottom) {
+            for (x in 0 until baseAtlas.width) {
+                if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
+
+                val a = luma(baseAtlas.pixels[baseAtlas.index(x, y)])
+                val b = luma(candidateAtlas.pixels[candidateAtlas.index(x, y)])
+                val ga = gradientMag(baseAtlas, x, y)
+                val gb = gradientMag(candidateAtlas, x, y)
+
+                val w = (1f + ((ga + gb) * 0.01f).coerceIn(0f, 4f)).toDouble()
+
+                val daLum = a - meanLumA
+                val dbLum = b - meanLumB
+
+                numLum += w * daLum * dbLum
+                denLumA += w * daLum * daLum
+                denLumB += w * dbLum * dbLum
+
+                val daGrad = ga - meanGradA
+                val dbGrad = gb - meanGradB
+
+                numGrad += w * daGrad * dbGrad
+                denGradA += w * daGrad * daGrad
+                denGradB += w * dbGrad * dbGrad
+            }
+        }
+
+        val lumScore =
+            if (denLumA > 1e-9 && denLumB > 1e-9) {
+                (numLum / sqrt(denLumA * denLumB)).toFloat()
+            } else {
+                -1f
+            }
+
+        val gradScore =
+            if (denGradA > 1e-9 && denGradB > 1e-9) {
+                (numGrad / sqrt(denGradA * denGradB)).toFloat()
+            } else {
+                -1f
+            }
+
+        val finalScore = 0.35f * lumScore + 0.65f * gradScore
+        return finalScore to count
+    }
+
+    private fun downscaleForZenithEstimation(src: Bitmap): Bitmap {
+        val longSide = max(src.width, src.height)
+        if (longSide <= ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE) return src
+
+        val scale = ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE.toFloat() / longSide.toFloat()
+        val dstW = (src.width * scale).roundToInt().coerceAtLeast(1)
+        val dstH = (src.height * scale).roundToInt().coerceAtLeast(1)
+
+        return Bitmap.createScaledBitmap(src, dstW, dstH, true)
+    }
+
+    private fun normalizeTwistDeg(value: Float): Float {
+        var v = value % 360f
+        if (v < 0f) v += 360f
+        return v
+    }
+
+    private fun luma(color: Int): Double {
+        return 0.299 * Color.red(color) +
+                0.587 * Color.green(color) +
+                0.114 * Color.blue(color)
+    }
+
+    private fun gradientMag(atlas: SkyAtlas, x: Int, y: Int): Double {
+        val xl = if (x > 0) x - 1 else x
+        val xr = if (x < atlas.width - 1) x + 1 else x
+        val yt = if (y > 0) y - 1 else y
+        val yb = if (y < atlas.height - 1) y + 1 else y
+
+        val gx = luma(atlas.pixels[atlas.index(xr, y)]) - luma(atlas.pixels[atlas.index(xl, y)])
+        val gy = luma(atlas.pixels[atlas.index(x, yb)]) - luma(atlas.pixels[atlas.index(x, yt)])
+
+        return kotlin.math.abs(gx) + kotlin.math.abs(gy)
     }
 
     private fun qualityWeightForFrame(frame: FrameRecord): Float {
