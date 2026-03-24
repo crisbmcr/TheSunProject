@@ -124,14 +124,31 @@ object AtlasProjector {
         val tanHalfH = tan(Math.toRadians(hfov / 2.0)).toFloat()
         val tanHalfV = tan(Math.toRadians(vfov / 2.0)).toFloat()
 
+        val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
+
+        val projectionAzimuthDeg = if (zenithLike) {
+            frame.targetAzimuthDeg
+        } else {
+            frame.measuredAzimuthDeg
+        }
+
         val yawRad = Math.toRadians(
-            AtlasMath.normalizeAzimuthDeg(frame.measuredAzimuthDeg).toDouble()
+            AtlasMath.normalizeAzimuthDeg(projectionAzimuthDeg).toDouble()
         ).toFloat()
 
         val pitchRad = Math.toRadians(frame.measuredPitchDeg.toDouble()).toFloat()
-
-        // Mantengo la misma convención de la fase 2
+// Mantengo la misma convención de la fase 2
         val rollRad = Math.toRadians((-frame.measuredRollDeg).toDouble()).toFloat()
+
+        Log.d(
+            "AtlasPose",
+            "frame=${frame.frameId} ring=${frame.ringId} " +
+                    "zenithLike=$zenithLike " +
+                    "yawUsed=${"%.2f".format(projectionAzimuthDeg)} " +
+                    "yawMeasured=${"%.2f".format(frame.measuredAzimuthDeg)} " +
+                    "pitch=${"%.2f".format(frame.measuredPitchDeg)} " +
+                    "roll=${"%.2f".format(frame.measuredRollDeg)}"
+        )
 
         val forward = worldDirectionRad(yawRad, pitchRad)
 
