@@ -18,6 +18,7 @@ data class FrameFootprint(
     val minAltitudeDeg: Float,
     val maxAltitudeDeg: Float
 )
+private const val ZENITH_TWIST_TEST_DEG = 90f
 
 object AtlasProjector {
 
@@ -132,13 +133,25 @@ object AtlasProjector {
             frame.measuredAzimuthDeg
         }
 
+        val projectionPitchDeg = if (zenithLike) {
+            90f
+        } else {
+            frame.measuredPitchDeg
+        }
+
+        val projectionRollDeg = if (zenithLike) {
+            0f
+        } else {
+            frame.measuredRollDeg
+        }
+
         val yawRad = Math.toRadians(
             AtlasMath.normalizeAzimuthDeg(projectionAzimuthDeg).toDouble()
         ).toFloat()
 
-        val pitchRad = Math.toRadians(frame.measuredPitchDeg.toDouble()).toFloat()
-// Mantengo la misma convención de la fase 2
-        val rollRad = Math.toRadians((-frame.measuredRollDeg).toDouble()).toFloat()
+        val pitchRad = Math.toRadians(projectionPitchDeg.toDouble()).toFloat()
+        // Mantengo la misma convención de la fase 2
+        val rollRad = Math.toRadians((-projectionRollDeg).toDouble()).toFloat()
 
         Log.d(
             "AtlasPose",
@@ -146,26 +159,66 @@ object AtlasProjector {
                     "zenithLike=$zenithLike " +
                     "yawUsed=${"%.2f".format(projectionAzimuthDeg)} " +
                     "yawMeasured=${"%.2f".format(frame.measuredAzimuthDeg)} " +
-                    "pitch=${"%.2f".format(frame.measuredPitchDeg)} " +
-                    "roll=${"%.2f".format(frame.measuredRollDeg)}"
+                    "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
+                    "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
+                    "rollUsed=${"%.2f".format(projectionRollDeg)} " +
+                    "rollMeasured=${"%.2f".format(frame.measuredRollDeg)}"
         )
 
         val forward = worldDirectionRad(yawRad, pitchRad)
 
-        var right0 = cross(forward, floatArrayOf(0f, 0f, 1f))
-        if (length(right0) < 1e-4f) {
-            right0 = floatArrayOf(1f, 0f, 0f)
-        }
-        right0 = normalize(right0)
+        val right0: FloatArray
+        val up0: FloatArray
 
-        var up0 = cross(right0, forward)
-        up0 = normalize(up0)
+        if (zenithLike && projectionPitchDeg >= 89.5f) {
+            // Base explícita para el polo.
+            // Esto evita que el cénit dependa del fallback fijo right0=(1,0,0)
+            // y nos permite probar un "twist" controlado.
+            val twistRad = Math.toRadians(ZENITH_TWIST_TEST_DEG.toDouble()).toFloat()
+
+            right0 = normalize(
+                floatArrayOf(
+                    cos(twistRad),
+                    sin(twistRad),
+                    0f
+                )
+            )
+
+            up0 = normalize(
+                floatArrayOf(
+                    -sin(twistRad),
+                    cos(twistRad),
+                    0f
+                )
+            )
+        } else {
+            var r = cross(forward, floatArrayOf(0f, 0f, 1f))
+            if (length(r) < 1e-4f) {
+                r = floatArrayOf(1f, 0f, 0f)
+            }
+            r = normalize(r)
+
+            var u = cross(r, forward)
+            u = normalize(u)
+
+            right0 = r
+            up0 = u
+        }
 
         val cosR = cos(rollRad)
         val sinR = sin(rollRad)
 
         val right = normalize(add(scale(right0, cosR), scale(up0, sinR)))
         val up = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
+
+        Log.d(
+            "AtlasPole",
+            "frame=${frame.frameId} ring=${frame.ringId} " +
+                    "zenithLike=$zenithLike " +
+                    "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
+                    "rollUsed=${"%.2f".format(projectionRollDeg)} " +
+                    "twistTest=${"%.2f".format(ZENITH_TWIST_TEST_DEG)}"
+        )
 
         val fp = approximateFootprint(frame)
         val yTop = AtlasMath.altitudeToY(fp.maxAltitudeDeg, atlas.config)
