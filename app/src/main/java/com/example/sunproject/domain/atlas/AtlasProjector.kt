@@ -614,46 +614,11 @@ object AtlasProjector {
             twistDeg = normalizeTwistDeg(twistDeg),
             pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchOffsetDeg),
             rollOffsetDeg = clampZenithRollOffsetDeg(rollOffsetDeg),
-            (rollOffsetDeg),
             score = score,
             comparedPixels = comparedPixels,
             confidence = 0f
         )
     }
-
-    private fun evaluateZenithTwistCandidate(
-        frame: FrameRecord,
-        src: Bitmap,
-        baseAtlas: SkyAtlas,
-        frameWeight: Float,
-        twistDeg: Float
-    ): ZenithTwistEstimate {
-        val candidateAtlas = SkyAtlas(baseAtlas.config)
-
-        projectBitmapToAtlas(
-            frame = frame,
-            src = src,
-            atlas = candidateAtlas,
-            frameWeight = frameWeight,
-            zenithTwistDegOverride = twistDeg,
-            emitLogs = false
-        )
-
-        val (score, comparedPixels) = scoreZenithOverlap(
-            baseAtlas = baseAtlas,
-            candidateAtlas = candidateAtlas,
-            minAltitudeDeg = ZENITH_OVERLAP_MIN_ALT_DEG,
-            maxAltitudeDeg = ZENITH_OVERLAP_MAX_ALT_DEG
-        )
-
-        return ZenithTwistEstimate(
-            twistDeg = normalizeTwistDeg(twistDeg),
-            score = score,
-            comparedPixels = comparedPixels,
-            confidence = 0f
-        )
-    }
-
     private fun scoreZenithOverlap(
         baseAtlas: SkyAtlas,
         candidateAtlas: SkyAtlas,
