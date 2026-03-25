@@ -12,11 +12,19 @@ import kotlin.math.sqrt
 import kotlin.math.tan
 import android.util.Log
 import android.graphics.Color
+
 private const val ZENITH_TWIST_FALLBACK_DEG = 90f
-private const val ZENITH_OVERLAP_MIN_ALT_DEG = 68f
-private const val ZENITH_OVERLAP_MAX_ALT_DEG = 80f
-private const val ZENITH_ESTIMATE_MIN_PIXELS = 2500
+private const val ZENITH_OVERLAP_MIN_ALT_DEG = 72f
+private const val ZENITH_OVERLAP_MAX_ALT_DEG = 78f
+private const val ZENITH_ESTIMATE_MIN_PIXELS = 1800
 private const val ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE = 1280
+
+private const val ZENITH_ESTIMATE_MIN_SCORE = 0.20f
+private const val ZENITH_ESTIMATE_MIN_CONFIDENCE = 0.01f
+
+private const val ZENITH_ESTIMATE_MIN_GRADIENT = 10.0
+private const val ZENITH_ESTIMATE_MIN_LUMA = 12.0
+private const val ZENITH_ESTIMATE_MAX_LUMA = 245.0
 
 data class FrameFootprint(
     val minAzimuthDeg: Float,
@@ -417,7 +425,9 @@ object AtlasProjector {
                 )
 
                 if (best == null || candidate.score > best!!.score) {
-                    if (best != null) secondBestScore = best!!.score
+                    if (best != null) {
+                        secondBestScore = best!!.score
+                    }
                     best = candidate
                 } else if (candidate.score > secondBestScore) {
                     secondBestScore = candidate.score
@@ -454,17 +464,26 @@ object AtlasProjector {
                 if (secondBestScore.isFinite()) finalBest.score - secondBestScore
                 else 0f
 
-            if (finalBest.comparedPixels < ZENITH_ESTIMATE_MIN_PIXELS || !finalBest.score.isFinite()) {
+            val lowPixels = finalBest.comparedPixels < ZENITH_ESTIMATE_MIN_PIXELS
+            val lowScore = !finalBest.score.isFinite() || finalBest.score < ZENITH_ESTIMATE_MIN_SCORE
+            val lowConfidence = confidence < ZENITH_ESTIMATE_MIN_CONFIDENCE
+
+            if (lowPixels || lowScore || lowConfidence) {
                 Log.w(
                     "AtlasZenithTwist",
-                    "fallback twist frame=${frame.frameId} " +
-                            "pixels=${finalBest.comparedPixels} score=${finalBest.score}"
+                    "fallback frame=${frame.frameId} " +
+                            "bestTwist=${"%.2f".format(finalBest.twistDeg)} " +
+                            "score=${"%.4f".format(finalBest.score)} " +
+                            "pixels=${finalBest.comparedPixels} " +
+                            "confidence=${"%.4f".format(confidence)} " +
+                            "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence"
                 )
+
                 return ZenithTwistEstimate(
                     twistDeg = ZENITH_TWIST_FALLBACK_DEG,
                     score = finalBest.score,
                     comparedPixels = finalBest.comparedPixels,
-                    confidence = 0f
+                    confidence = confidence
                 )
             }
 
@@ -529,18 +548,31 @@ object AtlasProjector {
             for (x in 0 until baseAtlas.width) {
                 if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
 
-                val a = luma(baseAtlas.pixels[baseAtlas.index(x, y)])
-                val b = luma(candidateAtlas.pixels[candidateAtlas.index(x, y)])
-                val ga = gradientMag(baseAtlas, x, y)
-                val gb = gradientMag(candidateAtlas, x, y)
+                val idxA = baseAtlas.index(x, y)
+                val idxB = candidateAtlas.index(x, y)
 
-                val w = 1.0 + ((ga + gb) * 0.01).coerceIn(0.0, 4.0)
+                val colorA = baseAtlas.pixels[idxA]
+                val colorB = candidateAtlas.pixels[idxB]
+
+                val lumA = luma(colorA)
+                val lumB = luma(colorB)
+                val gradA = gradientMag(baseAtlas, x, y)
+                val gradB = gradientMag(candidateAtlas, x, y)
+
+                if (!isInformativeZenithSample(lumA, lumB, gradA, gradB)) continue
+
+                val w = zenithSampleWeight(
+                    baseWeight = baseAtlas.weightAt(x, y).toDouble(),
+                    candidateWeight = candidateAtlas.weightAt(x, y).toDouble(),
+                    gradA = gradA,
+                    gradB = gradB
+                )
 
                 sumW += w
-                sumLumA += w * a
-                sumLumB += w * b
-                sumGradA += w * ga
-                sumGradB += w * gb
+                sumLumA += w * lumA
+                sumLumB += w * lumB
+                sumGradA += w * gradA
+                sumGradB += w * gradB
                 count++
             }
         }
@@ -566,23 +598,34 @@ object AtlasProjector {
             for (x in 0 until baseAtlas.width) {
                 if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
 
-                val a = luma(baseAtlas.pixels[baseAtlas.index(x, y)])
-                val b = luma(candidateAtlas.pixels[candidateAtlas.index(x, y)])
-                val ga = gradientMag(baseAtlas, x, y)
-                val gb = gradientMag(candidateAtlas, x, y)
+                val idxA = baseAtlas.index(x, y)
+                val idxB = candidateAtlas.index(x, y)
 
-                val w = 1.0 + ((ga + gb) * 0.01).coerceIn(0.0, 4.0)
+                val colorA = baseAtlas.pixels[idxA]
+                val colorB = candidateAtlas.pixels[idxB]
 
-                val daLum = a - meanLumA
-                val dbLum = b - meanLumB
+                val lumA = luma(colorA)
+                val lumB = luma(colorB)
+                val gradA = gradientMag(baseAtlas, x, y)
+                val gradB = gradientMag(candidateAtlas, x, y)
 
+                if (!isInformativeZenithSample(lumA, lumB, gradA, gradB)) continue
+
+                val w = zenithSampleWeight(
+                    baseWeight = baseAtlas.weightAt(x, y).toDouble(),
+                    candidateWeight = candidateAtlas.weightAt(x, y).toDouble(),
+                    gradA = gradA,
+                    gradB = gradB
+                )
+
+                val daLum = lumA - meanLumA
+                val dbLum = lumB - meanLumB
                 numLum += w * daLum * dbLum
                 denLumA += w * daLum * daLum
                 denLumB += w * dbLum * dbLum
 
-                val daGrad = ga - meanGradA
-                val dbGrad = gb - meanGradB
-
+                val daGrad = gradA - meanGradA
+                val dbGrad = gradB - meanGradB
                 numGrad += w * daGrad * dbGrad
                 denGradA += w * daGrad * daGrad
                 denGradB += w * dbGrad * dbGrad
@@ -603,8 +646,39 @@ object AtlasProjector {
                 -1f
             }
 
-        val finalScore = 0.35f * lumScore + 0.65f * gradScore
+        val finalScore = 0.20f * lumScore + 0.80f * gradScore
         return finalScore to count
+    }
+
+    private fun isInformativeZenithSample(
+        lumA: Double,
+        lumB: Double,
+        gradA: Double,
+        gradB: Double
+    ): Boolean {
+        if (lumA <= ZENITH_ESTIMATE_MIN_LUMA || lumA >= ZENITH_ESTIMATE_MAX_LUMA) return false
+        if (lumB <= ZENITH_ESTIMATE_MIN_LUMA || lumB >= ZENITH_ESTIMATE_MAX_LUMA) return false
+
+        val maxGrad = if (gradA > gradB) gradA else gradB
+        return maxGrad >= ZENITH_ESTIMATE_MIN_GRADIENT
+    }
+
+    private fun zenithSampleWeight(
+        baseWeight: Double,
+        candidateWeight: Double,
+        gradA: Double,
+        gradB: Double
+    ): Double {
+        val minCoverage =
+            if (baseWeight < candidateWeight) baseWeight else candidateWeight
+
+        val maxGrad =
+            if (gradA > gradB) gradA else gradB
+
+        val structureBoost = 1.0 + (maxGrad * 0.02).coerceIn(0.0, 6.0)
+        val coverageBoost = 1.0 + (minCoverage * 0.15).coerceIn(0.0, 1.5)
+
+        return structureBoost * coverageBoost
     }
 
     private fun downscaleForZenithEstimation(src: Bitmap): Bitmap {
