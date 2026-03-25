@@ -26,6 +26,15 @@ private const val ZENITH_ESTIMATE_MIN_GRADIENT = 10.0
 private const val ZENITH_ESTIMATE_MIN_LUMA = 12.0
 private const val ZENITH_ESTIMATE_MAX_LUMA = 245.0
 
+private const val ZENITH_PITCH_OFFSET_FALLBACK_DEG = 0f
+private const val ZENITH_ROLL_OFFSET_FALLBACK_DEG = 0f
+
+private const val ZENITH_PITCH_OFFSET_MIN_DEG = -4f
+private const val ZENITH_PITCH_OFFSET_MAX_DEG = 1f
+
+private const val ZENITH_ROLL_OFFSET_MIN_DEG = -6f
+private const val ZENITH_ROLL_OFFSET_MAX_DEG = 6f
+
 data class FrameFootprint(
     val minAzimuthDeg: Float,
     val maxAzimuthDeg: Float,
@@ -33,8 +42,10 @@ data class FrameFootprint(
     val maxAltitudeDeg: Float
 )
 
-data class ZenithTwistEstimate(
+data class ZenithPoseEstimate(
     val twistDeg: Float,
+    val pitchOffsetDeg: Float,
+    val rollOffsetDeg: Float,
     val score: Float,
     val comparedPixels: Int,
     val confidence: Float
@@ -107,6 +118,8 @@ object AtlasProjector {
                 atlas = atlas,
                 frameWeight = frameWeight,
                 zenithTwistDegOverride = null,
+                zenithPitchOffsetDegOverride = null,
+                zenithRollOffsetDegOverride = null,
                 emitLogs = true
             )
         } finally {
@@ -158,7 +171,7 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val twistEstimate = estimateZenithTwistDeg(
+                val poseEstimate = estimateZenithPoseDeg(
                     frame = frame,
                     src = src,
                     baseAtlas = atlas,
@@ -166,12 +179,14 @@ object AtlasProjector {
                 )
 
                 Log.d(
-                    "AtlasZenithTwist",
+                    "AtlasZenithPose",
                     "frame=${frame.frameId} ring=${frame.ringId} " +
-                            "twist=${"%.2f".format(twistEstimate.twistDeg)} " +
-                            "score=${"%.4f".format(twistEstimate.score)} " +
-                            "pixels=${twistEstimate.comparedPixels} " +
-                            "confidence=${"%.4f".format(twistEstimate.confidence)}"
+                            "twist=${"%.2f".format(poseEstimate.twistDeg)} " +
+                            "pitchOffset=${"%.2f".format(poseEstimate.pitchOffsetDeg)} " +
+                            "rollOffset=${"%.2f".format(poseEstimate.rollOffsetDeg)} " +
+                            "score=${"%.4f".format(poseEstimate.score)} " +
+                            "pixels=${poseEstimate.comparedPixels} " +
+                            "confidence=${"%.4f".format(poseEstimate.confidence)}"
                 )
 
                 projectBitmapToAtlas(
@@ -179,7 +194,9 @@ object AtlasProjector {
                     src = src,
                     atlas = atlas,
                     frameWeight = frameWeight,
-                    zenithTwistDegOverride = twistEstimate.twistDeg,
+                    zenithTwistDegOverride = poseEstimate.twistDeg,
+                    zenithPitchOffsetDegOverride = poseEstimate.pitchOffsetDeg,
+                    zenithRollOffsetDegOverride = poseEstimate.rollOffsetDeg,
                     emitLogs = true
                 )
             } finally {
@@ -194,6 +211,8 @@ object AtlasProjector {
         atlas: SkyAtlas,
         frameWeight: Float,
         zenithTwistDegOverride: Float? = null,
+        zenithPitchOffsetDegOverride: Float? = null,
+        zenithRollOffsetDegOverride: Float? = null,
         emitLogs: Boolean = true
     ) {
         if (frameWeight <= 0f) return
@@ -206,20 +225,29 @@ object AtlasProjector {
 
         val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
 
+        val effectiveZenithTwistDeg = zenithTwistDegOverride ?: ZENITH_TWIST_FALLBACK_DEG
+        val effectiveZenithPitchOffsetDeg =
+            zenithPitchOffsetDegOverride ?: ZENITH_PITCH_OFFSET_FALLBACK_DEG
+        val effectiveZenithRollOffsetDeg =
+            zenithRollOffsetDegOverride ?: ZENITH_ROLL_OFFSET_FALLBACK_DEG
+
         val projectionAzimuthDeg = if (zenithLike) {
-            frame.targetAzimuthDeg
+            frame.targetAzimuthDeg + effectiveZenithTwistDeg
         } else {
             frame.measuredAzimuthDeg
         }
 
         val projectionPitchDeg = if (zenithLike) {
-            90f
+            (90f + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
         } else {
             frame.measuredPitchDeg
         }
 
         val projectionRollDeg = if (zenithLike) {
-            0f
+            effectiveZenithRollOffsetDeg.coerceIn(
+                ZENITH_ROLL_OFFSET_MIN_DEG,
+                ZENITH_ROLL_OFFSET_MAX_DEG
+            )
         } else {
             frame.measuredRollDeg
         }
@@ -241,7 +269,10 @@ object AtlasProjector {
                         "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
                         "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
                         "rollUsed=${"%.2f".format(projectionRollDeg)} " +
-                        "rollMeasured=${"%.2f".format(frame.measuredRollDeg)}"
+                        "rollMeasured=${"%.2f".format(frame.measuredRollDeg)} " +
+                        "twist=${"%.2f".format(effectiveZenithTwistDeg)} " +
+                        "pitchOffset=${"%.2f".format(effectiveZenithPitchOffsetDeg)} " +
+                        "rollOffset=${"%.2f".format(effectiveZenithRollOffsetDeg)}"
             )
         }
 
@@ -250,23 +281,19 @@ object AtlasProjector {
         val right0: FloatArray
         val up0: FloatArray
 
-        val effectiveZenithTwistDeg = zenithTwistDegOverride ?: ZENITH_TWIST_FALLBACK_DEG
-
         if (zenithLike && projectionPitchDeg >= 89.5f) {
-            val twistRad = Math.toRadians(effectiveZenithTwistDeg.toDouble()).toFloat()
-
             right0 = normalize(
                 floatArrayOf(
-                    cos(twistRad),
-                    sin(twistRad),
+                    cos(yawRad),
+                    sin(yawRad),
                     0f
                 )
             )
 
             up0 = normalize(
                 floatArrayOf(
-                    -sin(twistRad),
-                    cos(twistRad),
+                    -sin(yawRad),
+                    cos(yawRad),
                     0f
                 )
             )
@@ -297,7 +324,9 @@ object AtlasProjector {
                         "zenithLike=$zenithLike " +
                         "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
                         "rollUsed=${"%.2f".format(projectionRollDeg)} " +
-                        "twist=${"%.2f".format(effectiveZenithTwistDeg)}"
+                        "twist=${"%.2f".format(effectiveZenithTwistDeg)} " +
+                        "pitchOffset=${"%.2f".format(effectiveZenithPitchOffsetDeg)} " +
+                        "rollOffset=${"%.2f".format(effectiveZenithRollOffsetDeg)}"
             )
         }
 
@@ -389,15 +418,17 @@ object AtlasProjector {
                 frame.measuredPitchDeg >= 80f
     }
 
-    private fun estimateZenithTwistDeg(
+    private fun estimateZenithPoseDeg(
         frame: FrameRecord,
         src: Bitmap,
         baseAtlas: SkyAtlas,
         frameWeight: Float
-    ): ZenithTwistEstimate {
+    ): ZenithPoseEstimate {
         if (frameWeight <= 0f) {
-            return ZenithTwistEstimate(
+            return ZenithPoseEstimate(
                 twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
                 score = Float.NEGATIVE_INFINITY,
                 comparedPixels = 0,
                 confidence = 0f
@@ -407,56 +438,107 @@ object AtlasProjector {
         val estimationSrc = downscaleForZenithEstimation(src)
 
         try {
-            var best: ZenithTwistEstimate? = null
+            var best: ZenithPoseEstimate? = null
             var secondBestScore = Float.NEGATIVE_INFINITY
-            val visited = HashSet<Int>()
+            val visited = HashSet<String>()
 
-            fun considerCandidate(twistDeg: Float) {
-                val normalized = normalizeTwistDeg(twistDeg)
-                val key = (normalized * 100f).roundToInt()
+            fun considerCandidate(
+                twistDeg: Float,
+                pitchOffsetDeg: Float,
+                rollOffsetDeg: Float
+            ) {
+                val normTwist = normalizeTwistDeg(twistDeg)
+                val normPitch = clampZenithPitchOffsetDeg(pitchOffsetDeg)
+                val normRoll = clampZenithRollOffsetDeg(rollOffsetDeg)
+
+                val key = buildString {
+                    append((normTwist * 10f).roundToInt())
+                    append(':')
+                    append((normPitch * 20f).roundToInt())
+                    append(':')
+                    append((normRoll * 20f).roundToInt())
+                }
+
                 if (!visited.add(key)) return
 
-                val candidate = evaluateZenithTwistCandidate(
+                val candidate = evaluateZenithPoseCandidate(
                     frame = frame,
                     src = estimationSrc,
                     baseAtlas = baseAtlas,
                     frameWeight = frameWeight,
-                    twistDeg = normalized
+                    twistDeg = normTwist,
+                    pitchOffsetDeg = normPitch,
+                    rollOffsetDeg = normRoll
                 )
 
                 if (best == null || candidate.score > best!!.score) {
-                    if (best != null) {
-                        secondBestScore = best!!.score
-                    }
+                    if (best != null) secondBestScore = best!!.score
                     best = candidate
                 } else if (candidate.score > secondBestScore) {
                     secondBestScore = candidate.score
                 }
             }
 
-            for (deg in 0 until 360 step 10) {
-                considerCandidate(deg.toFloat())
+            val coarsePitchOffsets = floatArrayOf(-4f, -2f, 0f, 1f)
+            val coarseRollOffsets = floatArrayOf(-6f, -3f, 0f, 3f, 6f)
+
+            for (twist in 0 until 360 step 20) {
+                for (pitchOffset in coarsePitchOffsets) {
+                    for (rollOffset in coarseRollOffsets) {
+                        considerCandidate(
+                            twistDeg = twist.toFloat(),
+                            pitchOffsetDeg = pitchOffset,
+                            rollOffsetDeg = rollOffset
+                        )
+                    }
+                }
             }
 
-            val coarseBest = best ?: ZenithTwistEstimate(
+            val coarseBest = best ?: ZenithPoseEstimate(
                 twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
                 score = Float.NEGATIVE_INFINITY,
                 comparedPixels = 0,
                 confidence = 0f
             )
 
-            var mid = coarseBest.twistDeg - 12f
-            while (mid <= coarseBest.twistDeg + 12f + 1e-3f) {
-                considerCandidate(mid)
-                mid += 2f
+            var twistMid = coarseBest.twistDeg - 20f
+            while (twistMid <= coarseBest.twistDeg + 20f + 1e-3f) {
+                var pitchMid = coarseBest.pitchOffsetDeg - 1.5f
+                while (pitchMid <= coarseBest.pitchOffsetDeg + 1.5f + 1e-3f) {
+                    var rollMid = coarseBest.rollOffsetDeg - 2f
+                    while (rollMid <= coarseBest.rollOffsetDeg + 2f + 1e-3f) {
+                        considerCandidate(
+                            twistDeg = twistMid,
+                            pitchOffsetDeg = pitchMid,
+                            rollOffsetDeg = rollMid
+                        )
+                        rollMid += 1f
+                    }
+                    pitchMid += 0.75f
+                }
+                twistMid += 5f
             }
 
             val midBest = best ?: coarseBest
 
-            var fine = midBest.twistDeg - 2f
-            while (fine <= midBest.twistDeg + 2f + 1e-3f) {
-                considerCandidate(fine)
-                fine += 0.5f
+            var twistFine = midBest.twistDeg - 4f
+            while (twistFine <= midBest.twistDeg + 4f + 1e-3f) {
+                var pitchFine = midBest.pitchOffsetDeg - 0.5f
+                while (pitchFine <= midBest.pitchOffsetDeg + 0.5f + 1e-3f) {
+                    var rollFine = midBest.rollOffsetDeg - 1f
+                    while (rollFine <= midBest.rollOffsetDeg + 1f + 1e-3f) {
+                        considerCandidate(
+                            twistDeg = twistFine,
+                            pitchOffsetDeg = pitchFine,
+                            rollOffsetDeg = rollFine
+                        )
+                        rollFine += 0.25f
+                    }
+                    pitchFine += 0.25f
+                }
+                twistFine += 1f
             }
 
             val finalBest = best ?: coarseBest
@@ -470,17 +552,21 @@ object AtlasProjector {
 
             if (lowPixels || lowScore || lowConfidence) {
                 Log.w(
-                    "AtlasZenithTwist",
+                    "AtlasZenithPose",
                     "fallback frame=${frame.frameId} " +
                             "bestTwist=${"%.2f".format(finalBest.twistDeg)} " +
+                            "bestPitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
+                            "bestRollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
                             "score=${"%.4f".format(finalBest.score)} " +
                             "pixels=${finalBest.comparedPixels} " +
                             "confidence=${"%.4f".format(confidence)} " +
                             "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence"
                 )
 
-                return ZenithTwistEstimate(
+                return ZenithPoseEstimate(
                     twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                    pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                    rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
                     score = finalBest.score,
                     comparedPixels = finalBest.comparedPixels,
                     confidence = confidence
@@ -493,6 +579,46 @@ object AtlasProjector {
                 estimationSrc.recycle()
             }
         }
+    }
+
+    private fun evaluateZenithPoseCandidate(
+        frame: FrameRecord,
+        src: Bitmap,
+        baseAtlas: SkyAtlas,
+        frameWeight: Float,
+        twistDeg: Float,
+        pitchOffsetDeg: Float,
+        rollOffsetDeg: Float
+    ): ZenithPoseEstimate {
+        val candidateAtlas = SkyAtlas(baseAtlas.config)
+
+        projectBitmapToAtlas(
+            frame = frame,
+            src = src,
+            atlas = candidateAtlas,
+            frameWeight = frameWeight,
+            zenithTwistDegOverride = twistDeg,
+            zenithPitchOffsetDegOverride = pitchOffsetDeg,
+            zenithRollOffsetDegOverride = rollOffsetDeg,
+            emitLogs = false
+        )
+
+        val (score, comparedPixels) = scoreZenithOverlap(
+            baseAtlas = baseAtlas,
+            candidateAtlas = candidateAtlas,
+            minAltitudeDeg = ZENITH_OVERLAP_MIN_ALT_DEG,
+            maxAltitudeDeg = ZENITH_OVERLAP_MAX_ALT_DEG
+        )
+
+        return ZenithPoseEstimate(
+            twistDeg = normalizeTwistDeg(twistDeg),
+            pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchOffsetDeg),
+            rollOffsetDeg = clampZenithRollOffsetDeg(rollOffsetDeg),
+            (rollOffsetDeg),
+            score = score,
+            comparedPixels = comparedPixels,
+            confidence = 0f
+        )
     }
 
     private fun evaluateZenithTwistCandidate(
@@ -702,6 +828,20 @@ object AtlasProjector {
         return 0.299 * Color.red(color) +
                 0.587 * Color.green(color) +
                 0.114 * Color.blue(color)
+    }
+
+    private fun clampZenithPitchOffsetDeg(value: Float): Float {
+        return value.coerceIn(
+            ZENITH_PITCH_OFFSET_MIN_DEG,
+            ZENITH_PITCH_OFFSET_MAX_DEG
+        )
+    }
+
+    private fun clampZenithRollOffsetDeg(value: Float): Float {
+        return value.coerceIn(
+            ZENITH_ROLL_OFFSET_MIN_DEG,
+            ZENITH_ROLL_OFFSET_MAX_DEG
+        )
     }
 
     private fun gradientMag(atlas: SkyAtlas, x: Int, y: Int): Double {
