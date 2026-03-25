@@ -18,27 +18,33 @@ private const val ZENITH_TWIST_FALLBACK_DEG = 90f
 private const val ZENITH_PITCH_OFFSET_FALLBACK_DEG = 0f
 private const val ZENITH_ROLL_OFFSET_FALLBACK_DEG = 0f
 
-private const val ZENITH_OVERLAP_MIN_ALT_DEG = 72f
-private const val ZENITH_OVERLAP_MAX_ALT_DEG = 78f
-private const val ZENITH_ESTIMATE_MIN_PIXELS = 1800
-private const val ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE = 640
-
-private const val ZENITH_ESTIMATE_MIN_SCORE = 0.20f
-private const val ZENITH_ESTIMATE_MIN_CONFIDENCE = 0.01f
-
-private const val ZENITH_ESTIMATE_MIN_GRADIENT = 10.0
-private const val ZENITH_ESTIMATE_MIN_LUMA = 12.0
-private const val ZENITH_ESTIMATE_MAX_LUMA = 245.0
-
-private const val ZENITH_ESTIMATE_MAX_CANDIDATES = 220
-private const val ZENITH_ESTIMATE_TIME_BUDGET_MS = 12000L
-private const val ZENITH_ESTIMATE_PROGRESS_EVERY = 25
-
 private const val ZENITH_PITCH_OFFSET_MIN_DEG = -4f
 private const val ZENITH_PITCH_OFFSET_MAX_DEG = 1f
 
 private const val ZENITH_ROLL_OFFSET_MIN_DEG = -6f
 private const val ZENITH_ROLL_OFFSET_MAX_DEG = 6f
+
+private const val ZENITH_OVERLAP_MIN_ALT_DEG = 72f
+private const val ZENITH_OVERLAP_MAX_ALT_DEG = 78f
+
+private const val ZENITH_ESTIMATE_MIN_PIXELS = 700
+private const val ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE = 480
+
+private const val ZENITH_ESTIMATE_MIN_SCORE = 0.10f
+private const val ZENITH_ESTIMATE_MIN_CONFIDENCE = 0.008f
+
+private const val ZENITH_ESTIMATE_MIN_GRADIENT = 10.0
+private const val ZENITH_ESTIMATE_MIN_LUMA = 12.0
+private const val ZENITH_ESTIMATE_MAX_LUMA = 245.0
+
+private const val ZENITH_ESTIMATE_MAX_CANDIDATES = 96
+private const val ZENITH_ESTIMATE_TIME_BUDGET_MS = 6000L
+private const val ZENITH_ESTIMATE_PROGRESS_EVERY = 12
+
+private const val ZENITH_ESTIMATE_PROJ_X_STEP = 4
+private const val ZENITH_ESTIMATE_PROJ_Y_STEP = 2
+private const val ZENITH_SCORE_X_STEP = 4
+private const val ZENITH_SCORE_Y_STEP = 2
 
 data class FrameFootprint(
     val minAzimuthDeg: Float,
@@ -218,7 +224,9 @@ object AtlasProjector {
         zenithTwistDegOverride: Float? = null,
         zenithPitchOffsetDegOverride: Float? = null,
         zenithRollOffsetDegOverride: Float? = null,
-        emitLogs: Boolean = true
+        emitLogs: Boolean = true,
+        atlasXStep: Int = 1,
+        atlasYStep: Int = 1
     ) {
         if (frameWeight <= 0f) return
 
@@ -371,12 +379,15 @@ object AtlasProjector {
             )
         }
 
+        val safeXStep = atlasXStep.coerceAtLeast(1)
+        val safeYStep = atlasYStep.coerceAtLeast(1)
+
         for ((x0, x1) in xSpans) {
-            for (y in yTop..yBottom) {
+            for (y in yTop..yBottom step safeYStep) {
                 val altDeg = AtlasMath.yToAltitude(y, atlas.config)
                 val altRad = Math.toRadians(altDeg.toDouble()).toFloat()
 
-                for (x in x0..x1) {
+                for (x in x0..x1 step safeXStep) {
                     val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
                     val azRad = Math.toRadians(azDeg.toDouble()).toFloat()
 
@@ -452,9 +463,8 @@ object AtlasProjector {
             var stoppedByBudget = false
 
             fun outOfBudget(): Boolean {
-                if (evaluatedCount >= ZENITH_ESTIMATE_MAX_CANDIDATES) return true
-                if (SystemClock.elapsedRealtime() >= deadlineAt) return true
-                return false
+                return evaluatedCount >= ZENITH_ESTIMATE_MAX_CANDIDATES ||
+                        SystemClock.elapsedRealtime() >= deadlineAt
             }
 
             fun considerCandidate(
@@ -512,10 +522,10 @@ object AtlasProjector {
                 }
             }
 
-            val coarsePitchOffsets = floatArrayOf(-3f, 0f)
+            val coarsePitchOffsets = floatArrayOf(-2f, 0f)
             val coarseRollOffsets = floatArrayOf(-4f, 0f, 4f)
 
-            loop@ for (twist in 0 until 360 step 30) {
+            loop@ for (twist in 0 until 360 step 45) {
                 for (pitchOffset in coarsePitchOffsets) {
                     for (rollOffset in coarseRollOffsets) {
                         considerCandidate(
@@ -538,8 +548,8 @@ object AtlasProjector {
             )
 
             if (!stoppedByBudget) {
-                var twistMid = coarseBest.twistDeg - 12f
-                loop@ while (twistMid <= coarseBest.twistDeg + 12f + 1e-3f) {
+                var twistMid = coarseBest.twistDeg - 10f
+                loop@ while (twistMid <= coarseBest.twistDeg + 10f + 1e-3f) {
                     var pitchMid = coarseBest.pitchOffsetDeg - 1f
                     while (pitchMid <= coarseBest.pitchOffsetDeg + 1f + 1e-3f) {
                         var rollMid = coarseBest.rollOffsetDeg - 2f
@@ -554,30 +564,7 @@ object AtlasProjector {
                         }
                         pitchMid += 1f
                     }
-                    twistMid += 6f
-                }
-            }
-
-            val midBest = best ?: coarseBest
-
-            if (!stoppedByBudget) {
-                var twistFine = midBest.twistDeg - 2f
-                loop@ while (twistFine <= midBest.twistDeg + 2f + 1e-3f) {
-                    var pitchFine = midBest.pitchOffsetDeg - 0.5f
-                    while (pitchFine <= midBest.pitchOffsetDeg + 0.5f + 1e-3f) {
-                        var rollFine = midBest.rollOffsetDeg - 1f
-                        while (rollFine <= midBest.rollOffsetDeg + 1f + 1e-3f) {
-                            considerCandidate(
-                                twistDeg = twistFine,
-                                pitchOffsetDeg = pitchFine,
-                                rollOffsetDeg = rollFine
-                            )
-                            if (stoppedByBudget) break@loop
-                            rollFine += 1f
-                        }
-                        pitchFine += 0.5f
-                    }
-                    twistFine += 1f
+                    twistMid += 5f
                 }
             }
 
@@ -652,14 +639,18 @@ object AtlasProjector {
             zenithTwistDegOverride = twistDeg,
             zenithPitchOffsetDegOverride = pitchOffsetDeg,
             zenithRollOffsetDegOverride = rollOffsetDeg,
-            emitLogs = false
+            emitLogs = false,
+            atlasXStep = ZENITH_ESTIMATE_PROJ_X_STEP,
+            atlasYStep = ZENITH_ESTIMATE_PROJ_Y_STEP
         )
 
         val (score, comparedPixels) = scoreZenithOverlap(
             baseAtlas = baseAtlas,
             candidateAtlas = candidateAtlas,
             minAltitudeDeg = ZENITH_OVERLAP_MIN_ALT_DEG,
-            maxAltitudeDeg = ZENITH_OVERLAP_MAX_ALT_DEG
+            maxAltitudeDeg = ZENITH_OVERLAP_MAX_ALT_DEG,
+            xStep = ZENITH_SCORE_X_STEP,
+            yStep = ZENITH_SCORE_Y_STEP
         )
 
         return ZenithPoseEstimate(
@@ -675,10 +666,15 @@ object AtlasProjector {
         baseAtlas: SkyAtlas,
         candidateAtlas: SkyAtlas,
         minAltitudeDeg: Float,
-        maxAltitudeDeg: Float
+        maxAltitudeDeg: Float,
+        xStep: Int = 1,
+        yStep: Int = 1
     ): Pair<Float, Int> {
         val yTop = AtlasMath.altitudeToY(maxAltitudeDeg, baseAtlas.config)
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, baseAtlas.config)
+
+        val safeXStep = xStep.coerceAtLeast(1)
+        val safeYStep = yStep.coerceAtLeast(1)
 
         var sumW = 0.0
         var sumLumA = 0.0
@@ -687,8 +683,8 @@ object AtlasProjector {
         var sumGradB = 0.0
         var count = 0
 
-        for (y in yTop..yBottom) {
-            for (x in 0 until baseAtlas.width) {
+        for (y in yTop..yBottom step safeYStep) {
+            for (x in 0 until baseAtlas.width step safeXStep) {
                 if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
 
                 val idxA = baseAtlas.index(x, y)
@@ -737,8 +733,8 @@ object AtlasProjector {
         var denGradA = 0.0
         var denGradB = 0.0
 
-        for (y in yTop..yBottom) {
-            for (x in 0 until baseAtlas.width) {
+        for (y in yTop..yBottom step safeYStep) {
+            for (x in 0 until baseAtlas.width step safeXStep) {
                 if (!baseAtlas.hasCoverageAt(x, y) || !candidateAtlas.hasCoverageAt(x, y)) continue
 
                 val idxA = baseAtlas.index(x, y)
