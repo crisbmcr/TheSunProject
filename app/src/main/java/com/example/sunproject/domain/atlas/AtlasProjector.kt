@@ -534,7 +534,7 @@ object AtlasProjector {
                 val ga = gradientMag(baseAtlas, x, y)
                 val gb = gradientMag(candidateAtlas, x, y)
 
-                val w = (1f + ((ga + gb) * 0.01f).coerceIn(0f, 4f)).toDouble()
+                val w = 1.0 + ((ga + gb) * 0.01).coerceIn(0.0, 4.0)
 
                 sumW += w
                 sumLumA += w * a
@@ -571,7 +571,7 @@ object AtlasProjector {
                 val ga = gradientMag(baseAtlas, x, y)
                 val gb = gradientMag(candidateAtlas, x, y)
 
-                val w = (1f + ((ga + gb) * 0.01f).coerceIn(0f, 4f)).toDouble()
+                val w = 1.0 + ((ga + gb) * 0.01).coerceIn(0.0, 4.0)
 
                 val daLum = a - meanLumA
                 val dbLum = b - meanLumB
