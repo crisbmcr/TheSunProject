@@ -30,8 +30,8 @@ private const val ZENITH_OVERLAP_MAX_ALT_DEG = 78f
 private const val ZENITH_ESTIMATE_MIN_PIXELS = 700
 private const val ZENITH_ESTIMATE_MAX_SRC_LONG_SIDE = 480
 
-private const val ZENITH_ESTIMATE_MIN_SCORE = 0.10f
-private const val ZENITH_ESTIMATE_MIN_CONFIDENCE = 0.008f
+private const val ZENITH_ESTIMATE_MIN_SCORE = 0.05f
+private const val ZENITH_ESTIMATE_MIN_CONFIDENCE = 0.002f
 
 private const val ZENITH_ESTIMATE_MIN_GRADIENT = 10.0
 private const val ZENITH_ESTIMATE_MIN_LUMA = 12.0
@@ -45,6 +45,12 @@ private const val ZENITH_ESTIMATE_PROJ_X_STEP = 4
 private const val ZENITH_ESTIMATE_PROJ_Y_STEP = 2
 private const val ZENITH_SCORE_X_STEP = 4
 private const val ZENITH_SCORE_Y_STEP = 2
+
+private const val ZENITH_ESTIMATE_MIN_IMPROVEMENT_OVER_FALLBACK = 0.015f
+
+private const val ZENITH_ESTIMATE_DISTINCT_TWIST_DEG = 20f
+private const val ZENITH_ESTIMATE_DISTINCT_PITCH_DEG = 0.75f
+private const val ZENITH_ESTIMATE_DISTINCT_ROLL_DEG = 1.5f
 
 data class FrameFootprint(
     val minAzimuthDeg: Float,
@@ -457,7 +463,8 @@ object AtlasProjector {
 
         try {
             var best: ZenithPoseEstimate? = null
-            var secondBestScore = Float.NEGATIVE_INFINITY
+            val allCandidates = ArrayList<ZenithPoseEstimate>(ZENITH_ESTIMATE_MAX_CANDIDATES + 8)
+
             val visited = HashSet<String>()
             var evaluatedCount = 0
             var stoppedByBudget = false
@@ -502,6 +509,7 @@ object AtlasProjector {
                 )
 
                 evaluatedCount++
+                allCandidates.add(candidate)
 
                 if (evaluatedCount % ZENITH_ESTIMATE_PROGRESS_EVERY == 0) {
                     Log.d(
@@ -515,10 +523,7 @@ object AtlasProjector {
                 }
 
                 if (best == null || candidate.score > best!!.score) {
-                    if (best != null) secondBestScore = best!!.score
                     best = candidate
-                } else if (candidate.score > secondBestScore) {
-                    secondBestScore = candidate.score
                 }
             }
 
@@ -569,13 +574,39 @@ object AtlasProjector {
             }
 
             val finalBest = best ?: coarseBest
+
+            val fallbackCandidate = evaluateZenithPoseCandidate(
+                frame = frame,
+                src = estimationSrc,
+                baseAtlas = baseAtlas,
+                frameWeight = frameWeight,
+                twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG
+            )
+
+            val distinctRunnerUpScore = allCandidates
+                .asSequence()
+                .filter { isDistinctZenithPoseCandidate(it, finalBest) }
+                .maxOfOrNull { it.score }
+                ?: Float.NEGATIVE_INFINITY
+
             val confidence =
-                if (secondBestScore.isFinite()) finalBest.score - secondBestScore
-                else 0f
+                if (distinctRunnerUpScore.isFinite()) {
+                    finalBest.score - distinctRunnerUpScore
+                } else {
+                    0f
+                }
+
+            val improvementOverFallback = finalBest.score - fallbackCandidate.score
 
             val lowPixels = finalBest.comparedPixels < ZENITH_ESTIMATE_MIN_PIXELS
             val lowScore = !finalBest.score.isFinite() || finalBest.score < ZENITH_ESTIMATE_MIN_SCORE
             val lowConfidence = confidence < ZENITH_ESTIMATE_MIN_CONFIDENCE
+
+            val acceptByAbsoluteGate = !lowPixels && !lowScore && !lowConfidence
+            val acceptByRelativeGain = !lowPixels &&
+                    improvementOverFallback >= ZENITH_ESTIMATE_MIN_IMPROVEMENT_OVER_FALLBACK
 
             Log.d(
                 "AtlasZenithPoseSummary",
@@ -585,34 +616,51 @@ object AtlasProjector {
                         "bestPitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
                         "bestRollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
                         "score=${"%.4f".format(finalBest.score)} " +
+                        "fallbackScore=${"%.4f".format(fallbackCandidate.score)} " +
+                        "improvement=${"%.4f".format(improvementOverFallback)} " +
                         "pixels=${finalBest.comparedPixels} " +
                         "confidence=${"%.4f".format(confidence)}"
             )
 
-            if (lowPixels || lowScore || lowConfidence) {
-                Log.w(
+            if (acceptByAbsoluteGate || acceptByRelativeGain) {
+                Log.d(
                     "AtlasZenithPose",
-                    "fallback frame=${frame.frameId} " +
-                            "bestTwist=${"%.2f".format(finalBest.twistDeg)} " +
-                            "bestPitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
-                            "bestRollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
+                    "accept frame=${frame.frameId} " +
+                            "twist=${"%.2f".format(finalBest.twistDeg)} " +
+                            "pitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
+                            "rollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
                             "score=${"%.4f".format(finalBest.score)} " +
-                            "pixels=${finalBest.comparedPixels} " +
+                            "fallbackScore=${"%.4f".format(fallbackCandidate.score)} " +
+                            "improvement=${"%.4f".format(improvementOverFallback)} " +
                             "confidence=${"%.4f".format(confidence)} " +
-                            "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence"
+                            "acceptByAbsoluteGate=$acceptByAbsoluteGate " +
+                            "acceptByRelativeGain=$acceptByRelativeGain"
                 )
-
-                return ZenithPoseEstimate(
-                    twistDeg = ZENITH_TWIST_FALLBACK_DEG,
-                    pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
-                    rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
-                    score = finalBest.score,
-                    comparedPixels = finalBest.comparedPixels,
-                    confidence = confidence
-                )
+                return finalBest.copy(confidence = confidence)
             }
 
-            return finalBest.copy(confidence = confidence)
+            Log.w(
+                "AtlasZenithPose",
+                "fallback frame=${frame.frameId} " +
+                        "bestTwist=${"%.2f".format(finalBest.twistDeg)} " +
+                        "bestPitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
+                        "bestRollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
+                        "score=${"%.4f".format(finalBest.score)} " +
+                        "fallbackScore=${"%.4f".format(fallbackCandidate.score)} " +
+                        "improvement=${"%.4f".format(improvementOverFallback)} " +
+                        "pixels=${finalBest.comparedPixels} " +
+                        "confidence=${"%.4f".format(confidence)} " +
+                        "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence"
+            )
+
+            return ZenithPoseEstimate(
+                twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
+                score = fallbackCandidate.score,
+                comparedPixels = fallbackCandidate.comparedPixels,
+                confidence = confidence
+            )
         } finally {
             if (estimationSrc !== src) {
                 estimationSrc.recycle()
@@ -836,7 +884,18 @@ object AtlasProjector {
         if (v < 0f) v += 360f
         return v
     }
+    private fun isDistinctZenithPoseCandidate(
+        a: ZenithPoseEstimate,
+        b: ZenithPoseEstimate
+    ): Boolean {
+        val twistDiff = angleDiffDeg(a.twistDeg, b.twistDeg)
+        val pitchDiff = abs(a.pitchOffsetDeg - b.pitchOffsetDeg)
+        val rollDiff = abs(a.rollOffsetDeg - b.rollOffsetDeg)
 
+        return twistDiff >= ZENITH_ESTIMATE_DISTINCT_TWIST_DEG ||
+                pitchDiff >= ZENITH_ESTIMATE_DISTINCT_PITCH_DEG ||
+                rollDiff >= ZENITH_ESTIMATE_DISTINCT_ROLL_DEG
+    }
     private fun luma(color: Int): Double {
         return 0.299 * Color.red(color) +
                 0.587 * Color.green(color) +
