@@ -53,6 +53,19 @@ private const val ZENITH_ESTIMATE_DISTINCT_TWIST_DEG = 20f
 private const val ZENITH_ESTIMATE_DISTINCT_PITCH_DEG = 0.75f
 private const val ZENITH_ESTIMATE_DISTINCT_ROLL_DEG = 1.5f
 
+private const val FRAME_RGB_GAIN_MIN = 0.92f
+private const val FRAME_RGB_GAIN_MAX = 1.08f
+private const val FRAME_GAIN_ESTIMATE_X_STEP = 6
+private const val FRAME_GAIN_ESTIMATE_Y_STEP = 3
+private const val FRAME_GAIN_ESTIMATE_MIN_SAMPLES = 400
+
+private data class RgbGain(
+    val r: Float,
+    val g: Float,
+    val b: Float
+)
+
+
 data class FrameFootprint(
     val minAzimuthDeg: Float,
     val maxAzimuthDeg: Float,
@@ -405,7 +418,31 @@ object AtlasProjector {
                 atlas.config
             )
         }
+        val frameRgbGain = estimateFrameRgbGain(
+            atlas = atlas,
+            frame = frame,
+            srcPixels = srcPixels,
+            srcW = srcW,
+            srcH = srcH,
+            forward = forward,
+            right = right,
+            up = up,
+            tanHalfH = tanHalfH,
+            tanHalfV = tanHalfV,
+            xSpans = xSpans,
+            yTop = yTop,
+            yBottom = yBottom
+        )
 
+        if (emitLogs) {
+            Log.d(
+                "AtlasFrameGain",
+                "frame=${frame.frameId} ring=${frame.ringId} " +
+                        "gainR=${"%.3f".format(frameRgbGain.r)} " +
+                        "gainG=${"%.3f".format(frameRgbGain.g)} " +
+                        "gainB=${"%.3f".format(frameRgbGain.b)}"
+            )
+        }
         if (emitLogs) {
             Log.d(
                 "AtlasFootprint",
@@ -443,15 +480,18 @@ object AtlasProjector {
 
                     if (abs(nx) > 1f || abs(ny) > 1f) continue
 
-                    val u = (((nx + 1f) * 0.5f) * (srcW - 1))
-                        .roundToInt()
-                        .coerceIn(0, srcW - 1)
+                    val u = (((nx + 1f) * 0.5f) * (srcW - 1)).coerceIn(0f, (srcW - 1).toFloat())
+                    val v = ((1f - ((ny + 1f) * 0.5f)) * (srcH - 1)).coerceIn(0f, (srcH - 1).toFloat())
 
-                    val v = ((1f - ((ny + 1f) * 0.5f)) * (srcH - 1))
-                        .roundToInt()
-                        .coerceIn(0, srcH - 1)
+                    val sampled = bilinearSampleArgb(
+                        pixels = srcPixels,
+                        width = srcW,
+                        height = srcH,
+                        fx = u,
+                        fy = v
+                    )
 
-                    val color = srcPixels[v * srcW + u]
+                    val color = applyRgbGain(sampled, frameRgbGain)
 
                     val wx = (1f - abs(nx)).coerceIn(0f, 1f)
                     val wy = (1f - abs(ny)).coerceIn(0f, 1f)
@@ -960,7 +1000,185 @@ object AtlasProjector {
 
         return kotlin.math.abs(gx) + kotlin.math.abs(gy)
     }
+    private fun estimateFrameRgbGain(
+        atlas: SkyAtlas,
+        frame: FrameRecord,
+        srcPixels: IntArray,
+        srcW: Int,
+        srcH: Int,
+        forward: FloatArray,
+        right: FloatArray,
+        up: FloatArray,
+        tanHalfH: Float,
+        tanHalfV: Float,
+        xSpans: List<Pair<Int, Int>>,
+        yTop: Int,
+        yBottom: Int
+    ): RgbGain {
+        var refRSum = 0f
+        var refGSum = 0f
+        var refBSum = 0f
 
+        var movRSum = 0f
+        var movGSum = 0f
+        var movBSum = 0f
+
+        var count = 0
+
+        for ((x0, x1) in xSpans) {
+            for (y in yTop..yBottom step FRAME_GAIN_ESTIMATE_Y_STEP) {
+                val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+                val altRad = Math.toRadians(altDeg.toDouble()).toFloat()
+
+                for (x in x0..x1 step FRAME_GAIN_ESTIMATE_X_STEP) {
+                    if (!atlas.hasCoverageAt(x, y)) continue
+
+                    val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
+                    val azRad = Math.toRadians(azDeg.toDouble()).toFloat()
+
+                    val dir = worldDirectionRad(azRad, altRad)
+
+                    val camX = dot(dir, right)
+                    val camY = dot(dir, up)
+                    val camZ = dot(dir, forward)
+
+                    if (camZ <= 0f) continue
+
+                    val nx = (camX / camZ) / tanHalfH
+                    val ny = (camY / camZ) / tanHalfV
+
+                    if (abs(nx) > 1f || abs(ny) > 1f) continue
+
+                    val u = (((nx + 1f) * 0.5f) * (srcW - 1)).coerceIn(0f, (srcW - 1).toFloat())
+                    val v = ((1f - ((ny + 1f) * 0.5f)) * (srcH - 1)).coerceIn(0f, (srcH - 1).toFloat())
+
+                    val movColor = bilinearSampleArgb(
+                        pixels = srcPixels,
+                        width = srcW,
+                        height = srcH,
+                        fx = u,
+                        fy = v
+                    )
+
+                    val refColor = atlas.pixels[atlas.index(x, y)]
+
+                    refRSum += Color.red(refColor)
+                    refGSum += Color.green(refColor)
+                    refBSum += Color.blue(refColor)
+
+                    movRSum += Color.red(movColor)
+                    movGSum += Color.green(movColor)
+                    movBSum += Color.blue(movColor)
+
+                    count++
+                }
+            }
+        }
+
+        if (count < FRAME_GAIN_ESTIMATE_MIN_SAMPLES) {
+            return RgbGain(1f, 1f, 1f)
+        }
+
+        val rGain = if (movRSum > 1e-3f) {
+            (refRSum / movRSum).coerceIn(FRAME_RGB_GAIN_MIN, FRAME_RGB_GAIN_MAX)
+        } else {
+            1f
+        }
+
+        val gGain = if (movGSum > 1e-3f) {
+            (refGSum / movGSum).coerceIn(FRAME_RGB_GAIN_MIN, FRAME_RGB_GAIN_MAX)
+        } else {
+            1f
+        }
+
+        val bGain = if (movBSum > 1e-3f) {
+            (refBSum / movBSum).coerceIn(FRAME_RGB_GAIN_MIN, FRAME_RGB_GAIN_MAX)
+        } else {
+            1f
+        }
+
+        return RgbGain(rGain, gGain, bGain)
+    }
+
+    private fun bilinearSampleArgb(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        fx: Float,
+        fy: Float
+    ): Int {
+        val x0 = fx.toInt().coerceIn(0, width - 1)
+        val y0 = fy.toInt().coerceIn(0, height - 1)
+        val x1 = (x0 + 1).coerceIn(0, width - 1)
+        val y1 = (y0 + 1).coerceIn(0, height - 1)
+
+        val dx = (fx - x0).coerceIn(0f, 1f)
+        val dy = (fy - y0).coerceIn(0f, 1f)
+
+        val c00 = pixels[y0 * width + x0]
+        val c10 = pixels[y0 * width + x1]
+        val c01 = pixels[y1 * width + x0]
+        val c11 = pixels[y1 * width + x1]
+
+        val a = bilerp(
+            Color.alpha(c00).toFloat(),
+            Color.alpha(c10).toFloat(),
+            Color.alpha(c01).toFloat(),
+            Color.alpha(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val r = bilerp(
+            Color.red(c00).toFloat(),
+            Color.red(c10).toFloat(),
+            Color.red(c01).toFloat(),
+            Color.red(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val g = bilerp(
+            Color.green(c00).toFloat(),
+            Color.green(c10).toFloat(),
+            Color.green(c01).toFloat(),
+            Color.green(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val b = bilerp(
+            Color.blue(c00).toFloat(),
+            Color.blue(c10).toFloat(),
+            Color.blue(c01).toFloat(),
+            Color.blue(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        return Color.argb(a, r, g, b)
+    }
+
+    private fun bilerp(
+        v00: Float,
+        v10: Float,
+        v01: Float,
+        v11: Float,
+        dx: Float,
+        dy: Float
+    ): Float {
+        val top = v00 * (1f - dx) + v10 * dx
+        val bottom = v01 * (1f - dx) + v11 * dx
+        return top * (1f - dy) + bottom * dy
+    }
+
+    private fun applyRgbGain(color: Int, gain: RgbGain): Int {
+        val a = Color.alpha(color)
+        val r = (Color.red(color) * gain.r).roundToInt().coerceIn(0, 255)
+        val g = (Color.green(color) * gain.g).roundToInt().coerceIn(0, 255)
+        val b = (Color.blue(color) * gain.b).roundToInt().coerceIn(0, 255)
+        return Color.argb(a, r, g, b)
+    }
     private fun qualityWeightForFrame(frame: FrameRecord): Float {
         val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
 

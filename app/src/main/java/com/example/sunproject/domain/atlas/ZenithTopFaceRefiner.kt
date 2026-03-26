@@ -40,6 +40,7 @@ object ZenithTopFaceRefiner {
     private const val RGB_GAIN_MIN = 0.92f
     private const val RGB_GAIN_MAX = 1.08f
 
+
     data class TopFace(
         val rgba: Mat,
         val gray32: Mat,
@@ -435,7 +436,7 @@ object ZenithTopFaceRefiner {
 
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val sampled = sampleTopFaceNearest(
+                val sampled = sampleTopFaceBilinear(
                     face = aligned,
                     facePixels = topPixels,
                     azDeg = azDeg,
@@ -475,7 +476,7 @@ object ZenithTopFaceRefiner {
             for (x in 0 until atlas.width) {
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val sampled = sampleTopFaceNearest(
+                val sampled = sampleTopFaceBilinear(
                     face = aligned,
                     facePixels = topPixels,
                     azDeg = azDeg,
@@ -508,7 +509,7 @@ object ZenithTopFaceRefiner {
         }
     }
 
-    private fun sampleTopFaceNearest(
+    private fun sampleTopFaceBilinear(
         face: TopFace,
         facePixels: IntArray,
         azDeg: Float,
@@ -527,15 +528,67 @@ object ZenithTopFaceRefiner {
         val fx = center + radius * (dir[0] / dir[2])
         val fy = center + radius * (dir[1] / dir[2])
 
-        val x = fx.roundToInt()
-        val y = fy.roundToInt()
+        if (fx < 0f || fy < 0f || fx > face.faceSizePx - 1f || fy > face.faceSizePx - 1f) {
+            return null
+        }
 
-        if (x !in 0 until face.faceSizePx || y !in 0 until face.faceSizePx) return null
+        val x0 = fx.toInt().coerceIn(0, face.faceSizePx - 1)
+        val y0 = fy.toInt().coerceIn(0, face.faceSizePx - 1)
+        val x1 = (x0 + 1).coerceIn(0, face.faceSizePx - 1)
+        val y1 = (y0 + 1).coerceIn(0, face.faceSizePx - 1)
 
-        val valid = face.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
-        if (valid <= 0) return null
+        val m00 = face.validMask.get(y0, x0)?.firstOrNull()?.toInt() ?: 0
+        val m10 = face.validMask.get(y0, x1)?.firstOrNull()?.toInt() ?: 0
+        val m01 = face.validMask.get(y1, x0)?.firstOrNull()?.toInt() ?: 0
+        val m11 = face.validMask.get(y1, x1)?.firstOrNull()?.toInt() ?: 0
 
-        return facePixels[y * face.faceSizePx + x]
+        if (m00 <= 0 && m10 <= 0 && m01 <= 0 && m11 <= 0) return null
+
+        val dx = (fx - x0).coerceIn(0f, 1f)
+        val dy = (fy - y0).coerceIn(0f, 1f)
+
+        val c00 = facePixels[y0 * face.faceSizePx + x0]
+        val c10 = facePixels[y0 * face.faceSizePx + x1]
+        val c01 = facePixels[y1 * face.faceSizePx + x0]
+        val c11 = facePixels[y1 * face.faceSizePx + x1]
+
+        val a = bilerp(
+            Color.alpha(c00).toFloat(),
+            Color.alpha(c10).toFloat(),
+            Color.alpha(c01).toFloat(),
+            Color.alpha(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val r = bilerp(
+            Color.red(c00).toFloat(),
+            Color.red(c10).toFloat(),
+            Color.red(c01).toFloat(),
+            Color.red(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val g = bilerp(
+            Color.green(c00).toFloat(),
+            Color.green(c10).toFloat(),
+            Color.green(c01).toFloat(),
+            Color.green(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        val b = bilerp(
+            Color.blue(c00).toFloat(),
+            Color.blue(c10).toFloat(),
+            Color.blue(c01).toFloat(),
+            Color.blue(c11).toFloat(),
+            dx,
+            dy
+        ).roundToInt().coerceIn(0, 255)
+
+        return Color.argb(a, r, g, b)
     }
 
     private fun applyRgbGain(
@@ -647,7 +700,18 @@ object ZenithTopFaceRefiner {
 
         return mask
     }
-
+    private fun bilerp(
+        v00: Float,
+        v10: Float,
+        v01: Float,
+        v11: Float,
+        dx: Float,
+        dy: Float
+    ): Float {
+        val top = v00 * (1f - dx) + v10 * dx
+        val bottom = v01 * (1f - dx) + v11 * dx
+        return top * (1f - dy) + bottom * dy
+    }
     private fun topFaceFromArgbAndMask(
         argb: IntArray,
         mask: ByteArray,
