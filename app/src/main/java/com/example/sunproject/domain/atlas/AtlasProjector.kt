@@ -173,6 +173,8 @@ object AtlasProjector {
                     atlas = atlas,
                     frameWeight = frameWeight,
                     zenithTwistDegOverride = null,
+                    zenithPitchOffsetDegOverride = null,
+                    zenithRollOffsetDegOverride = null,
                     emitLogs = true
                 )
             } finally {
@@ -189,17 +191,51 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
-                    atlas = atlas,
-                    frame = frame,
-                    srcBitmap = src,
-                    frameWeight = frameWeight
-                )
+                try {
+                    val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
+                        atlas = atlas,
+                        frame = frame,
+                        srcBitmap = src,
+                        frameWeight = frameWeight
+                    )
 
-                if (refined == null) {
-                    Log.w(
+                    if (refined == null) {
+                        Log.w(
+                            "AtlasZenithTopRefine",
+                            "frame=${frame.frameId} no refinement result; fallback to ERP zenith"
+                        )
+
+                        projectBitmapToAtlas(
+                            frame = frame,
+                            src = src,
+                            atlas = atlas,
+                            frameWeight = frameWeight,
+                            zenithTwistDegOverride = ZENITH_TWIST_FALLBACK_DEG,
+                            zenithPitchOffsetDegOverride = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                            zenithRollOffsetDegOverride = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
+                            emitLogs = true
+                        )
+                    } else {
+                        try {
+                            Log.d(
+                                "AtlasZenithTopRefine",
+                                "frame=${frame.frameId} " +
+                                        "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
+                                        "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
+                                        "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
+                                        "eccTx=${"%.2f".format(refined.eccTxPx)} " +
+                                        "eccTy=${"%.2f".format(refined.eccTyPx)} " +
+                                        "eccScore=${"%.5f".format(refined.eccScore)}"
+                            )
+                        } finally {
+                            ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
+                        }
+                    }
+                } catch (t: Throwable) {
+                    Log.e(
                         "AtlasZenithTopRefine",
-                        "frame=${frame.frameId} no refinement result; fallback to ERP zenith"
+                        "Fallo en refineAndBlendZenithIntoAtlas, usando fallback ERP",
+                        t
                     )
 
                     projectBitmapToAtlas(
@@ -212,19 +248,6 @@ object AtlasProjector {
                         zenithRollOffsetDegOverride = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
                         emitLogs = true
                     )
-                } else {
-                    Log.d(
-                        "AtlasZenithTopRefine",
-                        "frame=${frame.frameId} " +
-                                "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
-                                "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
-                                "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
-                                "eccTx=${"%.2f".format(refined.eccTxPx)} " +
-                                "eccTy=${"%.2f".format(refined.eccTyPx)} " +
-                                "eccScore=${"%.5f".format(refined.eccScore)}"
-                    )
-
-                    ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
                 }
             } finally {
                 src.recycle()

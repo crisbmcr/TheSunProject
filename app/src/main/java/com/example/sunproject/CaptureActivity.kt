@@ -46,6 +46,7 @@ import kotlin.math.acos
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import org.opencv.android.OpenCVLoader
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
@@ -217,7 +218,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_capture)
-
+        if (!OpenCVLoader.initLocal()) {
+            Log.e("OpenCV", "OpenCV initialization failed")
+            Toast.makeText(this, "OpenCV initialization failed", Toast.LENGTH_LONG).show()
+            finish()
+            return
+        } else {
+            Log.i("OpenCV", "OpenCV loaded successfully")
+        }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         cameraPreview = findViewById(R.id.cameraPreview)
@@ -1271,10 +1279,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     )
                 }
             } catch (t: Throwable) {
+                Log.e("AtlasBuild", "Error generando atlas multi-frame", t)
                 runOnUiThread {
                     Toast.makeText(
                         this,
-                        "Error proyectando frame: ${t.message}",
+                        "Error generando atlas multi-frame: ${t.message}",
                         Toast.LENGTH_LONG
                     ).show()
                 }
