@@ -13,6 +13,7 @@ import kotlin.math.tan
 import android.util.Log
 import android.graphics.Color
 import android.os.SystemClock
+import com.example.sunproject.domain.atlas.ZenithTopFaceRefiner
 
 private const val ZENITH_TWIST_FALLBACK_DEG = 90f
 private const val ZENITH_PITCH_OFFSET_FALLBACK_DEG = 0f
@@ -188,34 +189,43 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val poseEstimate = estimateZenithPoseDeg(
+                val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
+                    atlas = atlas,
                     frame = frame,
-                    src = src,
-                    baseAtlas = atlas,
+                    srcBitmap = src,
                     frameWeight = frameWeight
                 )
 
-                Log.d(
-                    "AtlasZenithPose",
-                    "frame=${frame.frameId} ring=${frame.ringId} " +
-                            "twist=${"%.2f".format(poseEstimate.twistDeg)} " +
-                            "pitchOffset=${"%.2f".format(poseEstimate.pitchOffsetDeg)} " +
-                            "rollOffset=${"%.2f".format(poseEstimate.rollOffsetDeg)} " +
-                            "score=${"%.4f".format(poseEstimate.score)} " +
-                            "pixels=${poseEstimate.comparedPixels} " +
-                            "confidence=${"%.4f".format(poseEstimate.confidence)}"
-                )
+                if (refined == null) {
+                    Log.w(
+                        "AtlasZenithTopRefine",
+                        "frame=${frame.frameId} no refinement result; fallback to ERP zenith"
+                    )
 
-                projectBitmapToAtlas(
-                    frame = frame,
-                    src = src,
-                    atlas = atlas,
-                    frameWeight = frameWeight,
-                    zenithTwistDegOverride = poseEstimate.twistDeg,
-                    zenithPitchOffsetDegOverride = poseEstimate.pitchOffsetDeg,
-                    zenithRollOffsetDegOverride = poseEstimate.rollOffsetDeg,
-                    emitLogs = true
-                )
+                    projectBitmapToAtlas(
+                        frame = frame,
+                        src = src,
+                        atlas = atlas,
+                        frameWeight = frameWeight,
+                        zenithTwistDegOverride = ZENITH_TWIST_FALLBACK_DEG,
+                        zenithPitchOffsetDegOverride = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
+                        zenithRollOffsetDegOverride = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
+                        emitLogs = true
+                    )
+                } else {
+                    Log.d(
+                        "AtlasZenithTopRefine",
+                        "frame=${frame.frameId} " +
+                                "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
+                                "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
+                                "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
+                                "eccTx=${"%.2f".format(refined.eccTxPx)} " +
+                                "eccTy=${"%.2f".format(refined.eccTyPx)} " +
+                                "eccScore=${"%.5f".format(refined.eccScore)}"
+                    )
+
+                    ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
+                }
             } finally {
                 src.recycle()
             }
