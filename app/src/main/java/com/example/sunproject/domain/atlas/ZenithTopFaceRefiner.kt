@@ -35,8 +35,8 @@ object ZenithTopFaceRefiner {
     private const val MIN_ECC_SCORE_TO_USE_TRANSLATION = 0.20
     private const val BLEND_FEATHER_START_ALT_DEG = 74f
     private const val BLEND_FEATHER_FULL_ALT_DEG = 84f
-    private const val LUMA_GAIN_MIN = 0.85
-    private const val LUMA_GAIN_MAX = 1.15
+    private const val LUMA_GAIN_MIN = 0.85f
+    private const val LUMA_GAIN_MAX = 1.15f
 
     data class TopFace(
         val rgba: Mat,
@@ -323,23 +323,25 @@ object ZenithTopFaceRefiner {
 
         val m00 = warp.get(0, 0)[0]
         val m01 = warp.get(0, 1)[0]
-        val tx = warp.get(0, 2)[0]
-        val ty = warp.get(1, 2)[0]
+
+        val tx = warp.get(0, 2)[0].toFloat()
+        val ty = warp.get(1, 2)[0].toFloat()
+
         val eccRotDeg = Math.toDegrees(atan2(m01, m00).toDouble()).toFloat()
 
-        val maxShiftPx = moving.faceSizePx * MAX_ECC_TRANSLATION_RATIO
+        val maxShiftPx = moving.faceSizePx.toFloat() * MAX_ECC_TRANSLATION_RATIO
         val allowTranslation = eccScore >= MIN_ECC_SCORE_TO_USE_TRANSLATION
 
-        val txUsed = if (allowTranslation) {
-            tx.coerceIn(-maxShiftPx.toDouble(), maxShiftPx.toDouble())
+        val txUsed: Float = if (allowTranslation) {
+            tx.coerceIn(-maxShiftPx, maxShiftPx)
         } else {
-            0.0
+            0f
         }
 
-        val tyUsed = if (allowTranslation) {
-            ty.coerceIn(-maxShiftPx.toDouble(), maxShiftPx.toDouble())
+        val tyUsed: Float = if (allowTranslation) {
+            ty.coerceIn(-maxShiftPx, maxShiftPx)
         } else {
-            0.0
+            0f
         }
 
         val warpUsed = Mat.eye(2, 3, CvType.CV_32F)
@@ -347,8 +349,8 @@ object ZenithTopFaceRefiner {
         warpUsed.put(0, 1, m01)
         warpUsed.put(1, 0, warp.get(1, 0)[0])
         warpUsed.put(1, 1, warp.get(1, 1)[0])
-        warpUsed.put(0, 2, txUsed)
-        warpUsed.put(1, 2, tyUsed)
+        warpUsed.put(0, 2, txUsed.toDouble())
+        warpUsed.put(1, 2, tyUsed.toDouble())
 
         val alignedRgba = Mat()
         val alignedMask = Mat()
@@ -390,8 +392,8 @@ object ZenithTopFaceRefiner {
             initialTwistDeg = initialTwistDeg,
             finalTwistDeg = normalizeDeg(initialTwistDeg + eccRotDeg),
             eccRotationDeg = eccRotDeg,
-            eccTxPx = txUsed.toFloat(),
-            eccTyPx = tyUsed.toFloat(),
+            eccTxPx = txUsed,
+            eccTyPx = tyUsed,
             eccScore = eccScore,
             alignedTopFace = TopFace(
                 rgba = alignedRgba,
@@ -440,8 +442,8 @@ object ZenithTopFaceRefiner {
             }
         }
 
-        val gain = if (overlapCount > 0 && movLumaSum > 1e-3f) {
-            (refLumaSum / movLumaSum).coerceIn(LUMA_GAIN_MIN, LUMA_GAIN_MAX)
+        val gain = if (overlapCount > 0 && movLumaSum > 1e-3) {
+            (refLumaSum / movLumaSum).toFloat().coerceIn(LUMA_GAIN_MIN, LUMA_GAIN_MAX)
         } else {
             1f
         }
