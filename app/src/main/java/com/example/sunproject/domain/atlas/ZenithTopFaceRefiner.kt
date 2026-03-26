@@ -31,12 +31,14 @@ object ZenithTopFaceRefiner {
     private const val ECC_MAX_ALT_DEG = 88f
     private const val BLEND_MIN_ALT_DEG = 68f
 
-    private const val MAX_ECC_TRANSLATION_RATIO = 0.05f
-    private const val MIN_ECC_SCORE_TO_USE_TRANSLATION = 0.20
-    private const val BLEND_FEATHER_START_ALT_DEG = 74f
-    private const val BLEND_FEATHER_FULL_ALT_DEG = 84f
-    private const val LUMA_GAIN_MIN = 0.85f
-    private const val LUMA_GAIN_MAX = 1.15f
+    private const val MAX_ECC_TRANSLATION_RATIO = 0.02f
+    private const val MIN_ECC_SCORE_TO_USE_TRANSLATION = 0.30
+
+    private const val BLEND_FEATHER_START_ALT_DEG = 82f
+    private const val BLEND_FEATHER_FULL_ALT_DEG = 89f
+
+    private const val RGB_GAIN_MIN = 0.92f
+    private const val RGB_GAIN_MAX = 1.08f
 
     data class TopFace(
         val rgba: Mat,
@@ -410,79 +412,138 @@ object ZenithTopFaceRefiner {
         frameWeight: Float,
         minAltitudeDeg: Float
     ) {
-        val pixels = rgbaMatToArgb(aligned.rgba)
-        val center = (aligned.faceSizePx - 1) * 0.5f
-        val radius = center
+        val topPixels = rgbaMatToArgb(aligned.rgba)
 
-        var refLumaSum = 0f
-        var movLumaSum = 0f
+        var refRSum = 0f
+        var refGSum = 0f
+        var refBSum = 0f
+
+        var movRSum = 0f
+        var movGSum = 0f
+        var movBSum = 0f
+
         var overlapCount = 0
 
-        for (y in 0 until aligned.faceSizePx) {
-            for (x in 0 until aligned.faceSizePx) {
-                val idx = y * aligned.faceSizePx + x
-                val valid = aligned.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
-                if (valid <= 0) continue
+        val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
-                val dir = topFaceDirection(x, y, center, radius)
-                val altDeg = radToDeg(atan2(dir[2], sqrt(dir[0] * dir[0] + dir[1] * dir[1])))
-                if (altDeg < minAltitudeDeg) continue
-                if (altDeg > BLEND_FEATHER_FULL_ALT_DEG) continue
+        for (y in 0..yBottom) {
+            val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+            if (altDeg < minAltitudeDeg) continue
 
-                val azDeg = normalizeDeg(radToDeg(atan2(dir[1], dir[0])))
+            for (x in 0 until atlas.width) {
+                val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val atlasX = AtlasMath.azimuthToX(azDeg, atlas.config).coerceIn(0, atlas.width - 1)
-                val atlasY = AtlasMath.altitudeToY(altDeg, atlas.config).coerceIn(0, atlas.height - 1)
+                val sampled = sampleTopFaceNearest(
+                    face = aligned,
+                    facePixels = topPixels,
+                    azDeg = azDeg,
+                    altDeg = altDeg
+                ) ?: continue
 
-                if (!atlas.hasCoverageAt(atlasX, atlasY)) continue
+                if (!atlas.hasCoverageAt(x, y)) continue
 
-                refLumaSum += colorLuma(atlas.pixels[atlas.index(atlasX, atlasY)])
-                movLumaSum += colorLuma(pixels[idx])
+                val refColor = atlas.pixels[atlas.index(x, y)]
+
+                refRSum += Color.red(refColor)
+                refGSum += Color.green(refColor)
+                refBSum += Color.blue(refColor)
+
+                movRSum += Color.red(sampled)
+                movGSum += Color.green(sampled)
+                movBSum += Color.blue(sampled)
+
                 overlapCount++
             }
         }
 
-        val gain = if (overlapCount > 0 && movLumaSum > 1e-3) {
-            (refLumaSum / movLumaSum).toFloat().coerceIn(LUMA_GAIN_MIN, LUMA_GAIN_MAX)
-        } else {
-            1f
-        }
+        val rGain = if (overlapCount > 0 && movRSum > 1e-3f) {
+            (refRSum / movRSum).coerceIn(RGB_GAIN_MIN, RGB_GAIN_MAX)
+        } else 1f
 
-        for (y in 0 until aligned.faceSizePx) {
-            for (x in 0 until aligned.faceSizePx) {
-                val idx = y * aligned.faceSizePx + x
-                val valid = aligned.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
-                if (valid <= 0) continue
+        val gGain = if (overlapCount > 0 && movGSum > 1e-3f) {
+            (refGSum / movGSum).coerceIn(RGB_GAIN_MIN, RGB_GAIN_MAX)
+        } else 1f
 
-                val dir = topFaceDirection(x, y, center, radius)
-                val altDeg = radToDeg(atan2(dir[2], sqrt(dir[0] * dir[0] + dir[1] * dir[1])))
-                if (altDeg < minAltitudeDeg) continue
+        val bGain = if (overlapCount > 0 && movBSum > 1e-3f) {
+            (refBSum / movBSum).coerceIn(RGB_GAIN_MIN, RGB_GAIN_MAX)
+        } else 1f
 
-                val azDeg = normalizeDeg(radToDeg(atan2(dir[1], dir[0])))
+        for (y in 0..yBottom) {
+            val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+            if (altDeg < minAltitudeDeg) continue
 
-                val atlasX = AtlasMath.azimuthToX(azDeg, atlas.config).coerceIn(0, atlas.width - 1)
-                val atlasY = AtlasMath.altitudeToY(altDeg, atlas.config).coerceIn(0, atlas.height - 1)
+            val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
+                    (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
+                .coerceIn(0f, 1f)
 
-                val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
-                        (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
-                    .coerceIn(0f, 1f)
+            val altitudeAlpha = t * t * (3f - 2f * t)
+            val finalWeightBase = frameWeight * altitudeAlpha
+            if (finalWeightBase <= 0f) continue
 
-                val altitudeAlpha = t * t * (3f - 2f * t)
-                val finalWeight = frameWeight * altitudeAlpha
-                if (finalWeight <= 0f) continue
+            for (x in 0 until atlas.width) {
+                val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val color = applyLumaGain(pixels[idx], gain)
+                val sampled = sampleTopFaceNearest(
+                    face = aligned,
+                    facePixels = topPixels,
+                    azDeg = azDeg,
+                    altDeg = altDeg
+                ) ?: continue
+
+                val corrected = applyRgbGain(sampled, rGain, gGain, bGain)
 
                 atlas.blendPixel(
-                    atlasX,
-                    atlasY,
-                    color,
-                    finalWeight
+                    x,
+                    y,
+                    corrected,
+                    finalWeightBase
                 )
             }
         }
     }
 
+    private fun sampleTopFaceNearest(
+        face: TopFace,
+        facePixels: IntArray,
+        azDeg: Float,
+        altDeg: Float
+    ): Int? {
+        val dir = worldDirectionRad(
+            degToRad(azDeg),
+            degToRad(altDeg)
+        )
+
+        if (dir[2] <= 1e-6f) return null
+
+        val center = (face.faceSizePx - 1) * 0.5f
+        val radius = center
+
+        val fx = center + radius * (dir[0] / dir[2])
+        val fy = center + radius * (dir[1] / dir[2])
+
+        val x = fx.roundToInt()
+        val y = fy.roundToInt()
+
+        if (x !in 0 until face.faceSizePx || y !in 0 until face.faceSizePx) return null
+
+        val valid = face.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
+        if (valid <= 0) return null
+
+        return facePixels[y * face.faceSizePx + x]
+    }
+
+    private fun applyRgbGain(
+        color: Int,
+        rGain: Float,
+        gGain: Float,
+        bGain: Float
+    ): Int {
+        val a = Color.alpha(color)
+        val r = (Color.red(color) * rGain).roundToInt().coerceIn(0, 255)
+        val g = (Color.green(color) * gGain).roundToInt().coerceIn(0, 255)
+        val b = (Color.blue(color) * bGain).roundToInt().coerceIn(0, 255)
+        return Color.argb(a, r, g, b)
+    }
 
     private fun colorLuma(color: Int): Float {
         val r = Color.red(color).toFloat()
