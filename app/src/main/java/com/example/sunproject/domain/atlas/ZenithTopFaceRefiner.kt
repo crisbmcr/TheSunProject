@@ -431,6 +431,8 @@ object ZenithTopFaceRefiner {
             if (altDeg < minAltitudeDeg) continue
 
             for (x in 0 until atlas.width) {
+                if (!atlas.hasCoverageAt(x, y)) continue
+
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
                 val sampled = sampleTopFaceNearest(
@@ -439,8 +441,6 @@ object ZenithTopFaceRefiner {
                     azDeg = azDeg,
                     altDeg = altDeg
                 ) ?: continue
-
-                if (!atlas.hasCoverageAt(x, y)) continue
 
                 val refColor = atlas.pixels[atlas.index(x, y)]
 
@@ -472,14 +472,6 @@ object ZenithTopFaceRefiner {
             val altDeg = AtlasMath.yToAltitude(y, atlas.config)
             if (altDeg < minAltitudeDeg) continue
 
-            val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
-                    (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
-                .coerceIn(0f, 1f)
-
-            val altitudeAlpha = t * t * (3f - 2f * t)
-            val finalWeightBase = frameWeight * altitudeAlpha
-            if (finalWeightBase <= 0f) continue
-
             for (x in 0 until atlas.width) {
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
@@ -490,13 +482,27 @@ object ZenithTopFaceRefiner {
                     altDeg = altDeg
                 ) ?: continue
 
+                val hasBaseCoverage = atlas.hasCoverageAt(x, y)
+
+                val altitudeAlpha = if (hasBaseCoverage) {
+                    val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
+                            (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
+                        .coerceIn(0f, 1f)
+                    t * t * (3f - 2f * t)
+                } else {
+                    1f
+                }
+
+                val finalWeight = frameWeight * altitudeAlpha
+                if (finalWeight <= 0f) continue
+
                 val corrected = applyRgbGain(sampled, rGain, gGain, bGain)
 
                 atlas.blendPixel(
                     x,
                     y,
                     corrected,
-                    finalWeightBase
+                    finalWeight
                 )
             }
         }
