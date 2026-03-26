@@ -78,7 +78,7 @@ configurations.all {
 
 dependencies {
     // --- DEPENDENCIA AL MÓDULO DE OPENCV ---
-    implementation("org.opencv:opencv:4.13.0")
+    implementation("org.opencv:opencv:4.10.0")
     // --- DEPENDENCIAS EXISTENTES ---
     implementation(libs.androidx.core.ktx)
     implementation("androidx.appcompat:appcompat:1.6.1")
