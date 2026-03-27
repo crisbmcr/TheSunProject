@@ -37,7 +37,9 @@ object ZenithTopFaceRefiner {
 
     private const val BLEND_FEATHER_START_ALT_DEG = 82f
     private const val BLEND_FEATHER_FULL_ALT_DEG = 89f
-
+    private const val ZENITH_EDGE_FADE_START_ALT_DEG = BLEND_MIN_ALT_DEG   // 68f
+    private const val ZENITH_EDGE_FADE_FULL_ALT_DEG = 78f
+    private const val ZENITH_EDGE_MIN_ALPHA = 0.35f
     private const val RGB_GAIN_MIN = 0.92f
     private const val RGB_GAIN_MAX = 1.08f
 
@@ -473,7 +475,14 @@ object ZenithTopFaceRefiner {
 
                 val hasBaseCoverage = atlas.hasCoverageAt(x, y)
 
-                val altitudeAlpha = if (hasBaseCoverage) {
+                val edgeT = ((altDeg - ZENITH_EDGE_FADE_START_ALT_DEG) /
+                        (ZENITH_EDGE_FADE_FULL_ALT_DEG - ZENITH_EDGE_FADE_START_ALT_DEG))
+                    .coerceIn(0f, 1f)
+
+                val zenithEdgeAlpha = ZENITH_EDGE_MIN_ALPHA +
+                        (1f - ZENITH_EDGE_MIN_ALPHA) * (edgeT * edgeT * (3f - 2f * edgeT))
+
+                val overlapAlpha = if (hasBaseCoverage) {
                     val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
                             (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
                         .coerceIn(0f, 1f)
@@ -482,7 +491,7 @@ object ZenithTopFaceRefiner {
                     1f
                 }
 
-                val finalWeight = frameWeight * altitudeAlpha
+                val finalWeight = frameWeight * zenithEdgeAlpha * overlapAlpha
                 if (finalWeight <= 0f) continue
 
                 val corrected = applyRgbGain(
@@ -757,14 +766,24 @@ object ZenithTopFaceRefiner {
         azDeg: Float,
         altDeg: Float
     ): Int? {
-        val coords = projectWorldToTopFace(face, azDeg, altDeg) ?: return null
-
-        return sampleTopFaceBilinearAt(
-            face = face,
-            facePixels = facePixels,
-            fx = coords.first,
-            fy = coords.second
+        val dir = worldDirectionRad(
+            degToRad(azDeg),
+            degToRad(altDeg)
         )
+
+        if (dir[2] <= 1e-6f) return null
+
+        val center = (face.faceSizePx - 1) * 0.5f
+        val radius = center
+
+        val fx = center + radius * (dir[0] / dir[2])
+        val fy = center + radius * (dir[1] / dir[2])
+
+        if (fx < 0f || fy < 0f || fx > face.faceSizePx - 1f || fy > face.faceSizePx - 1f) {
+            return null
+        }
+
+        return sampleTopFaceBilinearAt(face, facePixels, fx, fy)
     }
 
     private fun sampleTopFaceBilinearAt(
