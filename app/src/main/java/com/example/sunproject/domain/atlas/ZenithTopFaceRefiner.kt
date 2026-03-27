@@ -61,7 +61,17 @@ object ZenithTopFaceRefiner {
         val eccScore: Double,
         val alignedTopFace: TopFace
     )
+    private data class ColorCorrection(
+        val rGain: Float,
+        val gGain: Float,
+        val bGain: Float,
+        val overlapCount: Int
+    )
 
+    private data class TopFaceSample(
+        val color: Int,
+        val usedFallback: Boolean
+    )
     fun refineAndBlendZenithIntoAtlas(
         atlas: SkyAtlas,
         frame: FrameRecord,
@@ -73,84 +83,44 @@ object ZenithTopFaceRefiner {
         val atlasTop = buildAtlasTopFace(atlas, FACE_SIZE_PX)
         val zenithTop = buildZenithTopFace(frame, srcBitmap, baseTwistDeg = 0f, faceSizePx = FACE_SIZE_PX)
 
-        val initialTwistDeg = estimateTwistFromAnnulus(
-            reference = atlasTop,
-            moving = zenithTop,
-            minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
-            maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
-        )
-
-        val refined = refineWithEcc(
-            reference = atlasTop,
-            moving = zenithTop,
-            initialTwistDeg = initialTwistDeg,
-            eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
-            eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
-        )
-
-        blendTopFaceIntoAtlas(
-            aligned = refined.alignedTopFace,
-            atlas = atlas,
-            frameWeight = frameWeight,
-            minAltitudeDeg = BLEND_MIN_ALT_DEG
-        )
-
-
-        fun fillUncoveredPolarCapFromTopFace(
-            aligned: TopFace,
-            atlas: SkyAtlas,
-            frameWeight: Float,
-            minAltitudeDeg: Float
-        ) {
-            val topPixels = rgbaMatToArgb(aligned.rgba)
-            val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
-
-            var filledCount = 0
-
-            for (y in 0..yBottom) {
-                val altDeg = AtlasMath.yToAltitude(y, atlas.config)
-                if (altDeg < minAltitudeDeg) continue
-
-                for (x in 0 until atlas.width) {
-                    if (atlas.hasCoverageAt(x, y)) continue
-
-                    val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
-
-                    val sampled = sampleTopFaceWithFallback(
-                        face = aligned,
-                        facePixels = topPixels,
-                        azDeg = azDeg,
-                        altDeg = altDeg
-                    ) ?: continue
-
-                    atlas.blendPixel(
-                        x,
-                        y,
-                        sampled,
-                        maxOf(frameWeight, POLAR_CAP_FILL_WEIGHT)
-                    )
-                    filledCount++
-                }
-            }
-
-            Log.d(
-                "AtlasZenithFill",
-                "filledPolarPixels=$filledCount minAltitudeDeg=${"%.2f".format(minAltitudeDeg)}"
+        try {
+            val initialTwistDeg = estimateTwistFromAnnulus(
+                reference = atlasTop,
+                moving = zenithTop,
+                minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
+                maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
             )
+
+            val refined = refineWithEcc(
+                reference = atlasTop,
+                moving = zenithTop,
+                initialTwistDeg = initialTwistDeg,
+                eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
+                eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
+            )
+
+            val colorCorrection = blendTopFaceIntoAtlas(
+                aligned = refined.alignedTopFace,
+                atlas = atlas,
+                frameWeight = frameWeight,
+                minAltitudeDeg = BLEND_MIN_ALT_DEG
+            )
+
+            fillUncoveredPolarCapFromTopFace(
+                aligned = refined.alignedTopFace,
+                atlas = atlas,
+                frameWeight = frameWeight,
+                minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG,
+                colorCorrection = colorCorrection
+            )
+
+            return refined
+        } finally {
+            releaseTopFace(atlasTop)
+            releaseTopFace(zenithTop)
         }
-
-        fillUncoveredPolarCapFromTopFace(
-            aligned = refined.alignedTopFace,
-            atlas = atlas,
-            frameWeight = frameWeight,
-            minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG
-        )
-
-        releaseTopFace(atlasTop)
-        releaseTopFace(zenithTop)
-
-        return refined
     }
+
 
     fun buildAtlasTopFace(
         atlas: SkyAtlas,
@@ -467,9 +437,88 @@ object ZenithTopFaceRefiner {
         atlas: SkyAtlas,
         frameWeight: Float,
         minAltitudeDeg: Float
-    ) {
+    ): ColorCorrection {
         val topPixels = rgbaMatToArgb(aligned.rgba)
+        val correction = computeOverlapColorCorrection(
+            aligned = aligned,
+            atlas = atlas,
+            facePixels = topPixels,
+            minAltitudeDeg = minAltitudeDeg
+        )
 
+        var coveredWrites = 0
+        var uncoveredWrites = 0
+        var nullSamples = 0
+
+        val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
+
+        for (y in 0..yBottom) {
+            val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+            if (altDeg < minAltitudeDeg) continue
+
+            for (x in 0 until atlas.width) {
+                val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
+
+                val sampled = sampleTopFaceBilinear(
+                    face = aligned,
+                    facePixels = topPixels,
+                    azDeg = azDeg,
+                    altDeg = altDeg
+                )
+
+                if (sampled == null) {
+                    nullSamples++
+                    continue
+                }
+
+                val hasBaseCoverage = atlas.hasCoverageAt(x, y)
+
+                val altitudeAlpha = if (hasBaseCoverage) {
+                    val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
+                            (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
+                        .coerceIn(0f, 1f)
+                    t * t * (3f - 2f * t)
+                } else {
+                    1f
+                }
+
+                val finalWeight = frameWeight * altitudeAlpha
+                if (finalWeight <= 0f) continue
+
+                val corrected = applyRgbGain(
+                    sampled,
+                    correction.rGain,
+                    correction.gGain,
+                    correction.bGain
+                )
+
+                atlas.blendPixel(x, y, corrected, finalWeight)
+
+                if (hasBaseCoverage) coveredWrites++ else uncoveredWrites++
+            }
+        }
+
+        Log.d(
+            "AtlasZenithBlend",
+            "minAlt=${"%.1f".format(minAltitudeDeg)} " +
+                    "overlap=${correction.overlapCount} " +
+                    "gainR=${"%.3f".format(correction.rGain)} " +
+                    "gainG=${"%.3f".format(correction.gGain)} " +
+                    "gainB=${"%.3f".format(correction.bGain)} " +
+                    "coveredWrites=$coveredWrites " +
+                    "uncoveredWrites=$uncoveredWrites " +
+                    "nullSamples=$nullSamples"
+        )
+
+        return correction
+    }
+
+    private fun computeOverlapColorCorrection(
+        aligned: TopFace,
+        atlas: SkyAtlas,
+        facePixels: IntArray,
+        minAltitudeDeg: Float
+    ): ColorCorrection {
         var refRSum = 0f
         var refGSum = 0f
         var refBSum = 0f
@@ -493,7 +542,7 @@ object ZenithTopFaceRefiner {
 
                 val sampled = sampleTopFaceBilinear(
                     face = aligned,
-                    facePixels = topPixels,
+                    facePixels = facePixels,
                     azDeg = azDeg,
                     altDeg = altDeg
                 ) ?: continue
@@ -524,56 +573,121 @@ object ZenithTopFaceRefiner {
             (refBSum / movBSum).coerceIn(RGB_GAIN_MIN, RGB_GAIN_MAX)
         } else 1f
 
+        return ColorCorrection(
+            rGain = rGain,
+            gGain = gGain,
+            bGain = bGain,
+            overlapCount = overlapCount
+        )
+    }
+
+    private fun fillUncoveredPolarCapFromTopFace(
+        aligned: TopFace,
+        atlas: SkyAtlas,
+        frameWeight: Float,
+        minAltitudeDeg: Float,
+        colorCorrection: ColorCorrection
+    ) {
+        if (frameWeight <= 0f) return
+
+        val topPixels = rgbaMatToArgb(aligned.rgba)
+        val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
+
+        var candidateCount = 0
+        var filledCount = 0
+        var directCount = 0
+        var fallbackCount = 0
+        var missedCount = 0
+
         for (y in 0..yBottom) {
             val altDeg = AtlasMath.yToAltitude(y, atlas.config)
             if (altDeg < minAltitudeDeg) continue
 
             for (x in 0 until atlas.width) {
+                if (atlas.hasCoverageAt(x, y)) continue
+
+                candidateCount++
+
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val sampled = sampleTopFaceBilinear(
+                val sampled = sampleTopFaceWithFallback(
                     face = aligned,
                     facePixels = topPixels,
                     azDeg = azDeg,
                     altDeg = altDeg
-                ) ?: continue
+                )
 
-                val hasBaseCoverage = atlas.hasCoverageAt(x, y)
-
-                val altitudeAlpha = if (hasBaseCoverage) {
-                    val t = ((altDeg - BLEND_FEATHER_START_ALT_DEG) /
-                            (BLEND_FEATHER_FULL_ALT_DEG - BLEND_FEATHER_START_ALT_DEG))
-                        .coerceIn(0f, 1f)
-                    t * t * (3f - 2f * t)
-                } else {
-                    1f
+                if (sampled == null) {
+                    missedCount++
+                    continue
                 }
 
-                val finalWeight = frameWeight * altitudeAlpha
-                if (finalWeight <= 0f) continue
-
-                val corrected = applyRgbGain(sampled, rGain, gGain, bGain)
-
-                atlas.blendPixel(
-                    x,
-                    y,
-                    corrected,
-                    finalWeight
+                val corrected = applyRgbGain(
+                    sampled.color,
+                    colorCorrection.rGain,
+                    colorCorrection.gGain,
+                    colorCorrection.bGain
                 )
+
+                atlas.blendPixel(x, y, corrected, frameWeight)
+                filledCount++
+
+                if (sampled.usedFallback) fallbackCount++ else directCount++
             }
         }
+
         Log.d(
-            "AtlasZenithBlend",
-            "blendTopFaceIntoAtlas done minAltitudeDeg=${"%.2f".format(minAltitudeDeg)}"
+            "AtlasZenithFill",
+            "minAlt=${"%.1f".format(minAltitudeDeg)} " +
+                    "candidates=$candidateCount " +
+                    "filled=$filledCount " +
+                    "direct=$directCount " +
+                    "fallback=$fallbackCount " +
+                    "missed=$missedCount"
         )
     }
 
-    private fun sampleTopFaceBilinear(
+    private fun sampleTopFaceWithFallback(
         face: TopFace,
         facePixels: IntArray,
         azDeg: Float,
         altDeg: Float
-    ): Int? {
+    ): TopFaceSample? {
+        val coords = projectWorldToTopFace(face, azDeg, altDeg) ?: return null
+
+        val direct = sampleTopFaceBilinearAt(
+            face = face,
+            facePixels = facePixels,
+            fx = coords.first,
+            fy = coords.second
+        )
+
+        if (direct != null) {
+            return TopFaceSample(
+                color = direct,
+                usedFallback = false
+            )
+        }
+
+        val fallback = sampleNearestValidTopFace(
+            face = face,
+            facePixels = facePixels,
+            fx = coords.first,
+            fy = coords.second,
+            maxRadiusPx = POLAR_CAP_NEAREST_RADIUS_PX
+        ) ?: return null
+
+        return TopFaceSample(
+            color = fallback,
+            usedFallback = true
+        )
+    }
+
+    private fun projectWorldToTopFace(
+        face: TopFace,
+        azDeg: Float,
+        altDeg: Float
+    ): Pair<Float, Float>? {
         val dir = worldDirectionRad(
             degToRad(azDeg),
             degToRad(altDeg)
@@ -591,6 +705,74 @@ object ZenithTopFaceRefiner {
             return null
         }
 
+        return fx to fy
+    }
+
+    private fun sampleNearestValidTopFace(
+        face: TopFace,
+        facePixels: IntArray,
+        fx: Float,
+        fy: Float,
+        maxRadiusPx: Int
+    ): Int? {
+        val cx = fx.roundToInt().coerceIn(0, face.faceSizePx - 1)
+        val cy = fy.roundToInt().coerceIn(0, face.faceSizePx - 1)
+
+        for (radius in 1..maxRadiusPx) {
+            var bestColor: Int? = null
+            var bestD2 = Float.POSITIVE_INFINITY
+
+            val left = (cx - radius).coerceAtLeast(0)
+            val right = (cx + radius).coerceAtMost(face.faceSizePx - 1)
+            val top = (cy - radius).coerceAtLeast(0)
+            val bottom = (cy + radius).coerceAtMost(face.faceSizePx - 1)
+
+            for (y in top..bottom) {
+                for (x in left..right) {
+                    if (x != left && x != right && y != top && y != bottom) continue
+
+                    val valid = face.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
+                    if (valid <= 0) continue
+
+                    val dx = x - fx
+                    val dy = y - fy
+                    val d2 = dx * dx + dy * dy
+
+                    if (d2 < bestD2) {
+                        bestD2 = d2
+                        bestColor = facePixels[y * face.faceSizePx + x]
+                    }
+                }
+            }
+
+            if (bestColor != null) return bestColor
+        }
+
+        return null
+    }
+
+    private fun sampleTopFaceBilinear(
+        face: TopFace,
+        facePixels: IntArray,
+        azDeg: Float,
+        altDeg: Float
+    ): Int? {
+        val coords = projectWorldToTopFace(face, azDeg, altDeg) ?: return null
+
+        return sampleTopFaceBilinearAt(
+            face = face,
+            facePixels = facePixels,
+            fx = coords.first,
+            fy = coords.second
+        )
+    }
+
+    private fun sampleTopFaceBilinearAt(
+        face: TopFace,
+        facePixels: IntArray,
+        fx: Float,
+        fy: Float
+    ): Int? {
         val x0 = fx.toInt().coerceIn(0, face.faceSizePx - 1)
         val y0 = fy.toInt().coerceIn(0, face.faceSizePx - 1)
         val x1 = (x0 + 1).coerceIn(0, face.faceSizePx - 1)
@@ -601,95 +783,47 @@ object ZenithTopFaceRefiner {
         val m01 = face.validMask.get(y1, x0)?.firstOrNull()?.toInt() ?: 0
         val m11 = face.validMask.get(y1, x1)?.firstOrNull()?.toInt() ?: 0
 
-        if (m00 <= 0 && m10 <= 0 && m01 <= 0 && m11 <= 0) return null
-
         val dx = (fx - x0).coerceIn(0f, 1f)
         val dy = (fy - y0).coerceIn(0f, 1f)
+
+        val w00 = (1f - dx) * (1f - dy)
+        val w10 = dx * (1f - dy)
+        val w01 = (1f - dx) * dy
+        val w11 = dx * dy
 
         val c00 = facePixels[y0 * face.faceSizePx + x0]
         val c10 = facePixels[y0 * face.faceSizePx + x1]
         val c01 = facePixels[y1 * face.faceSizePx + x0]
         val c11 = facePixels[y1 * face.faceSizePx + x1]
 
-        val a = bilerp(
-            Color.alpha(c00).toFloat(),
-            Color.alpha(c10).toFloat(),
-            Color.alpha(c01).toFloat(),
-            Color.alpha(c11).toFloat(),
-            dx,
-            dy
-        ).roundToInt().coerceIn(0, 255)
+        var sumW = 0f
+        var sumA = 0f
+        var sumR = 0f
+        var sumG = 0f
+        var sumB = 0f
 
-        val r = bilerp(
-            Color.red(c00).toFloat(),
-            Color.red(c10).toFloat(),
-            Color.red(c01).toFloat(),
-            Color.red(c11).toFloat(),
-            dx,
-            dy
-        ).roundToInt().coerceIn(0, 255)
-
-        val g = bilerp(
-            Color.green(c00).toFloat(),
-            Color.green(c10).toFloat(),
-            Color.green(c01).toFloat(),
-            Color.green(c11).toFloat(),
-            dx,
-            dy
-        ).roundToInt().coerceIn(0, 255)
-
-        val b = bilerp(
-            Color.blue(c00).toFloat(),
-            Color.blue(c10).toFloat(),
-            Color.blue(c01).toFloat(),
-            Color.blue(c11).toFloat(),
-            dx,
-            dy
-        ).roundToInt().coerceIn(0, 255)
-
-        return Color.argb(a, r, g, b)
-    }
-
-    private fun sampleTopFaceWithFallback(
-        face: TopFace,
-        facePixels: IntArray,
-        azDeg: Float,
-        altDeg: Float
-    ): Int? {
-        val bilinear = sampleTopFaceBilinear(face, facePixels, azDeg, altDeg)
-        if (bilinear != null) return bilinear
-
-        val dir = worldDirectionRad(
-            degToRad(azDeg),
-            degToRad(altDeg)
-        )
-
-        if (dir[2] <= 1e-6f) return null
-
-        val center = (face.faceSizePx - 1) * 0.5f
-        val radius = center
-
-        val fx = center + radius * (dir[0] / dir[2])
-        val fy = center + radius * (dir[1] / dir[2])
-
-        val cx = fx.roundToInt()
-        val cy = fy.roundToInt()
-
-        for (r in 1..POLAR_CAP_NEAREST_RADIUS_PX) {
-            for (dy in -r..r) {
-                for (dx in -r..r) {
-                    val x = (cx + dx).coerceIn(0, face.faceSizePx - 1)
-                    val y = (cy + dy).coerceIn(0, face.faceSizePx - 1)
-
-                    val valid = face.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
-                    if (valid > 0) {
-                        return facePixels[y * face.faceSizePx + x]
-                    }
-                }
-            }
+        fun acc(mask: Int, weight: Float, color: Int) {
+            if (mask <= 0 || weight <= 0f) return
+            sumW += weight
+            sumA += Color.alpha(color) * weight
+            sumR += Color.red(color) * weight
+            sumG += Color.green(color) * weight
+            sumB += Color.blue(color) * weight
         }
 
-        return null
+        acc(m00, w00, c00)
+        acc(m10, w10, c10)
+        acc(m01, w01, c01)
+        acc(m11, w11, c11)
+
+        if (sumW <= 1e-6f) return null
+
+        val a = (sumA / sumW).roundToInt().coerceIn(0, 255)
+        val r = (sumR / sumW).roundToInt().coerceIn(0, 255)
+        val g = (sumG / sumW).roundToInt().coerceIn(0, 255)
+        val b = (sumB / sumW).roundToInt().coerceIn(0, 255)
+
+        return Color.argb(a, r, g, b)
     }
 
     private fun applyRgbGain(
@@ -801,18 +935,7 @@ object ZenithTopFaceRefiner {
 
         return mask
     }
-    private fun bilerp(
-        v00: Float,
-        v10: Float,
-        v01: Float,
-        v11: Float,
-        dx: Float,
-        dy: Float
-    ): Float {
-        val top = v00 * (1f - dx) + v10 * dx
-        val bottom = v01 * (1f - dx) + v11 * dx
-        return top * (1f - dy) + bottom * dy
-    }
+
     private fun topFaceFromArgbAndMask(
         argb: IntArray,
         mask: ByteArray,
