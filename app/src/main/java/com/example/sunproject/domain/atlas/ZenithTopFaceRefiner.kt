@@ -21,6 +21,7 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
+import android.util.Log
 
 object ZenithTopFaceRefiner {
 
@@ -40,6 +41,9 @@ object ZenithTopFaceRefiner {
     private const val RGB_GAIN_MIN = 0.92f
     private const val RGB_GAIN_MAX = 1.08f
 
+    private const val POLAR_CAP_FILL_MIN_ALT_DEG = 86f
+    private const val POLAR_CAP_NEAREST_RADIUS_PX = 4
+    private const val POLAR_CAP_FILL_WEIGHT = 2.0f
 
     data class TopFace(
         val rgba: Mat,
@@ -89,6 +93,57 @@ object ZenithTopFaceRefiner {
             atlas = atlas,
             frameWeight = frameWeight,
             minAltitudeDeg = BLEND_MIN_ALT_DEG
+        )
+
+
+        fun fillUncoveredPolarCapFromTopFace(
+            aligned: TopFace,
+            atlas: SkyAtlas,
+            frameWeight: Float,
+            minAltitudeDeg: Float
+        ) {
+            val topPixels = rgbaMatToArgb(aligned.rgba)
+            val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
+
+            var filledCount = 0
+
+            for (y in 0..yBottom) {
+                val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+                if (altDeg < minAltitudeDeg) continue
+
+                for (x in 0 until atlas.width) {
+                    if (atlas.hasCoverageAt(x, y)) continue
+
+                    val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
+
+                    val sampled = sampleTopFaceWithFallback(
+                        face = aligned,
+                        facePixels = topPixels,
+                        azDeg = azDeg,
+                        altDeg = altDeg
+                    ) ?: continue
+
+                    atlas.blendPixel(
+                        x,
+                        y,
+                        sampled,
+                        maxOf(frameWeight, POLAR_CAP_FILL_WEIGHT)
+                    )
+                    filledCount++
+                }
+            }
+
+            Log.d(
+                "AtlasZenithFill",
+                "filledPolarPixels=$filledCount minAltitudeDeg=${"%.2f".format(minAltitudeDeg)}"
+            )
+        }
+
+        fillUncoveredPolarCapFromTopFace(
+            aligned = refined.alignedTopFace,
+            atlas = atlas,
+            frameWeight = frameWeight,
+            minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG
         )
 
         releaseTopFace(atlasTop)
@@ -507,6 +562,10 @@ object ZenithTopFaceRefiner {
                 )
             }
         }
+        Log.d(
+            "AtlasZenithBlend",
+            "blendTopFaceIntoAtlas done minAltitudeDeg=${"%.2f".format(minAltitudeDeg)}"
+        )
     }
 
     private fun sampleTopFaceBilinear(
@@ -589,6 +648,48 @@ object ZenithTopFaceRefiner {
         ).roundToInt().coerceIn(0, 255)
 
         return Color.argb(a, r, g, b)
+    }
+
+    private fun sampleTopFaceWithFallback(
+        face: TopFace,
+        facePixels: IntArray,
+        azDeg: Float,
+        altDeg: Float
+    ): Int? {
+        val bilinear = sampleTopFaceBilinear(face, facePixels, azDeg, altDeg)
+        if (bilinear != null) return bilinear
+
+        val dir = worldDirectionRad(
+            degToRad(azDeg),
+            degToRad(altDeg)
+        )
+
+        if (dir[2] <= 1e-6f) return null
+
+        val center = (face.faceSizePx - 1) * 0.5f
+        val radius = center
+
+        val fx = center + radius * (dir[0] / dir[2])
+        val fy = center + radius * (dir[1] / dir[2])
+
+        val cx = fx.roundToInt()
+        val cy = fy.roundToInt()
+
+        for (r in 1..POLAR_CAP_NEAREST_RADIUS_PX) {
+            for (dy in -r..r) {
+                for (dx in -r..r) {
+                    val x = (cx + dx).coerceIn(0, face.faceSizePx - 1)
+                    val y = (cy + dy).coerceIn(0, face.faceSizePx - 1)
+
+                    val valid = face.validMask.get(y, x)?.firstOrNull()?.toInt() ?: 0
+                    if (valid > 0) {
+                        return facePixels[y * face.faceSizePx + x]
+                    }
+                }
+            }
+        }
+
+        return null
     }
 
     private fun applyRgbGain(
