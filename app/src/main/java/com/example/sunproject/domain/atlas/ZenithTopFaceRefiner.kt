@@ -432,7 +432,7 @@ object ZenithTopFaceRefiner {
         )
     }
 
-    fun blendTopFaceIntoAtlas(
+    private fun blendTopFaceIntoAtlas(
         aligned: TopFace,
         atlas: SkyAtlas,
         frameWeight: Float,
