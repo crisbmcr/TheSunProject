@@ -32,6 +32,19 @@ object ZenithTopFaceRefiner {
     private const val ECC_MAX_ALT_DEG = 88f
     private const val BLEND_MIN_ALT_DEG = 68f
 
+    private const val POLAR_PHASE_MIN_ALT_DEG = 70f
+    private const val POLAR_PHASE_MAX_ALT_DEG = 88f
+    private const val POLAR_PHASE_ANGLE_BINS = 720
+    private const val POLAR_PHASE_RADIAL_BINS = 96
+    private const val MIN_POLAR_PHASE_RESPONSE = 0.03
+    private const val MIN_POLAR_PHASE_COVERAGE = 0.12f
+
+    private data class PolarPhaseStrip(
+        val gray32: Mat,
+        val valid32: Mat,
+        val angleBins: Int,
+        val radialBins: Int
+    )
     private const val MAX_ECC_TRANSLATION_RATIO = 0.02f
     private const val MIN_ECC_SCORE_TO_USE_TRANSLATION = 0.30
 
@@ -86,12 +99,20 @@ object ZenithTopFaceRefiner {
         val zenithTop = buildZenithTopFace(frame, srcBitmap, baseTwistDeg = 0f, faceSizePx = FACE_SIZE_PX)
 
         try {
-            val initialTwistDeg = estimateTwistFromAnnulus(
+            val annulusTwistDeg = estimateTwistFromAnnulus(
                 reference = atlasTop,
                 moving = zenithTop,
                 minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
                 maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
             )
+
+            val initialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
+                reference = atlasTop,
+                moving = zenithTop,
+                minAltitudeDeg = POLAR_PHASE_MIN_ALT_DEG,
+                maxAltitudeDeg = POLAR_PHASE_MAX_ALT_DEG,
+                coarseTwistDeg = annulusTwistDeg
+            ) ?: annulusTwistDeg
 
             val refined = refineWithEcc(
                 reference = atlasTop,
@@ -451,6 +472,8 @@ object ZenithTopFaceRefiner {
         var coveredWrites = 0
         var uncoveredWrites = 0
         var nullSamples = 0
+        var directSamples = 0
+        var fallbackSamples = 0
 
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
@@ -461,7 +484,7 @@ object ZenithTopFaceRefiner {
             for (x in 0 until atlas.width) {
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val sampled = sampleTopFaceBilinear(
+                val sampled = sampleTopFaceWithFallback(
                     face = aligned,
                     facePixels = topPixels,
                     azDeg = azDeg,
@@ -473,6 +496,7 @@ object ZenithTopFaceRefiner {
                     continue
                 }
 
+                if (sampled.usedFallback) fallbackSamples++ else directSamples++
                 val hasBaseCoverage = atlas.hasCoverageAt(x, y)
 
                 val edgeT = ((altDeg - ZENITH_EDGE_FADE_START_ALT_DEG) /
@@ -495,7 +519,7 @@ object ZenithTopFaceRefiner {
                 if (finalWeight <= 0f) continue
 
                 val corrected = applyRgbGain(
-                    sampled,
+                    sampled.color,
                     correction.rGain,
                     correction.gGain,
                     correction.bGain
@@ -516,7 +540,9 @@ object ZenithTopFaceRefiner {
                     "gainB=${"%.3f".format(correction.bGain)} " +
                     "coveredWrites=$coveredWrites " +
                     "uncoveredWrites=$uncoveredWrites " +
-                    "nullSamples=$nullSamples"
+                    "nullSamples=$nullSamples " +
+                    "directSamples=$directSamples " +
+                    "fallbackSamples=$fallbackSamples"
         )
 
         return correction
@@ -549,7 +575,7 @@ object ZenithTopFaceRefiner {
 
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
-                val sampled = sampleTopFaceBilinear(
+                val sampled = sampleTopFaceWithFallback(
                     face = aligned,
                     facePixels = facePixels,
                     azDeg = azDeg,
@@ -562,9 +588,9 @@ object ZenithTopFaceRefiner {
                 refGSum += Color.green(refColor)
                 refBSum += Color.blue(refColor)
 
-                movRSum += Color.red(sampled)
-                movGSum += Color.green(sampled)
-                movBSum += Color.blue(sampled)
+                movRSum += Color.red(sampled.color)
+                movGSum += Color.green(sampled.color)
+                movBSum += Color.blue(sampled.color)
 
                 overlapCount++
             }
@@ -879,7 +905,306 @@ object ZenithTopFaceRefiner {
         face.gray32.release()
         face.validMask.release()
     }
+    private fun estimateTwistWithPolarPhaseCorrelation(
+        reference: TopFace,
+        moving: TopFace,
+        minAltitudeDeg: Float,
+        maxAltitudeDeg: Float,
+        coarseTwistDeg: Float,
+        angleBins: Int = POLAR_PHASE_ANGLE_BINS,
+        radialBins: Int = POLAR_PHASE_RADIAL_BINS
+    ): Float? {
+        val refStrip = buildPolarStripForPhaseCorrelation(
+            face = reference,
+            minAltitudeDeg = minAltitudeDeg,
+            maxAltitudeDeg = maxAltitudeDeg,
+            angleBins = angleBins,
+            radialBins = radialBins
+        )
+        val movStrip = buildPolarStripForPhaseCorrelation(
+            face = moving,
+            minAltitudeDeg = minAltitudeDeg,
+            maxAltitudeDeg = maxAltitudeDeg,
+            angleBins = angleBins,
+            radialBins = radialBins
+        )
 
+        val refGrayTiled = tilePolarStripX(refStrip.gray32, repeatCount = 2)
+        val movGrayTiled = tilePolarStripX(movStrip.gray32, repeatCount = 2)
+        val refValidTiled = tilePolarStripX(refStrip.valid32, repeatCount = 2)
+        val movValidTiled = tilePolarStripX(movStrip.valid32, repeatCount = 2)
+
+        val commonMask = Mat()
+        val hann = Mat()
+        val window = Mat()
+
+        try {
+            Core.min(refValidTiled, movValidTiled, commonMask)
+
+            val totalCells = (commonMask.rows() * commonMask.cols()).coerceAtLeast(1)
+            val commonCoverage = (Core.sumElems(commonMask).`val`[0] / totalCells.toDouble()).toFloat()
+
+            if (commonCoverage < MIN_POLAR_PHASE_COVERAGE) {
+                Log.d(
+                    "AtlasZenithTwistPhase",
+                    "coverage=${"%.3f".format(commonCoverage)} tooLow fallback=${"%.2f".format(coarseTwistDeg)}"
+                )
+                return null
+            }
+
+            Imgproc.createHanningWindow(
+                hann,
+                Size(refGrayTiled.cols().toDouble(), refGrayTiled.rows().toDouble()),
+                CvType.CV_32F
+            )
+            Core.multiply(hann, commonMask, window)
+
+            val response = doubleArrayOf(0.0)
+            val shift = Imgproc.phaseCorrelate(
+                refGrayTiled,
+                movGrayTiled,
+                window,
+                response
+            )
+
+            var shiftX = shift.x.toFloat() % angleBins.toFloat()
+            if (shiftX > angleBins * 0.5f) shiftX -= angleBins.toFloat()
+            if (shiftX < -angleBins * 0.5f) shiftX += angleBins.toFloat()
+
+            val rawTwistDeg = shiftX * 360f / angleBins.toFloat()
+
+            val candidatePos = normalizeDeg(rawTwistDeg)
+            val candidateNeg = normalizeDeg(-rawTwistDeg)
+
+            val chosen = if (
+                angularDistanceDeg(candidatePos, coarseTwistDeg) <=
+                angularDistanceDeg(candidateNeg, coarseTwistDeg)
+            ) {
+                candidatePos
+            } else {
+                candidateNeg
+            }
+
+            Log.d(
+                "AtlasZenithTwistPhase",
+                "coverage=${"%.3f".format(commonCoverage)} " +
+                        "response=${"%.5f".format(response[0])} " +
+                        "shiftX=${"%.2f".format(shiftX)} " +
+                        "candPos=${"%.2f".format(candidatePos)} " +
+                        "candNeg=${"%.2f".format(candidateNeg)} " +
+                        "coarse=${"%.2f".format(coarseTwistDeg)} " +
+                        "chosen=${"%.2f".format(chosen)}"
+            )
+
+            return if (response[0] >= MIN_POLAR_PHASE_RESPONSE) chosen else null
+        } finally {
+            refStrip.gray32.release()
+            refStrip.valid32.release()
+            movStrip.gray32.release()
+            movStrip.valid32.release()
+            refGrayTiled.release()
+            movGrayTiled.release()
+            refValidTiled.release()
+            movValidTiled.release()
+            commonMask.release()
+            hann.release()
+            window.release()
+        }
+    }
+
+    private fun buildPolarStripForPhaseCorrelation(
+        face: TopFace,
+        minAltitudeDeg: Float,
+        maxAltitudeDeg: Float,
+        angleBins: Int,
+        radialBins: Int
+    ): PolarPhaseStrip {
+        val gray = Mat.zeros(radialBins, angleBins, CvType.CV_32F)
+        val valid = Mat.zeros(radialBins, angleBins, CvType.CV_32F)
+
+        val center = (face.faceSizePx - 1) * 0.5f
+        val maxRadius = center
+        val innerRadius = altitudeToTopRadiusPx(maxAltitudeDeg, maxRadius)
+        val outerRadius = altitudeToTopRadiusPx(minAltitudeDeg, maxRadius)
+
+        for (ry in 0 until radialBins) {
+            val tR = if (radialBins <= 1) 0f else ry.toFloat() / (radialBins - 1).toFloat()
+            val radius = innerRadius + (outerRadius - innerRadius) * tR
+
+            val grayRow = FloatArray(angleBins)
+            val validRow = FloatArray(angleBins)
+
+            for (ax in 0 until angleBins) {
+                val theta = (2.0 * PI * ax.toDouble()) / angleBins.toDouble()
+                val fx = center + radius * cos(theta).toFloat()
+                val fy = center + radius * sin(theta).toFloat()
+
+                val sampled = sampleGray32WithMaskBilinear(face, fx, fy) ?: continue
+                grayRow[ax] = sampled.first
+                validRow[ax] = sampled.second
+            }
+
+            gray.put(ry, 0, grayRow)
+            valid.put(ry, 0, validRow)
+        }
+
+        normalizePolarStripInPlace(gray, valid)
+
+        return PolarPhaseStrip(
+            gray32 = gray,
+            valid32 = valid,
+            angleBins = angleBins,
+            radialBins = radialBins
+        )
+    }
+
+    private fun sampleGray32WithMaskBilinear(
+        face: TopFace,
+        fx: Float,
+        fy: Float
+    ): Pair<Float, Float>? {
+        if (fx < 0f || fy < 0f || fx > face.faceSizePx - 1f || fy > face.faceSizePx - 1f) {
+            return null
+        }
+
+        val x0 = fx.toInt().coerceIn(0, face.faceSizePx - 1)
+        val y0 = fy.toInt().coerceIn(0, face.faceSizePx - 1)
+        val x1 = (x0 + 1).coerceIn(0, face.faceSizePx - 1)
+        val y1 = (y0 + 1).coerceIn(0, face.faceSizePx - 1)
+
+        val dx = (fx - x0).coerceIn(0f, 1f)
+        val dy = (fy - y0).coerceIn(0f, 1f)
+
+        val w00 = (1f - dx) * (1f - dy)
+        val w10 = dx * (1f - dy)
+        val w01 = (1f - dx) * dy
+        val w11 = dx * dy
+
+        val m00 = if ((face.validMask.get(y0, x0)?.firstOrNull() ?: 0.0) > 0.0) 1f else 0f
+        val m10 = if ((face.validMask.get(y0, x1)?.firstOrNull() ?: 0.0) > 0.0) 1f else 0f
+        val m01 = if ((face.validMask.get(y1, x0)?.firstOrNull() ?: 0.0) > 0.0) 1f else 0f
+        val m11 = if ((face.validMask.get(y1, x1)?.firstOrNull() ?: 0.0) > 0.0) 1f else 0f
+
+        val g00 = (face.gray32.get(y0, x0)?.firstOrNull() ?: 0.0).toFloat()
+        val g10 = (face.gray32.get(y0, x1)?.firstOrNull() ?: 0.0).toFloat()
+        val g01 = (face.gray32.get(y1, x0)?.firstOrNull() ?: 0.0).toFloat()
+        val g11 = (face.gray32.get(y1, x1)?.firstOrNull() ?: 0.0).toFloat()
+
+        var sumW = 0f
+        var sumG = 0f
+
+        fun acc(mask: Float, weight: Float, value: Float) {
+            if (mask <= 0f || weight <= 0f) return
+            val ww = mask * weight
+            sumW += ww
+            sumG += value * ww
+        }
+
+        acc(m00, w00, g00)
+        acc(m10, w10, g10)
+        acc(m01, w01, g01)
+        acc(m11, w11, g11)
+
+        if (sumW <= 1e-6f) return null
+
+        val gray = sumG / sumW
+        val coverage = sumW.coerceIn(0f, 1f)
+        return gray to coverage
+    }
+
+    private fun normalizePolarStripInPlace(
+        gray: Mat,
+        valid: Mat
+    ) {
+        val rows = gray.rows()
+        val cols = gray.cols()
+
+        var sum = 0.0
+        var weightSum = 0.0
+
+        for (y in 0 until rows) {
+            val grayRow = FloatArray(cols)
+            val validRow = FloatArray(cols)
+            gray.get(y, 0, grayRow)
+            valid.get(y, 0, validRow)
+
+            for (x in 0 until cols) {
+                val w = validRow[x].toDouble()
+                if (w <= 1e-6) continue
+                sum += grayRow[x] * w
+                weightSum += w
+            }
+        }
+
+        if (weightSum <= 1e-6) {
+            gray.setTo(Scalar(0.0))
+            return
+        }
+
+        val mean = (sum / weightSum).toFloat()
+
+        var varSum = 0.0
+        for (y in 0 until rows) {
+            val grayRow = FloatArray(cols)
+            val validRow = FloatArray(cols)
+            gray.get(y, 0, grayRow)
+            valid.get(y, 0, validRow)
+
+            for (x in 0 until cols) {
+                val w = validRow[x].toDouble()
+                if (w <= 1e-6) continue
+                val d = (grayRow[x] - mean).toDouble()
+                varSum += d * d * w
+            }
+        }
+
+        val std = sqrt((varSum / weightSum).coerceAtLeast(1e-9)).toFloat()
+
+        for (y in 0 until rows) {
+            val grayRow = FloatArray(cols)
+            val validRow = FloatArray(cols)
+            gray.get(y, 0, grayRow)
+            valid.get(y, 0, validRow)
+
+            for (x in 0 until cols) {
+                val w = validRow[x]
+                grayRow[x] = if (w > 1e-6f) {
+                    ((grayRow[x] - mean) / std) * w
+                } else {
+                    0f
+                }
+            }
+
+            gray.put(y, 0, grayRow)
+        }
+    }
+
+    private fun tilePolarStripX(
+        src: Mat,
+        repeatCount: Int
+    ): Mat {
+        val dst = Mat.zeros(src.rows(), src.cols() * repeatCount, src.type())
+        for (i in 0 until repeatCount) {
+            val roi = dst.colRange(i * src.cols(), (i + 1) * src.cols())
+            src.copyTo(roi)
+            roi.release()
+        }
+        return dst
+    }
+
+    private fun angularDistanceDeg(
+        aDeg: Float,
+        bDeg: Float
+    ): Float {
+        return abs(normalizeSignedDeg(aDeg - bDeg))
+    }
+
+    private fun normalizeSignedDeg(valueDeg: Float): Float {
+        var v = valueDeg
+        while (v <= -180f) v += 360f
+        while (v > 180f) v -= 360f
+        return v
+    }
     private fun buildAnnulusSignature(
         face: TopFace,
         minAltitudeDeg: Float,
