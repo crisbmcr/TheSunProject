@@ -22,7 +22,6 @@ import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
 import android.util.Log
-
 object ZenithTopFaceRefiner {
 
     private const val FACE_SIZE_PX = 512
@@ -93,6 +92,8 @@ object ZenithTopFaceRefiner {
         srcBitmap: Bitmap,
         frameWeight: Float
     ): RefinementResult? {
+        com.example.sunproject.SunProjectApp.requireOpenCv()
+
         if (frameWeight <= 0f) return null
 
         val atlasTop = buildAtlasTopFace(atlas, FACE_SIZE_PX)

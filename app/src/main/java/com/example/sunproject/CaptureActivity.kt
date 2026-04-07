@@ -46,7 +46,6 @@ import kotlin.math.acos
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
-import org.opencv.android.OpenCVLoader
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
@@ -218,7 +217,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_capture)
-        if (!OpenCVLoader.initLocal()) {
+        if (!SunProjectApp.ensureOpenCvReady()) {
             Log.e("OpenCV", "OpenCV initialization failed")
             Toast.makeText(this, "OpenCV initialization failed", Toast.LENGTH_LONG).show()
             finish()
