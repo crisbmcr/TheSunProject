@@ -503,6 +503,7 @@ object ZenithTopFaceRefiner {
             facePixels = topPixels,
             minAltitudeDeg = minAltitudeDeg
         )
+        val correctionStrength = computeColorCorrectionStrength(correction)
 
         var coveredWrites = 0
         var uncoveredWrites = 0
@@ -525,13 +526,13 @@ object ZenithTopFaceRefiner {
                     azDeg = azDeg,
                     altDeg = altDeg
                 )
-
                 if (sampled == null) {
                     nullSamples++
                     continue
                 }
 
                 if (sampled.usedFallback) fallbackSamples++ else directSamples++
+
                 val hasBaseCoverage = atlas.hasCoverageAt(x, y)
 
                 val edgeT = ((altDeg - ZENITH_EDGE_FADE_START_ALT_DEG) /
@@ -569,13 +570,7 @@ object ZenithTopFaceRefiner {
                     correctionStrength = correctionStrength
                 )
 
-                val corrected = applyRgbGain(
-                    sampled.color,
-                    gainR,
-                    gainG,
-                    gainB
-                )
-                val correctionStrength = computeColorCorrectionStrength(correction)
+                val corrected = applyRgbGain(sampled.color, gainR, gainG, gainB)
                 atlas.blendPixel(x, y, corrected, finalWeight)
 
                 if (hasBaseCoverage) coveredWrites++ else uncoveredWrites++
@@ -678,6 +673,7 @@ object ZenithTopFaceRefiner {
         if (frameWeight <= 0f) return
 
         val topPixels = rgbaMatToArgb(aligned.rgba)
+        val correctionStrength = computeColorCorrectionStrength(colorCorrection)
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
         var candidateCount = 0
