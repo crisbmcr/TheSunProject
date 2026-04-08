@@ -58,7 +58,10 @@ object ZenithTopFaceRefiner {
     private const val POLAR_CAP_FILL_MIN_ALT_DEG = 86f
     private const val POLAR_CAP_NEAREST_RADIUS_PX = 4
     private const val POLAR_CAP_FILL_WEIGHT = 2.0f
-
+    private const val MIN_ECC_ACCEPT_SCORE = 0.12
+    private const val STRONG_ECC_ACCEPT_SCORE = 0.20
+    private const val MAX_ECC_ROT_IF_WEAK_SCORE_DEG = 3.0f
+    private const val MAX_ECC_ROT_IF_STRONG_SCORE_DEG = 6.0f
     data class TopFace(
         val rgba: Mat,
         val gray32: Mat,
@@ -379,10 +382,21 @@ object ZenithTopFaceRefiner {
         val tx = warp.get(0, 2)[0].toFloat()
         val ty = warp.get(1, 2)[0].toFloat()
 
-        val eccRotDeg = Math.toDegrees(atan2(m01, m00).toDouble()).toFloat()
+        val eccRotRawDeg = Math.toDegrees(atan2(m01, m00).toDouble()).toFloat()
+
+        val acceptEccRotation =
+            eccScore >= MIN_ECC_ACCEPT_SCORE &&
+                    (
+                            (eccScore >= STRONG_ECC_ACCEPT_SCORE &&
+                                    abs(eccRotRawDeg) <= MAX_ECC_ROT_IF_STRONG_SCORE_DEG) ||
+                                    (eccScore < STRONG_ECC_ACCEPT_SCORE &&
+                                            abs(eccRotRawDeg) <= MAX_ECC_ROT_IF_WEAK_SCORE_DEG)
+                            )
+
+        val eccRotUsedDeg = if (acceptEccRotation) eccRotRawDeg else 0f
 
         val maxShiftPx = moving.faceSizePx.toFloat() * MAX_ECC_TRANSLATION_RATIO
-        val allowTranslation = eccScore >= MIN_ECC_SCORE_TO_USE_TRANSLATION
+        val allowTranslation = acceptEccRotation && eccScore >= MIN_ECC_SCORE_TO_USE_TRANSLATION
 
         val txUsed: Float = if (allowTranslation) {
             tx.coerceIn(-maxShiftPx, maxShiftPx)
@@ -396,13 +410,29 @@ object ZenithTopFaceRefiner {
             0f
         }
 
+        val eccRotRad = Math.toRadians(eccRotUsedDeg.toDouble())
+        val cosR = kotlin.math.cos(eccRotRad)
+        val sinR = kotlin.math.sin(eccRotRad)
+
         val warpUsed = Mat.eye(2, 3, CvType.CV_32F)
-        warpUsed.put(0, 0, m00)
-        warpUsed.put(0, 1, m01)
-        warpUsed.put(1, 0, warp.get(1, 0)[0])
-        warpUsed.put(1, 1, warp.get(1, 1)[0])
+        warpUsed.put(0, 0, cosR)
+        warpUsed.put(0, 1, sinR)
+        warpUsed.put(1, 0, -sinR)
+        warpUsed.put(1, 1, cosR)
         warpUsed.put(0, 2, txUsed.toDouble())
         warpUsed.put(1, 2, tyUsed.toDouble())
+
+        Log.d(
+            "AtlasZenithEccGate",
+            "score=${"%.5f".format(eccScore)} " +
+                    "rawRot=${"%.2f".format(eccRotRawDeg)} " +
+                    "usedRot=${"%.2f".format(eccRotUsedDeg)} " +
+                    "accepted=$acceptEccRotation " +
+                    "txRaw=${"%.2f".format(tx)} " +
+                    "tyRaw=${"%.2f".format(ty)} " +
+                    "txUsed=${"%.2f".format(txUsed)} " +
+                    "tyUsed=${"%.2f".format(tyUsed)}"
+        )
 
         val alignedRgba = Mat()
         val alignedMask = Mat()
@@ -442,8 +472,8 @@ object ZenithTopFaceRefiner {
 
         return RefinementResult(
             initialTwistDeg = initialTwistDeg,
-            finalTwistDeg = normalizeDeg(initialTwistDeg + eccRotDeg),
-            eccRotationDeg = eccRotDeg,
+            finalTwistDeg = normalizeDeg(initialTwistDeg + eccRotUsedDeg),
+            eccRotationDeg = eccRotUsedDeg,
             eccTxPx = txUsed,
             eccTyPx = tyUsed,
             eccScore = eccScore,
