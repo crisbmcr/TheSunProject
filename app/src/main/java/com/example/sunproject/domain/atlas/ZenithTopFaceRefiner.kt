@@ -497,7 +497,8 @@ object ZenithTopFaceRefiner {
         var nullSamples = 0
         var directSamples = 0
         var fallbackSamples = 0
-
+        var seamCorrectedWrites = 0
+        var neutralWrites = 0
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
         for (y in 0..yBottom) {
@@ -541,25 +542,46 @@ object ZenithTopFaceRefiner {
                 val finalWeight = frameWeight * zenithEdgeAlpha * overlapAlpha
                 if (finalWeight <= 0f) continue
 
-                val gainR = remapGainTowardNeutralByAltitude(
-                    gain = correction.rGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
-                val gainG = remapGainTowardNeutralByAltitude(
-                    gain = correction.gGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
-                val gainB = remapGainTowardNeutralByAltitude(
-                    gain = correction.bGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
+                val applySeamColorCorrection = hasBaseCoverage
 
-                val corrected = applyRgbGain(sampled.color, gainR, gainG, gainB)
+                val gainR = if (applySeamColorCorrection) {
+                    remapGainTowardNeutralByAltitude(
+                        gain = correction.rGain,
+                        altDeg = altDeg,
+                        correctionStrength = correctionStrength
+                    )
+                } else {
+                    1f
+                }
+
+                val gainG = if (applySeamColorCorrection) {
+                    remapGainTowardNeutralByAltitude(
+                        gain = correction.gGain,
+                        altDeg = altDeg,
+                        correctionStrength = correctionStrength
+                    )
+                } else {
+                    1f
+                }
+
+                val gainB = if (applySeamColorCorrection) {
+                    remapGainTowardNeutralByAltitude(
+                        gain = correction.bGain,
+                        altDeg = altDeg,
+                        correctionStrength = correctionStrength
+                    )
+                } else {
+                    1f
+                }
+
+                val corrected = applyRgbGain(
+                    sampled.color,
+                    gainR,
+                    gainG,
+                    gainB
+                )
                 atlas.blendPixel(x, y, corrected, finalWeight)
-
+                if (applySeamColorCorrection) seamCorrectedWrites++ else neutralWrites++
                 if (hasBaseCoverage) coveredWrites++ else uncoveredWrites++
             }
         }
@@ -574,6 +596,8 @@ object ZenithTopFaceRefiner {
                     "correctionStrength=${"%.2f".format(correctionStrength)} " +
                     "coveredWrites=$coveredWrites " +
                     "uncoveredWrites=$uncoveredWrites " +
+                    "seamCorrectedWrites=$seamCorrectedWrites " +
+                    "neutralWrites=$neutralWrites " +
                     "nullSamples=$nullSamples " +
                     "directSamples=$directSamples " +
                     "fallbackSamples=$fallbackSamples"
@@ -694,21 +718,9 @@ object ZenithTopFaceRefiner {
 
                 val correctionStrength = computeColorCorrectionStrength(colorCorrection)
 
-                val gainR = remapGainTowardNeutralByAltitude(
-                    gain = colorCorrection.rGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
-                val gainG = remapGainTowardNeutralByAltitude(
-                    gain = colorCorrection.gGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
-                val gainB = remapGainTowardNeutralByAltitude(
-                    gain = colorCorrection.bGain,
-                    altDeg = altDeg,
-                    correctionStrength = correctionStrength
-                )
+                val gainR = 1f
+                val gainG = 1f
+                val gainB = 1f
 
                 val corrected = applyRgbGain(
                     sampled.color,
