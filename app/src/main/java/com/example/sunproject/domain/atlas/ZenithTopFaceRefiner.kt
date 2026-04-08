@@ -62,6 +62,10 @@ object ZenithTopFaceRefiner {
     private const val STRONG_ECC_ACCEPT_SCORE = 0.20
     private const val MAX_ECC_ROT_IF_WEAK_SCORE_DEG = 3.0f
     private const val MAX_ECC_ROT_IF_STRONG_SCORE_DEG = 6.0f
+    private const val COLOR_MATCH_FULL_AT_ALT_DEG = 70f
+    private const val COLOR_MATCH_NEUTRAL_AT_ALT_DEG = 84f
+    private const val MIN_COLOR_CORRECTION_STRENGTH = 0.35f
+    private const val COLOR_GAIN_CLAMP_EPS = 0.002f
     data class TopFace(
         val rgba: Mat,
         val gray32: Mat,
@@ -549,13 +553,29 @@ object ZenithTopFaceRefiner {
                 val finalWeight = frameWeight * zenithEdgeAlpha * overlapAlpha
                 if (finalWeight <= 0f) continue
 
-                val corrected = applyRgbGain(
-                    sampled.color,
-                    correction.rGain,
-                    correction.gGain,
-                    correction.bGain
+                val gainR = remapGainTowardNeutralByAltitude(
+                    gain = correction.rGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
+                )
+                val gainG = remapGainTowardNeutralByAltitude(
+                    gain = correction.gGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
+                )
+                val gainB = remapGainTowardNeutralByAltitude(
+                    gain = correction.bGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
                 )
 
+                val corrected = applyRgbGain(
+                    sampled.color,
+                    gainR,
+                    gainG,
+                    gainB
+                )
+                val correctionStrength = computeColorCorrectionStrength(correction)
                 atlas.blendPixel(x, y, corrected, finalWeight)
 
                 if (hasBaseCoverage) coveredWrites++ else uncoveredWrites++
@@ -569,6 +589,7 @@ object ZenithTopFaceRefiner {
                     "gainR=${"%.3f".format(correction.rGain)} " +
                     "gainG=${"%.3f".format(correction.gGain)} " +
                     "gainB=${"%.3f".format(correction.bGain)} " +
+                    "correctionStrength=${"%.2f".format(correctionStrength)} " +
                     "coveredWrites=$coveredWrites " +
                     "uncoveredWrites=$uncoveredWrites " +
                     "nullSamples=$nullSamples " +
@@ -688,11 +709,29 @@ object ZenithTopFaceRefiner {
                     continue
                 }
 
+                val correctionStrength = computeColorCorrectionStrength(colorCorrection)
+
+                val gainR = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.rGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
+                )
+                val gainG = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.gGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
+                )
+                val gainB = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.bGain,
+                    altDeg = altDeg,
+                    correctionStrength = correctionStrength
+                )
+
                 val corrected = applyRgbGain(
                     sampled.color,
-                    colorCorrection.rGain,
-                    colorCorrection.gGain,
-                    colorCorrection.bGain
+                    gainR,
+                    gainG,
+                    gainB
                 )
 
                 atlas.blendPixel(x, y, corrected, frameWeight)
@@ -914,7 +953,40 @@ object ZenithTopFaceRefiner {
         val b = (Color.blue(color) * bGain).roundToInt().coerceIn(0, 255)
         return Color.argb(a, r, g, b)
     }
+    private fun computeColorCorrectionStrength(
+        correction: ColorCorrection
+    ): Float {
+        val allAtFloor =
+            abs(correction.rGain - RGB_GAIN_MIN) <= COLOR_GAIN_CLAMP_EPS &&
+                    abs(correction.gGain - RGB_GAIN_MIN) <= COLOR_GAIN_CLAMP_EPS &&
+                    abs(correction.bGain - RGB_GAIN_MIN) <= COLOR_GAIN_CLAMP_EPS
 
+        val allAtCeil =
+            abs(correction.rGain - RGB_GAIN_MAX) <= COLOR_GAIN_CLAMP_EPS &&
+                    abs(correction.gGain - RGB_GAIN_MAX) <= COLOR_GAIN_CLAMP_EPS &&
+                    abs(correction.bGain - RGB_GAIN_MAX) <= COLOR_GAIN_CLAMP_EPS
+
+        return if (allAtFloor || allAtCeil) {
+            MIN_COLOR_CORRECTION_STRENGTH
+        } else {
+            1f
+        }
+    }
+
+    private fun remapGainTowardNeutralByAltitude(
+        gain: Float,
+        altDeg: Float,
+        correctionStrength: Float
+    ): Float {
+        val seamT = 1f - (
+                (altDeg - COLOR_MATCH_FULL_AT_ALT_DEG) /
+                        (COLOR_MATCH_NEUTRAL_AT_ALT_DEG - COLOR_MATCH_FULL_AT_ALT_DEG)
+                ).coerceIn(0f, 1f)
+
+        val effectiveT = (seamT * correctionStrength).coerceIn(0f, 1f)
+
+        return 1f + (gain - 1f) * effectiveT
+    }
     private fun colorLuma(color: Int): Float {
         val r = Color.red(color).toFloat()
         val g = Color.green(color).toFloat()
