@@ -399,20 +399,8 @@ object ZenithTopFaceRefiner {
 
         val eccRotUsedDeg = if (acceptEccRotation) eccRotRawDeg else 0f
 
-        val maxShiftPx = moving.faceSizePx.toFloat() * MAX_ECC_TRANSLATION_RATIO
-        val allowTranslation = acceptEccRotation && eccScore >= MIN_ECC_SCORE_TO_USE_TRANSLATION
-
-        val txUsed: Float = if (allowTranslation) {
-            tx.coerceIn(-maxShiftPx, maxShiftPx)
-        } else {
-            0f
-        }
-
-        val tyUsed: Float = if (allowTranslation) {
-            ty.coerceIn(-maxShiftPx, maxShiftPx)
-        } else {
-            0f
-        }
+        val txUsed = 0f
+        val tyUsed = 0f
 
         val eccRotRad = Math.toRadians(eccRotUsedDeg.toDouble())
         val cosR = kotlin.math.cos(eccRotRad)
@@ -434,8 +422,7 @@ object ZenithTopFaceRefiner {
                     "accepted=$acceptEccRotation " +
                     "txRaw=${"%.2f".format(tx)} " +
                     "tyRaw=${"%.2f".format(ty)} " +
-                    "txUsed=${"%.2f".format(txUsed)} " +
-                    "tyUsed=${"%.2f".format(tyUsed)}"
+                    "txUsed=0.00 tyUsed=0.00 translationDisabled=true"
         )
 
         val alignedRgba = Mat()
