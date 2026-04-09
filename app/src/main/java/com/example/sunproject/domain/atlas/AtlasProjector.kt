@@ -204,12 +204,33 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
+                val zenithPose = estimateZenithPoseDeg(
+                    frame = frame,
+                    src = src,
+                    baseAtlas = atlas,
+                    frameWeight = frameWeight
+                )
+
+                Log.d(
+                    "AtlasZenithPoseSeed",
+                    "frame=${frame.frameId} " +
+                            "twist=${"%.2f".format(zenithPose.twistDeg)} " +
+                            "pitchOffset=${"%.2f".format(zenithPose.pitchOffsetDeg)} " +
+                            "rollOffset=${"%.2f".format(zenithPose.rollOffsetDeg)} " +
+                            "score=${"%.5f".format(zenithPose.score)} " +
+                            "compared=${zenithPose.comparedPixels} " +
+                            "confidence=${"%.3f".format(zenithPose.confidence)}"
+                )
+
                 try {
                     val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
                         atlas = atlas,
                         frame = frame,
                         srcBitmap = src,
-                        frameWeight = frameWeight
+                        frameWeight = frameWeight,
+                        seedTwistDeg = zenithPose.twistDeg,
+                        seedPitchOffsetDeg = zenithPose.pitchOffsetDeg,
+                        seedRollOffsetDeg = zenithPose.rollOffsetDeg
                     )
 
                     if (refined == null) {
@@ -223,9 +244,9 @@ object AtlasProjector {
                             src = src,
                             atlas = atlas,
                             frameWeight = frameWeight,
-                            zenithTwistDegOverride = ZENITH_TWIST_FALLBACK_DEG,
-                            zenithPitchOffsetDegOverride = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
-                            zenithRollOffsetDegOverride = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
+                            zenithTwistDegOverride = zenithPose.twistDeg,
+                            zenithPitchOffsetDegOverride = zenithPose.pitchOffsetDeg,
+                            zenithRollOffsetDegOverride = zenithPose.rollOffsetDeg,
                             emitLogs = true
                         )
                     } else {
@@ -256,9 +277,9 @@ object AtlasProjector {
                         src = src,
                         atlas = atlas,
                         frameWeight = frameWeight,
-                        zenithTwistDegOverride = ZENITH_TWIST_FALLBACK_DEG,
-                        zenithPitchOffsetDegOverride = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
-                        zenithRollOffsetDegOverride = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
+                        zenithTwistDegOverride = zenithPose.twistDeg,
+                        zenithPitchOffsetDegOverride = zenithPose.pitchOffsetDeg,
+                        zenithRollOffsetDegOverride = zenithPose.rollOffsetDeg,
                         emitLogs = true
                     )
                 }
@@ -297,19 +318,19 @@ object AtlasProjector {
             zenithRollOffsetDegOverride ?: ZENITH_ROLL_OFFSET_FALLBACK_DEG
 
         val projectionAzimuthDeg = if (zenithLike) {
-            frame.targetAzimuthDeg + effectiveZenithTwistDeg
+            frame.measuredAzimuthDeg + effectiveZenithTwistDeg
         } else {
             frame.measuredAzimuthDeg
         }
 
         val projectionPitchDeg = if (zenithLike) {
-            (90f + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
+            (frame.measuredPitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
         } else {
             frame.measuredPitchDeg
         }
 
         val projectionRollDeg = if (zenithLike) {
-            effectiveZenithRollOffsetDeg.coerceIn(
+            (frame.measuredRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
                 ZENITH_ROLL_OFFSET_MIN_DEG,
                 ZENITH_ROLL_OFFSET_MAX_DEG
             )

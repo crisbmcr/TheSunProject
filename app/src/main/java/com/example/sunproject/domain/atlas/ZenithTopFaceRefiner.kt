@@ -97,55 +97,76 @@ object ZenithTopFaceRefiner {
         atlas: SkyAtlas,
         frame: FrameRecord,
         srcBitmap: Bitmap,
-        frameWeight: Float
+        frameWeight: Float,
+        seedTwistDeg: Float,
+        seedPitchOffsetDeg: Float,
+        seedRollOffsetDeg: Float
     ): RefinementResult? {
         com.example.sunproject.SunProjectApp.requireOpenCv()
 
         if (frameWeight <= 0f) return null
 
         val atlasTop = buildAtlasTopFace(atlas, FACE_SIZE_PX)
-        val zenithTop = buildZenithTopFace(frame, srcBitmap, baseTwistDeg = 0f, faceSizePx = FACE_SIZE_PX)
+        val zenithTop = buildZenithTopFace(
+            frame = frame,
+            srcBitmap = srcBitmap,
+            baseTwistDeg = seedTwistDeg,
+            basePitchOffsetDeg = seedPitchOffsetDeg,
+            baseRollOffsetDeg = seedRollOffsetDeg,
+            faceSizePx = FACE_SIZE_PX
+        )
 
         try {
-            val annulusTwistDeg = estimateTwistFromAnnulus(
+            val residualAnnulusTwistDeg = estimateTwistFromAnnulus(
                 reference = atlasTop,
                 moving = zenithTop,
                 minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
                 maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
             )
 
-            val initialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
+            val residualInitialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
                 reference = atlasTop,
                 moving = zenithTop,
                 minAltitudeDeg = POLAR_PHASE_MIN_ALT_DEG,
                 maxAltitudeDeg = POLAR_PHASE_MAX_ALT_DEG,
-                coarseTwistDeg = annulusTwistDeg
-            ) ?: annulusTwistDeg
+                coarseTwistDeg = residualAnnulusTwistDeg
+            ) ?: residualAnnulusTwistDeg
 
-            val refined = refineWithEcc(
+            val residualRefined = refineWithEcc(
                 reference = atlasTop,
                 moving = zenithTop,
-                initialTwistDeg = initialTwistDeg,
+                initialTwistDeg = residualInitialTwistDeg,
                 eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
                 eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
             )
 
             val colorCorrection = blendTopFaceIntoAtlas(
-                aligned = refined.alignedTopFace,
+                aligned = residualRefined.alignedTopFace,
                 atlas = atlas,
                 frameWeight = frameWeight,
                 minAltitudeDeg = BLEND_MIN_ALT_DEG
             )
 
             fillUncoveredPolarCapFromTopFace(
-                aligned = refined.alignedTopFace,
+                aligned = residualRefined.alignedTopFace,
                 atlas = atlas,
                 frameWeight = frameWeight,
                 minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG,
                 colorCorrection = colorCorrection
             )
 
-            return refined
+            val absoluteInitialTwistDeg = normalizeDeg(seedTwistDeg + residualInitialTwistDeg)
+            val absoluteFinalTwistDeg = normalizeDeg(seedTwistDeg + residualRefined.finalTwistDeg)
+
+            return RefinementResult(
+                initialTwistDeg = absoluteInitialTwistDeg,
+                finalTwistDeg = absoluteFinalTwistDeg,
+                eccRotationDeg = residualRefined.eccRotationDeg,
+                eccTxPx = residualRefined.eccTxPx,
+                eccTyPx = residualRefined.eccTyPx,
+                eccScore = residualRefined.eccScore,
+                alignedTopFace = residualRefined.alignedTopFace
+            )
         } finally {
             releaseTopFace(atlasTop)
             releaseTopFace(zenithTop)
@@ -190,6 +211,8 @@ object ZenithTopFaceRefiner {
         frame: FrameRecord,
         srcBitmap: Bitmap,
         baseTwistDeg: Float,
+        basePitchOffsetDeg: Float,
+        baseRollOffsetDeg: Float,
         faceSizePx: Int = FACE_SIZE_PX
     ): TopFace {
         val srcW = srcBitmap.width
@@ -203,14 +226,32 @@ object ZenithTopFaceRefiner {
         val tanHalfH = tan(Math.toRadians(hfov * 0.5).toFloat())
         val tanHalfV = tan(Math.toRadians(vfov * 0.5).toFloat())
 
-        val yawDeg = normalizeDeg(frame.targetAzimuthDeg + baseTwistDeg)
-        val pitchDeg = frame.measuredPitchDeg.coerceIn(84f, 90f)
-        val rollDeg = frame.measuredRollDeg
+        val yawDeg = normalizeDeg(frame.measuredAzimuthDeg + baseTwistDeg)
+        val pitchDeg = (frame.measuredPitchDeg + basePitchOffsetDeg).coerceIn(84f, 90f)
+        val rollDeg = frame.measuredRollDeg + baseRollOffsetDeg
+
+        Log.d(
+            "AtlasZenithSeed",
+            "frame=${frame.frameId} " +
+                    "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
+                    "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
+                    "yawSeed=${"%.2f".format(yawDeg)} " +
+                    "pitchSeed=${"%.2f".format(pitchDeg)} " +
+                    "rollSeed=${"%.2f".format(rollDeg)}"
+        )
 
         val yawRad = degToRad(yawDeg)
         val pitchRad = degToRad(pitchDeg)
         val rollRad = degToRad(-rollDeg)
-
+        Log.d(
+            "AtlasZenithSeed",
+            "frame=${frame.frameId} " +
+                    "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
+                    "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
+                    "yawSeed=${"%.2f".format(yawDeg)} " +
+                    "pitchSeed=${"%.2f".format(pitchDeg)} " +
+                    "rollSeed=${"%.2f".format(rollDeg)}"
+        )
         val forward = worldDirectionRad(yawRad, pitchRad)
 
         var right0 = cross(forward, floatArrayOf(0f, 0f, 1f))
