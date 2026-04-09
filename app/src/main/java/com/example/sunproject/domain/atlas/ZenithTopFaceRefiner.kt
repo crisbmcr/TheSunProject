@@ -23,7 +23,8 @@ import kotlin.math.sqrt
 import kotlin.math.tan
 import android.util.Log
 object ZenithTopFaceRefiner {
-
+    // ECC translation intentionally disabled for zenith refinement.
+// Keep only rotational residual refinement here.
     private const val FACE_SIZE_PX = 512
     private const val ANNULUS_MIN_ALT_DEG = 72f
     private const val ANNULUS_MAX_ALT_DEG = 78f
@@ -44,8 +45,6 @@ object ZenithTopFaceRefiner {
         val angleBins: Int,
         val radialBins: Int
     )
-    private const val MAX_ECC_TRANSLATION_RATIO = 0.02f
-    private const val MIN_ECC_SCORE_TO_USE_TRANSLATION = 0.30
 
     private const val BLEND_FEATHER_START_ALT_DEG = 82f
     private const val BLEND_FEATHER_FULL_ALT_DEG = 89f
@@ -57,7 +56,6 @@ object ZenithTopFaceRefiner {
 
     private const val POLAR_CAP_FILL_MIN_ALT_DEG = 86f
     private const val POLAR_CAP_NEAREST_RADIUS_PX = 4
-    private const val POLAR_CAP_FILL_WEIGHT = 2.0f
     private const val MIN_ECC_ACCEPT_SCORE = 0.12
     private const val STRONG_ECC_ACCEPT_SCORE = 0.20
     private const val MAX_ECC_ROT_IF_WEAK_SCORE_DEG = 3.0f
@@ -243,15 +241,6 @@ object ZenithTopFaceRefiner {
         val yawRad = degToRad(yawDeg)
         val pitchRad = degToRad(pitchDeg)
         val rollRad = degToRad(-rollDeg)
-        Log.d(
-            "AtlasZenithSeed",
-            "frame=${frame.frameId} " +
-                    "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
-                    "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
-                    "yawSeed=${"%.2f".format(yawDeg)} " +
-                    "pitchSeed=${"%.2f".format(pitchDeg)} " +
-                    "rollSeed=${"%.2f".format(rollDeg)}"
-        )
         val forward = worldDirectionRad(yawRad, pitchRad)
 
         var right0 = cross(forward, floatArrayOf(0f, 0f, 1f))
@@ -440,6 +429,7 @@ object ZenithTopFaceRefiner {
 
         val eccRotUsedDeg = if (acceptEccRotation) eccRotRawDeg else 0f
 
+        // Zenith translation disabled on purpose: only residual rotation is allowed.
         val txUsed = 0f
         val tyUsed = 0f
 
@@ -725,7 +715,6 @@ object ZenithTopFaceRefiner {
         if (frameWeight <= 0f) return
 
         val topPixels = rgbaMatToArgb(aligned.rgba)
-        val correctionStrength = computeColorCorrectionStrength(colorCorrection)
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
         var candidateCount = 0
@@ -757,17 +746,11 @@ object ZenithTopFaceRefiner {
                     continue
                 }
 
-                val correctionStrength = computeColorCorrectionStrength(colorCorrection)
-
-                val gainR = 1f
-                val gainG = 1f
-                val gainB = 1f
-
                 val corrected = applyRgbGain(
                     sampled.color,
-                    gainR,
-                    gainG,
-                    gainB
+                    1f,
+                    1f,
+                    1f
                 )
 
                 atlas.blendPixel(x, y, corrected, frameWeight)
@@ -1023,20 +1006,7 @@ object ZenithTopFaceRefiner {
 
         return 1f + (gain - 1f) * effectiveT
     }
-    private fun colorLuma(color: Int): Float {
-        val r = Color.red(color).toFloat()
-        val g = Color.green(color).toFloat()
-        val b = Color.blue(color).toFloat()
-        return 0.299f * r + 0.587f * g + 0.114f * b
-    }
 
-    private fun applyLumaGain(color: Int, gain: Float): Int {
-        val a = Color.alpha(color)
-        val r = (Color.red(color) * gain).roundToInt().coerceIn(0, 255)
-        val g = (Color.green(color) * gain).roundToInt().coerceIn(0, 255)
-        val b = (Color.blue(color) * gain).roundToInt().coerceIn(0, 255)
-        return Color.argb(a, r, g, b)
-    }
 
 
     fun releaseTopFace(face: TopFace) {
