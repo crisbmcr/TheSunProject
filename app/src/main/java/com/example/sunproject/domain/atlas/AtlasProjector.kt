@@ -559,23 +559,21 @@ object AtlasProjector {
 
         try {
             var best: ZenithPoseEstimate? = null
-            val allCandidates = ArrayList<ZenithPoseEstimate>(ZENITH_ESTIMATE_MAX_CANDIDATES + 8)
-
+            val allCandidates = mutableListOf<ZenithPoseEstimate>()
             val visited = HashSet<String>()
             var evaluatedCount = 0
             var stoppedByBudget = false
-
-            fun outOfBudget(): Boolean {
-                return evaluatedCount >= ZENITH_ESTIMATE_MAX_CANDIDATES ||
-                        SystemClock.elapsedRealtime() >= deadlineAt
-            }
 
             fun considerCandidate(
                 twistDeg: Float,
                 pitchOffsetDeg: Float,
                 rollOffsetDeg: Float
             ) {
-                if (outOfBudget()) {
+                if (stoppedByBudget) return
+
+                if (SystemClock.elapsedRealtime() >= deadlineAt ||
+                    evaluatedCount >= ZENITH_ESTIMATE_MAX_CANDIDATES
+                ) {
                     stoppedByBudget = true
                     return
                 }
@@ -623,54 +621,6 @@ object AtlasProjector {
                 }
             }
 
-            val coarsePitchOffsets = floatArrayOf(-4f, -2f, 0f, 2f, 4f)
-            val coarseRollOffsets = floatArrayOf(-6f, -3f, 0f, 3f, 6f)
-
-            loop@ for (twist in 0 until 360 step 30) {
-                for (pitchOffset in coarsePitchOffsets) {
-                    for (rollOffset in coarseRollOffsets) {
-                        considerCandidate(
-                            twistDeg = twist.toFloat(),
-                            pitchOffsetDeg = pitchOffset,
-                            rollOffsetDeg = rollOffset
-                        )
-                        if (stoppedByBudget) break@loop
-                    }
-                }
-            }
-
-            val coarseBest = best ?: ZenithPoseEstimate(
-                twistDeg = ZENITH_TWIST_FALLBACK_DEG,
-                pitchOffsetDeg = ZENITH_PITCH_OFFSET_FALLBACK_DEG,
-                rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG,
-                score = Float.NEGATIVE_INFINITY,
-                comparedPixels = 0,
-                confidence = 0f
-            )
-
-            if (!stoppedByBudget) {
-                var twistMid = coarseBest.twistDeg - 15f
-                loop@ while (twistMid <= coarseBest.twistDeg + 15f + 1e-3f) {
-                    var pitchMid = coarseBest.pitchOffsetDeg - 2f
-                    while (pitchMid <= coarseBest.pitchOffsetDeg + 2f + 1e-3f) {
-                        var rollMid = coarseBest.rollOffsetDeg - 3f
-                        while (rollMid <= coarseBest.rollOffsetDeg + 3f + 1e-3f) {
-                            considerCandidate(
-                                twistDeg = twistMid,
-                                pitchOffsetDeg = pitchMid,
-                                rollOffsetDeg = rollMid
-                            )
-                            if (stoppedByBudget) break@loop
-                            rollMid += 1.5f
-                        }
-                        pitchMid += 1f
-                    }
-                    twistMid += 3f
-                }
-            }
-
-            val finalBest = best ?: coarseBest
-
             val fallbackCandidate = evaluateZenithPoseCandidate(
                 frame = frame,
                 src = estimationSrc,
@@ -681,18 +631,87 @@ object AtlasProjector {
                 rollOffsetDeg = ZENITH_ROLL_OFFSET_FALLBACK_DEG
             )
 
+            // Stage 1: coarse pitch/roll with fixed fallback twist.
+            val stage1PitchOffsets = floatArrayOf(-4f, 0f, 4f)
+            val stage1RollOffsets = floatArrayOf(-6f, -3f, 0f, 3f, 6f)
+
+            loop@ for (pitchOffset in stage1PitchOffsets) {
+                for (rollOffset in stage1RollOffsets) {
+                    considerCandidate(
+                        twistDeg = ZENITH_TWIST_FALLBACK_DEG,
+                        pitchOffsetDeg = pitchOffset,
+                        rollOffsetDeg = rollOffset
+                    )
+                    if (stoppedByBudget) break@loop
+                }
+            }
+
+            val stage1Best = best ?: fallbackCandidate
+
+            Log.d(
+                "AtlasZenithPoseStage1",
+                "frame=${frame.frameId} " +
+                        "pitchOffset=${"%.2f".format(stage1Best.pitchOffsetDeg)} " +
+                        "rollOffset=${"%.2f".format(stage1Best.rollOffsetDeg)} " +
+                        "score=${"%.4f".format(stage1Best.score)} " +
+                        "evaluated=$evaluatedCount stoppedByBudget=$stoppedByBudget"
+            )
+
+            // Stage 2: twist sweep on the best coarse pitch/roll.
+            if (!stoppedByBudget) {
+                var twist = 0f
+                while (twist < 360f - 1e-3f) {
+                    considerCandidate(
+                        twistDeg = twist,
+                        pitchOffsetDeg = stage1Best.pitchOffsetDeg,
+                        rollOffsetDeg = stage1Best.rollOffsetDeg
+                    )
+                    if (stoppedByBudget) break
+                    twist += 30f
+                }
+            }
+
+            val stage2Best = best ?: stage1Best
+
+            Log.d(
+                "AtlasZenithPoseStage2",
+                "frame=${frame.frameId} " +
+                        "twist=${"%.2f".format(stage2Best.twistDeg)} " +
+                        "pitchOffset=${"%.2f".format(stage2Best.pitchOffsetDeg)} " +
+                        "rollOffset=${"%.2f".format(stage2Best.rollOffsetDeg)} " +
+                        "score=${"%.4f".format(stage2Best.score)} " +
+                        "evaluated=$evaluatedCount stoppedByBudget=$stoppedByBudget"
+            )
+
+            // Stage 3: small local refinement around the current best.
+            val finalBest = if (!stoppedByBudget) {
+                refineZenithPoseLocally(
+                    seed = stage2Best,
+                    considerCandidate = { twistDeg, pitchOffsetDeg, rollOffsetDeg ->
+                        considerCandidate(
+                            twistDeg = twistDeg,
+                            pitchOffsetDeg = pitchOffsetDeg,
+                            rollOffsetDeg = rollOffsetDeg
+                        )
+                    },
+                    currentBestProvider = { best },
+                    stopRequested = { stoppedByBudget }
+                )
+            } else {
+                stage2Best
+            }
+
             val distinctRunnerUpScore = allCandidates
                 .asSequence()
                 .filter { isDistinctZenithPoseCandidate(it, finalBest) }
                 .maxOfOrNull { it.score }
                 ?: Float.NEGATIVE_INFINITY
 
-            val confidence =
-                if (distinctRunnerUpScore.isFinite()) {
-                    finalBest.score - distinctRunnerUpScore
-                } else {
-                    0f
-                }
+            val confidence = if (distinctRunnerUpScore.isFinite()) {
+                finalBest.score - distinctRunnerUpScore
+            } else {
+                0f
+            }
 
             val improvementOverFallback = finalBest.score - fallbackCandidate.score
 
@@ -700,16 +719,19 @@ object AtlasProjector {
             val lowScore = !finalBest.score.isFinite() || finalBest.score < ZENITH_ESTIMATE_MIN_SCORE
             val lowConfidence = confidence < ZENITH_ESTIMATE_MIN_CONFIDENCE
 
-            val acceptByAbsoluteGate = !lowPixels && !lowScore && !lowConfidence
-
             val softLowScore =
                 !finalBest.score.isFinite() || finalBest.score < ZENITH_ESTIMATE_SOFT_MIN_SCORE
             val softBeatsFallback =
                 improvementOverFallback >= ZENITH_ESTIMATE_SOFT_MIN_IMPROVEMENT_OVER_FALLBACK
-            val acceptBySoftGate = !lowPixels && !softLowScore && softBeatsFallback
 
+            val onSearchEdge = isZenithPoseOnSearchEdge(finalBest)
+            val edgeBlocked = onSearchEdge && stoppedByBudget
+
+            val acceptByAbsoluteGate = !lowPixels && !lowScore && !lowConfidence && !edgeBlocked
+            val acceptBySoftGate = !lowPixels && !softLowScore && softBeatsFallback && !edgeBlocked
             val acceptByRelativeGain = !lowPixels &&
-                    improvementOverFallback >= ZENITH_ESTIMATE_MIN_IMPROVEMENT_OVER_FALLBACK
+                    improvementOverFallback >= ZENITH_ESTIMATE_MIN_IMPROVEMENT_OVER_FALLBACK &&
+                    !edgeBlocked
 
             Log.d(
                 "AtlasZenithPoseSummary",
@@ -723,21 +745,44 @@ object AtlasProjector {
                         "improvement=${"%.4f".format(improvementOverFallback)} " +
                         "pixels=${finalBest.comparedPixels} " +
                         "confidence=${"%.4f".format(confidence)} " +
+                        "onSearchEdge=$onSearchEdge edgeBlocked=$edgeBlocked " +
                         "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence " +
                         "acceptAbs=$acceptByAbsoluteGate acceptSoft=$acceptBySoftGate " +
                         "acceptRel=$acceptByRelativeGain"
             )
 
             if (acceptByAbsoluteGate || acceptBySoftGate || acceptByRelativeGain) {
-                return ZenithPoseEstimate(
-                    twistDeg = finalBest.twistDeg,
-                    pitchOffsetDeg = finalBest.pitchOffsetDeg,
-                    rollOffsetDeg = finalBest.rollOffsetDeg,
-                    score = finalBest.score,
-                    comparedPixels = finalBest.comparedPixels,
-                    confidence = confidence
+                Log.d(
+                    "AtlasZenithPose",
+                    "accept frame=${frame.frameId} " +
+                            "twist=${"%.2f".format(finalBest.twistDeg)} " +
+                            "pitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
+                            "rollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
+                            "score=${"%.4f".format(finalBest.score)} " +
+                            "fallbackScore=${"%.4f".format(fallbackCandidate.score)} " +
+                            "improvement=${"%.4f".format(improvementOverFallback)} " +
+                            "confidence=${"%.4f".format(confidence)} " +
+                            "acceptByAbsoluteGate=$acceptByAbsoluteGate " +
+                            "acceptBySoftGate=$acceptBySoftGate " +
+                            "acceptByRelativeGain=$acceptByRelativeGain"
                 )
+                return finalBest.copy(confidence = confidence)
             }
+
+            Log.w(
+                "AtlasZenithPose",
+                "fallback frame=${frame.frameId} " +
+                        "bestTwist=${"%.2f".format(finalBest.twistDeg)} " +
+                        "bestPitchOffset=${"%.2f".format(finalBest.pitchOffsetDeg)} " +
+                        "bestRollOffset=${"%.2f".format(finalBest.rollOffsetDeg)} " +
+                        "score=${"%.4f".format(finalBest.score)} " +
+                        "fallbackScore=${"%.4f".format(fallbackCandidate.score)} " +
+                        "improvement=${"%.4f".format(improvementOverFallback)} " +
+                        "pixels=${finalBest.comparedPixels} " +
+                        "confidence=${"%.4f".format(confidence)} " +
+                        "onSearchEdge=$onSearchEdge edgeBlocked=$edgeBlocked " +
+                        "lowPixels=$lowPixels lowScore=$lowScore lowConfidence=$lowConfidence"
+            )
 
             return ZenithPoseEstimate(
                 twistDeg = ZENITH_TWIST_FALLBACK_DEG,
@@ -752,6 +797,60 @@ object AtlasProjector {
                 estimationSrc.recycle()
             }
         }
+    }
+
+    private fun refineZenithPoseLocally(
+        seed: ZenithPoseEstimate,
+        considerCandidate: (Float, Float, Float) -> Unit,
+        currentBestProvider: () -> ZenithPoseEstimate?,
+        stopRequested: () -> Boolean
+    ): ZenithPoseEstimate {
+        var current = seed
+
+        val stepSchedule = listOf(
+            Triple(6f, 1f, 1.5f),
+            Triple(3f, 0.5f, 0.75f)
+        )
+
+        for ((twistStep, pitchStep, rollStep) in stepSchedule) {
+            if (stopRequested()) break
+
+            val anchor = currentBestProvider() ?: current
+
+            val neighborhood = listOf(
+                Triple(anchor.twistDeg - twistStep, anchor.pitchOffsetDeg, anchor.rollOffsetDeg),
+                Triple(anchor.twistDeg + twistStep, anchor.pitchOffsetDeg, anchor.rollOffsetDeg),
+                Triple(anchor.twistDeg, anchor.pitchOffsetDeg - pitchStep, anchor.rollOffsetDeg),
+                Triple(anchor.twistDeg, anchor.pitchOffsetDeg + pitchStep, anchor.rollOffsetDeg),
+                Triple(anchor.twistDeg, anchor.pitchOffsetDeg, anchor.rollOffsetDeg - rollStep),
+                Triple(anchor.twistDeg, anchor.pitchOffsetDeg, anchor.rollOffsetDeg + rollStep)
+            )
+
+            for ((twistDeg, pitchOffsetDeg, rollOffsetDeg) in neighborhood) {
+                considerCandidate(twistDeg, pitchOffsetDeg, rollOffsetDeg)
+                if (stopRequested()) {
+                    return currentBestProvider() ?: anchor
+                }
+            }
+
+            current = currentBestProvider() ?: anchor
+        }
+
+        return currentBestProvider() ?: current
+    }
+
+    private fun isZenithPoseOnSearchEdge(candidate: ZenithPoseEstimate): Boolean {
+        val eps = 1e-3f
+
+        val pitchAtEdge =
+            abs(candidate.pitchOffsetDeg - ZENITH_PITCH_OFFSET_MIN_DEG) <= eps ||
+                    abs(candidate.pitchOffsetDeg - ZENITH_PITCH_OFFSET_MAX_DEG) <= eps
+
+        val rollAtEdge =
+            abs(candidate.rollOffsetDeg - ZENITH_ROLL_OFFSET_MIN_DEG) <= eps ||
+                    abs(candidate.rollOffsetDeg - ZENITH_ROLL_OFFSET_MAX_DEG) <= eps
+
+        return pitchAtEdge || rollAtEdge
     }
 
     private fun evaluateZenithPoseCandidate(
