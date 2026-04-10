@@ -210,18 +210,20 @@ object AtlasProjector {
         yawDeg: Float,
         pitchDeg: Float,
         rollDeg: Float,
-        zenithLike: Boolean
+        zenithLike: Boolean,
+        forceHardZenith: Boolean = false
     ): ProjectionBasis {
         val yawRad = Math.toRadians(yawDeg.toDouble()).toFloat()
         val pitchRad = Math.toRadians(pitchDeg.toDouble()).toFloat()
         val rollRad = Math.toRadians(rollDeg.toDouble()).toFloat()
-
         val forward = worldDirectionRad(yawRad, pitchRad)
 
         val right0: FloatArray
         val up0: FloatArray
 
-        if (zenithLike && pitchDeg >= 89.5f) {
+        val useHardZenithBasis = forceHardZenith || (zenithLike && pitchDeg >= 89.5f)
+
+        if (useHardZenithBasis) {
             right0 = normalize(
                 floatArrayOf(
                     cos(yawRad),
@@ -229,7 +231,6 @@ object AtlasProjector {
                     0f
                 )
             )
-
             up0 = normalize(
                 floatArrayOf(
                     -sin(yawRad),
@@ -243,10 +244,7 @@ object AtlasProjector {
                 r = floatArrayOf(1f, 0f, 0f)
             }
             r = normalize(r)
-
-            var u = cross(r, forward)
-            u = normalize(u)
-
+            val u = normalize(cross(r, forward))
             right0 = r
             up0 = u
         }
@@ -386,7 +384,11 @@ object AtlasProjector {
         // La descomposición cambia según la rama que usa projectBitmapToAtlas:
         // - pitch >= 89.5 -> rama zenital especial
         // - pitch < 89.5  -> rama general cercana al zenith
-        val useHardZenithBranch = pitchAbsDeg >= 89.5f
+        val useHardZenithBranch = shouldUseHardZenithBasis(
+            frame = frame,
+            pitchDeg = pitchAbsDeg,
+            zenithLike = true
+        )
 
         val tangentAzDeg = if (useHardZenithBranch) {
             normalizeTwistDeg(
@@ -412,9 +414,9 @@ object AtlasProjector {
             yawDeg = tangentAzDeg,
             pitchDeg = pitchAbsDeg,
             rollDeg = 0f,
-            zenithLike = true
+            zenithLike = true,
+            forceHardZenith = useHardZenithBranch
         )
-
         val zeroRightT = safeNormalizeTangent(zeroRollBasis.right, forward) ?: return null
         val zeroUpT = safeNormalizeTangent(zeroRollBasis.up, forward) ?: return null
 
@@ -437,6 +439,7 @@ object AtlasProjector {
                     "rollResidual=${"%.2f".format(residualRollDeg)} " +
                     "twistOffset=${"%.2f".format(twistOffsetDeg)} " +
                     "pitchOffset=${"%.2f".format(pitchOffsetDeg)} " +
+                    "seedHard=${useHardZenithBranch}" +
                     "rollOffset=${"%.2f".format(rollOffsetDeg)}"
         )
 
@@ -661,12 +664,11 @@ object AtlasProjector {
         val right0: FloatArray
         val up0: FloatArray
 
-        val useHardZenithBasis =
-            zenithLike && (
-                    frame.ringId.equals("Z0", ignoreCase = true) ||
-                            frame.targetPitchDeg >= 88f ||
-                            projectionPitchDeg >= 89.5f
-                    )
+        val useHardZenithBasis = shouldUseHardZenithBasis(
+            frame = frame,
+            pitchDeg = projectionPitchDeg,
+            zenithLike = zenithLike
+        )
 
         if (useHardZenithBasis) {
             right0 = normalize(
@@ -1659,7 +1661,17 @@ object AtlasProjector {
 
         return weight
     }
-
+    private fun shouldUseHardZenithBasis(
+        frame: FrameRecord,
+        pitchDeg: Float,
+        zenithLike: Boolean
+    ): Boolean {
+        return zenithLike && (
+                frame.ringId.equals("Z0", ignoreCase = true) ||
+                        frame.targetPitchDeg >= 88f ||
+                        pitchDeg >= 89.5f
+                )
+    }
     private fun angleDiffDeg(a: Float, b: Float): Float {
         var d = AtlasMath.normalizeAzimuthDeg(a) - AtlasMath.normalizeAzimuthDeg(b)
         if (d > 180f) d -= 360f
