@@ -661,7 +661,14 @@ object AtlasProjector {
         val right0: FloatArray
         val up0: FloatArray
 
-        if (zenithLike && projectionPitchDeg >= 89.5f) {
+        val useHardZenithBasis =
+            zenithLike && (
+                    frame.ringId.equals("Z0", ignoreCase = true) ||
+                            frame.targetPitchDeg >= 88f ||
+                            projectionPitchDeg >= 89.5f
+                    )
+
+        if (useHardZenithBasis) {
             right0 = normalize(
                 floatArrayOf(
                     cos(yawRad),
