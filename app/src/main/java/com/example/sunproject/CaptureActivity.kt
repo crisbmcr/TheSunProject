@@ -71,7 +71,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val rotationMatrix = FloatArray(9)
     private val remappedRotationMatrix = FloatArray(9)
     private val orientationAngles = FloatArray(3)
-    //private var smoothedAngles = FloatArray(3)
+    private val lastAbsRotationMatrix = FloatArray(9)
+    private var hasLastAbsRotationMatrix = false
+
     //private val alpha = 0.08f
     //private var isFirstReading = true
     private data class Vec3(var x: Float, var y: Float, var z: Float)
@@ -160,6 +162,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val azimuthDeg: Float,
         val pitchDeg: Float,
         val rollDeg: Float,
+        val rotationM00: Float?,
+        val rotationM01: Float?,
+        val rotationM02: Float?,
+        val rotationM10: Float?,
+        val rotationM11: Float?,
+        val rotationM12: Float?,
+        val rotationM20: Float?,
+        val rotationM21: Float?,
+        val rotationM22: Float?,
         val capturedAtUtcMs: Long
     )
 
@@ -339,6 +350,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             }
 
             Sensor.TYPE_ROTATION_VECTOR -> {
+                updateLastAbsRotationMatrix(event.values)
                 val raw = extractAnglesFromRotationVector(event.values)
 
                 val rawAz = applyDeclination(raw[0])
@@ -639,6 +651,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             azimuthDeg = displayAzimuth,
             pitchDeg = displayPitchDeg,
             rollDeg = displayRollDeg,
+            rotationM00 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[0] else null,
+            rotationM01 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[1] else null,
+            rotationM02 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[2] else null,
+            rotationM10 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[3] else null,
+            rotationM11 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[4] else null,
+            rotationM12 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[5] else null,
+            rotationM20 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[6] else null,
+            rotationM21 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[7] else null,
+            rotationM22 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[8] else null,
             capturedAtUtcMs = System.currentTimeMillis()
         )
 
@@ -978,6 +999,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             measuredAzimuthDeg = pose.azimuthDeg,
             measuredPitchDeg = pose.pitchDeg,
             measuredRollDeg = pose.rollDeg,
+            rotationM00 = pose.rotationM00,
+            rotationM01 = pose.rotationM01,
+            rotationM02 = pose.rotationM02,
+            rotationM10 = pose.rotationM10,
+            rotationM11 = pose.rotationM11,
+            rotationM12 = pose.rotationM12,
+            rotationM20 = pose.rotationM20,
+            rotationM21 = pose.rotationM21,
+            rotationM22 = pose.rotationM22,
             latitudeDeg = loc?.latitude,
             longitudeDeg = loc?.longitude,
             altitudeM = loc?.altitude,
@@ -1326,7 +1356,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         )
         return floatArrayOf(azimuth, pitch, roll)
     }
-
+    private fun updateLastAbsRotationMatrix(rotationVectorValues: FloatArray) {
+        val rawR = FloatArray(9)
+        SensorManager.getRotationMatrixFromVector(rawR, rotationVectorValues)
+        System.arraycopy(rawR, 0, lastAbsRotationMatrix, 0, 9)
+        hasLastAbsRotationMatrix = true
+    }
     private fun applyDeclination(azimuthDeg: Float): Float {
         var out = azimuthDeg
         lastLocation?.let {

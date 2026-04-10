@@ -14,6 +14,8 @@ import android.util.Log
 import android.graphics.Color
 import android.os.SystemClock
 import com.example.sunproject.domain.atlas.ZenithTopFaceRefiner
+import kotlin.math.atan2
+import kotlin.math.asin
 
 private const val ZENITH_TWIST_FALLBACK_DEG = 90f
 private const val ZENITH_PITCH_OFFSET_FALLBACK_DEG = 0f
@@ -83,7 +85,18 @@ data class ZenithPoseEstimate(
     val comparedPixels: Int,
     val confidence: Float
 )
+private data class ProjectionBasis(
+    val forward: FloatArray,
+    val right: FloatArray,
+    val up: FloatArray
+)
 
+private data class CameraMountBasis(
+    val forwardInDevice: FloatArray,
+    val rightInDevice: FloatArray,
+    val upInDevice: FloatArray,
+    val sampleCount: Int
+)
 
 object AtlasProjector {
 
@@ -159,12 +172,218 @@ object AtlasProjector {
             src.recycle()
         }
     }
+    private fun storedDeviceToWorldMatrix(frame: FrameRecord): FloatArray? {
+        val m00 = frame.rotationM00 ?: return null
+        val m01 = frame.rotationM01 ?: return null
+        val m02 = frame.rotationM02 ?: return null
+        val m10 = frame.rotationM10 ?: return null
+        val m11 = frame.rotationM11 ?: return null
+        val m12 = frame.rotationM12 ?: return null
+        val m20 = frame.rotationM20 ?: return null
+        val m21 = frame.rotationM21 ?: return null
+        val m22 = frame.rotationM22 ?: return null
 
+        return floatArrayOf(
+            m00, m01, m02,
+            m10, m11, m12,
+            m20, m21, m22
+        )
+    }
+
+    private fun transpose3x3(m: FloatArray): FloatArray {
+        return floatArrayOf(
+            m[0], m[3], m[6],
+            m[1], m[4], m[7],
+            m[2], m[5], m[8]
+        )
+    }
+
+    private fun mulMat3Vec(m: FloatArray, v: FloatArray): FloatArray {
+        return floatArrayOf(
+            m[0] * v[0] + m[1] * v[1] + m[2] * v[2],
+            m[3] * v[0] + m[4] * v[1] + m[5] * v[2],
+            m[6] * v[0] + m[7] * v[1] + m[8] * v[2]
+        )
+    }
+
+    private fun buildProjectionBasisFromAngles(
+        yawDeg: Float,
+        pitchDeg: Float,
+        rollDeg: Float,
+        zenithLike: Boolean
+    ): ProjectionBasis {
+        val yawRad = Math.toRadians(yawDeg.toDouble()).toFloat()
+        val pitchRad = Math.toRadians(pitchDeg.toDouble()).toFloat()
+        val rollRad = Math.toRadians(rollDeg.toDouble()).toFloat()
+
+        val forward = worldDirectionRad(yawRad, pitchRad)
+
+        val right0: FloatArray
+        val up0: FloatArray
+
+        if (zenithLike && pitchDeg >= 89.5f) {
+            right0 = normalize(
+                floatArrayOf(
+                    cos(yawRad),
+                    sin(yawRad),
+                    0f
+                )
+            )
+
+            up0 = normalize(
+                floatArrayOf(
+                    -sin(yawRad),
+                    cos(yawRad),
+                    0f
+                )
+            )
+        } else {
+            var r = cross(forward, floatArrayOf(0f, 0f, 1f))
+            if (length(r) < 1e-4f) {
+                r = floatArrayOf(1f, 0f, 0f)
+            }
+            r = normalize(r)
+
+            var u = cross(r, forward)
+            u = normalize(u)
+
+            right0 = r
+            up0 = u
+        }
+
+        val cosR = cos(rollRad)
+        val sinR = sin(rollRad)
+
+        val right = normalize(add(scale(right0, cosR), scale(up0, sinR)))
+        val up = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
+
+        return ProjectionBasis(
+            forward = forward,
+            right = right,
+            up = up
+        )
+    }
+
+    private fun estimateCameraMountBasis(frames: List<FrameRecord>): CameraMountBasis? {
+        var count = 0
+
+        var sumForwardDev = floatArrayOf(0f, 0f, 0f)
+        var sumRightDev = floatArrayOf(0f, 0f, 0f)
+        var sumUpDev = floatArrayOf(0f, 0f, 0f)
+
+        frames.forEach { frame ->
+            if (isZenithFrame(frame)) return@forEach
+            val rWorldDevice = storedDeviceToWorldMatrix(frame) ?: return@forEach
+            val rDeviceWorld = transpose3x3(rWorldDevice)
+
+            val eulerBasis = buildProjectionBasisFromAngles(
+                yawDeg = frame.measuredAzimuthDeg,
+                pitchDeg = frame.measuredPitchDeg,
+                rollDeg = frame.measuredRollDeg,
+                zenithLike = false
+            )
+
+            val forwardDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.forward))
+            val rightDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.right))
+            val upDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.up))
+
+            sumForwardDev = add(sumForwardDev, forwardDev)
+            sumRightDev = add(sumRightDev, rightDev)
+            sumUpDev = add(sumUpDev, upDev)
+            count++
+        }
+
+        if (count < 3) {
+            Log.w("AtlasMatrixMount", "insufficientSamples=$count")
+            return null
+        }
+
+        var forward = normalize(sumForwardDev)
+        var right = add(sumRightDev, scale(forward, -dot(sumRightDev, forward)))
+        if (length(right) < 1e-4f) {
+            right = floatArrayOf(1f, 0f, 0f)
+        }
+        right = normalize(right)
+
+        var up = normalize(cross(forward, right))
+        if (dot(up, sumUpDev) < 0f) {
+            up = scale(up, -1f)
+            right = scale(right, -1f)
+        }
+
+        Log.d(
+            "AtlasMatrixMount",
+            "samples=$count " +
+                    "forwardDev=${forward.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }} " +
+                    "rightDev=${right.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }} " +
+                    "upDev=${up.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }}"
+        )
+
+        return CameraMountBasis(
+            forwardInDevice = forward,
+            rightInDevice = right,
+            upInDevice = up,
+            sampleCount = count
+        )
+    }
+
+    private fun deriveZenithPoseSeedFromStoredRotation(
+        frame: FrameRecord,
+        mount: CameraMountBasis
+    ): ZenithPoseEstimate? {
+        val rWorldDevice = storedDeviceToWorldMatrix(frame) ?: return null
+
+        val forward = normalize(mulMat3Vec(rWorldDevice, mount.forwardInDevice))
+        val right = normalize(mulMat3Vec(rWorldDevice, mount.rightInDevice))
+        val up = normalize(mulMat3Vec(rWorldDevice, mount.upInDevice))
+
+        val yawDeg = normalizeTwistDeg(
+            Math.toDegrees(atan2(forward[1].toDouble(), forward[0].toDouble())).toFloat()
+        )
+        val pitchDeg = Math.toDegrees(
+            asin(forward[2].coerceIn(-1f, 1f).toDouble())
+        ).toFloat()
+
+        val zeroRollBasis = buildProjectionBasisFromAngles(
+            yawDeg = yawDeg,
+            pitchDeg = pitchDeg,
+            rollDeg = 0f,
+            zenithLike = pitchDeg >= 89.5f
+        )
+
+        val cosR = dot(right, zeroRollBasis.right).coerceIn(-1f, 1f)
+        val sinR = dot(right, zeroRollBasis.up).coerceIn(-1f, 1f)
+        val absoluteRollDeg = Math.toDegrees(atan2(sinR.toDouble(), cosR.toDouble())).toFloat()
+
+        val twistOffsetDeg = normalizeTwistDeg(yawDeg - frame.measuredAzimuthDeg)
+        val pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchDeg - frame.measuredPitchDeg)
+        val rollOffsetDeg = clampZenithRollOffsetDeg(absoluteRollDeg - frame.measuredRollDeg)
+
+        Log.d(
+            "AtlasZenithMatrixSeed",
+            "frame=${frame.frameId} " +
+                    "yawAbs=${"%.2f".format(yawDeg)} " +
+                    "pitchAbs=${"%.2f".format(pitchDeg)} " +
+                    "rollAbs=${"%.2f".format(absoluteRollDeg)} " +
+                    "twistOffset=${"%.2f".format(twistOffsetDeg)} " +
+                    "pitchOffset=${"%.2f".format(pitchOffsetDeg)} " +
+                    "rollOffset=${"%.2f".format(rollOffsetDeg)}"
+        )
+
+        return ZenithPoseEstimate(
+            twistDeg = twistOffsetDeg,
+            pitchOffsetDeg = pitchOffsetDeg,
+            rollOffsetDeg = rollOffsetDeg,
+            score = Float.POSITIVE_INFINITY,
+            comparedPixels = 0,
+            confidence = 1f
+        )
+    }
     fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
         val ordered = frames.sortedBy { it.shotIndex }
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
         val zenithFrames = ordered.filter { isZenithFrame(it) }
-
+        val cameraMountBasis = estimateCameraMountBasis(nonZenithFrames)
         nonZenithFrames.forEach { frame ->
             val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
                 Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
@@ -206,16 +425,19 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val zenithPose = estimateZenithPoseDeg(
-                    frame = frame,
-                    src = src,
-                    baseAtlas = atlas,
-                    frameWeight = frameWeight
-                )
+                val zenithPose = cameraMountBasis
+                    ?.let { deriveZenithPoseSeedFromStoredRotation(frame, it) }
+                    ?: estimateZenithPoseDeg(
+                        frame = frame,
+                        src = src,
+                        baseAtlas = atlas,
+                        frameWeight = frameWeight
+                    )
 
                 Log.d(
                     "AtlasZenithPoseSeed",
                     "frame=${frame.frameId} " +
+                            "source=${if (cameraMountBasis != null && storedDeviceToWorldMatrix(frame) != null) "matrix" else "image"} " +
                             "twist=${"%.2f".format(zenithPose.twistDeg)} " +
                             "pitchOffset=${"%.2f".format(zenithPose.pitchOffsetDeg)} " +
                             "rollOffset=${"%.2f".format(zenithPose.rollOffsetDeg)} " +
