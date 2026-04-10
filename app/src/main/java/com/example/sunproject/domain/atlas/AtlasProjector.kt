@@ -327,44 +327,114 @@ object AtlasProjector {
         )
     }
 
-    private fun deriveZenithPoseSeedFromStoredRotation(
+    private fun deriveZenithPoseSeedFromMatrixTangent(
         frame: FrameRecord,
         mount: CameraMountBasis
     ): ZenithPoseEstimate? {
         val rWorldDevice = storedDeviceToWorldMatrix(frame) ?: return null
 
+        fun projectToPlane(v: FloatArray, normal: FloatArray): FloatArray {
+            return add(v, scale(normal, -dot(v, normal)))
+        }
+
+        fun buildLocalTangentBasis(forward: FloatArray): Pair<FloatArray, FloatArray> {
+            val worldNorth = floatArrayOf(0f, 1f, 0f)
+            val worldEast = floatArrayOf(1f, 0f, 0f)
+
+            var northT = projectToPlane(worldNorth, forward)
+            if (length(northT) < 1e-4f) {
+                northT = projectToPlane(worldEast, forward)
+            }
+            northT = normalize(northT)
+
+            var eastT = cross(northT, forward)
+            if (length(eastT) < 1e-4f) {
+                eastT = projectToPlane(worldEast, forward)
+            }
+            eastT = normalize(eastT)
+
+            // Re-ortonormalización
+            northT = normalize(cross(forward, eastT))
+
+            return northT to eastT
+        }
+
+        fun safeNormalizeTangent(v: FloatArray, forward: FloatArray): FloatArray? {
+            val projected = projectToPlane(v, forward)
+            return if (length(projected) < 1e-4f) null else normalize(projected)
+        }
+
         val forward = normalize(mulMat3Vec(rWorldDevice, mount.forwardInDevice))
         val right = normalize(mulMat3Vec(rWorldDevice, mount.rightInDevice))
         val up = normalize(mulMat3Vec(rWorldDevice, mount.upInDevice))
 
-        val yawDeg = normalizeTwistDeg(
-            Math.toDegrees(atan2(forward[1].toDouble(), forward[0].toDouble())).toFloat()
-        )
-        val pitchDeg = Math.toDegrees(
+        val pitchAbsDeg = Math.toDegrees(
             asin(forward[2].coerceIn(-1f, 1f).toDouble())
         ).toFloat()
 
-        val zeroRollBasis = buildProjectionBasisFromAngles(
-            yawDeg = yawDeg,
-            pitchDeg = pitchDeg,
-            rollDeg = 0f,
-            zenithLike = pitchDeg >= 89.5f
+        val (northT, eastT) = buildLocalTangentBasis(forward)
+
+        val rightT = safeNormalizeTangent(right, forward) ?: return null
+        val upT = safeNormalizeTangent(up, forward) ?: return null
+
+        val forwardAzDeg = normalizeTwistDeg(
+            Math.toDegrees(
+                atan2(forward[0].toDouble(), forward[1].toDouble())
+            ).toFloat()
         )
 
-        val cosR = dot(right, zeroRollBasis.right).coerceIn(-1f, 1f)
-        val sinR = dot(right, zeroRollBasis.up).coerceIn(-1f, 1f)
-        val absoluteRollDeg = Math.toDegrees(atan2(sinR.toDouble(), cosR.toDouble())).toFloat()
+        // La descomposición cambia según la rama que usa projectBitmapToAtlas:
+        // - pitch >= 89.5 -> rama zenital especial
+        // - pitch < 89.5  -> rama general cercana al zenith
+        val useHardZenithBranch = pitchAbsDeg >= 89.5f
 
-        val twistOffsetDeg = normalizeTwistDeg(yawDeg - frame.measuredAzimuthDeg)
-        val pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchDeg - frame.measuredPitchDeg)
-        val rollOffsetDeg = clampZenithRollOffsetDeg(absoluteRollDeg - frame.measuredRollDeg)
+        val tangentAzDeg = if (useHardZenithBranch) {
+            normalizeTwistDeg(
+                Math.toDegrees(
+                    atan2(
+                        (-dot(upT, eastT)).toDouble(),
+                        dot(upT, northT).toDouble()
+                    )
+                ).toFloat()
+            )
+        } else {
+            normalizeTwistDeg(
+                Math.toDegrees(
+                    atan2(
+                        (-dot(rightT, northT)).toDouble(),
+                        dot(rightT, eastT).toDouble()
+                    )
+                ).toFloat()
+            )
+        }
+
+        val zeroRollBasis = buildProjectionBasisFromAngles(
+            yawDeg = tangentAzDeg,
+            pitchDeg = pitchAbsDeg,
+            rollDeg = 0f,
+            zenithLike = true
+        )
+
+        val zeroRightT = safeNormalizeTangent(zeroRollBasis.right, forward) ?: return null
+        val zeroUpT = safeNormalizeTangent(zeroRollBasis.up, forward) ?: return null
+
+        val cosR = dot(rightT, zeroRightT).coerceIn(-1f, 1f)
+        val sinR = dot(rightT, zeroUpT).coerceIn(-1f, 1f)
+        val residualRollDeg = Math.toDegrees(
+            atan2(sinR.toDouble(), cosR.toDouble())
+        ).toFloat()
+
+        val twistOffsetDeg = normalizeTwistDeg(tangentAzDeg - frame.measuredAzimuthDeg)
+        val pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchAbsDeg - frame.measuredPitchDeg)
+        val rollOffsetDeg = clampZenithRollOffsetDeg(residualRollDeg)
 
         Log.d(
             "AtlasZenithMatrixSeed",
             "frame=${frame.frameId} " +
-                    "yawAbs=${"%.2f".format(yawDeg)} " +
-                    "pitchAbs=${"%.2f".format(pitchDeg)} " +
-                    "rollAbs=${"%.2f".format(absoluteRollDeg)} " +
+                    "yawForward=${"%.2f".format(forwardAzDeg)} " +
+                    "yawTangent=${"%.2f".format(tangentAzDeg)} " +
+                    "pitchAbs=${"%.2f".format(pitchAbsDeg)} " +
+                    "rollResidual=${"%.2f".format(residualRollDeg)} " +
                     "twistOffset=${"%.2f".format(twistOffsetDeg)} " +
                     "pitchOffset=${"%.2f".format(pitchOffsetDeg)} " +
                     "rollOffset=${"%.2f".format(rollOffsetDeg)}"
@@ -426,7 +496,7 @@ object AtlasProjector {
                 val frameWeight = qualityWeightForFrame(frame)
 
                 val zenithPose = cameraMountBasis
-                    ?.let { deriveZenithPoseSeedFromStoredRotation(frame, it) }
+                    ?.let { deriveZenithPoseSeedFromMatrixTangent(frame, it) }
                     ?: estimateZenithPoseDeg(
                         frame = frame,
                         src = src,
