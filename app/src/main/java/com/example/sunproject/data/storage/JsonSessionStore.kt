@@ -55,6 +55,11 @@ class JsonSessionStore : SessionRepository {
             .put("measuredAzimuthDeg", frame.measuredAzimuthDeg)
             .put("measuredPitchDeg", frame.measuredPitchDeg)
             .put("measuredRollDeg", frame.measuredRollDeg)
+
+            .put("absAzimuthDeg", frame.absAzimuthDeg)
+            .put("absPitchDeg", frame.absPitchDeg)
+            .put("absRollDeg", frame.absRollDeg)
+
             .put("rotationM00", frame.rotationM00)
             .put("rotationM01", frame.rotationM01)
             .put("rotationM02", frame.rotationM02)
@@ -118,6 +123,11 @@ class JsonSessionStore : SessionRepository {
                 measuredAzimuthDeg = o.getDouble("measuredAzimuthDeg").toFloat(),
                 measuredPitchDeg = o.getDouble("measuredPitchDeg").toFloat(),
                 measuredRollDeg = o.getDouble("measuredRollDeg").toFloat(),
+
+                absAzimuthDeg = o.optFloatOrNull("absAzimuthDeg"),
+                absPitchDeg = o.optFloatOrNull("absPitchDeg"),
+                absRollDeg = o.optFloatOrNull("absRollDeg"),
+
                 rotationM00 = o.optFloatOrNull("rotationM00"),
                 rotationM01 = o.optFloatOrNull("rotationM01"),
                 rotationM02 = o.optFloatOrNull("rotationM02"),

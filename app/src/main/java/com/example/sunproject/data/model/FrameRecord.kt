@@ -7,11 +7,20 @@ data class FrameRecord(
     val shotIndex: Int,
     val originalPath: String,
     val capturedAtUtcMs: Long,
+
     val targetAzimuthDeg: Float,
     val targetPitchDeg: Float,
+
+    // Pose "display" usada por UI/guía/autocaptura
     val measuredAzimuthDeg: Float,
     val measuredPitchDeg: Float,
     val measuredRollDeg: Float,
+
+    // Pose absoluta derivada del mismo TYPE_ROTATION_VECTOR que generó la matriz 3x3
+    val absAzimuthDeg: Float? = null,
+    val absPitchDeg: Float? = null,
+    val absRollDeg: Float? = null,
+
     val rotationM00: Float? = null,
     val rotationM01: Float? = null,
     val rotationM02: Float? = null,
@@ -21,6 +30,7 @@ data class FrameRecord(
     val rotationM20: Float? = null,
     val rotationM21: Float? = null,
     val rotationM22: Float? = null,
+
     val latitudeDeg: Double?,
     val longitudeDeg: Double?,
     val altitudeM: Double?,

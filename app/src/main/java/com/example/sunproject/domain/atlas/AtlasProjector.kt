@@ -261,7 +261,29 @@ object AtlasProjector {
             up = up
         )
     }
+    private fun baseYawDeg(frame: FrameRecord, zenithLike: Boolean): Float {
+        return if (zenithLike) {
+            frame.absAzimuthDeg ?: frame.measuredAzimuthDeg
+        } else {
+            frame.absAzimuthDeg ?: frame.measuredAzimuthDeg
+        }
+    }
 
+    private fun basePitchDeg(frame: FrameRecord, zenithLike: Boolean): Float {
+        return if (zenithLike) {
+            frame.absPitchDeg ?: frame.measuredPitchDeg
+        } else {
+            frame.absPitchDeg ?: frame.measuredPitchDeg
+        }
+    }
+
+    private fun baseRollDeg(frame: FrameRecord, zenithLike: Boolean): Float {
+        return if (zenithLike) {
+            frame.absRollDeg ?: frame.measuredRollDeg
+        } else {
+            frame.absRollDeg ?: frame.measuredRollDeg
+        }
+    }
     private fun estimateCameraMountBasis(frames: List<FrameRecord>): CameraMountBasis? {
         var count = 0
 
@@ -275,9 +297,9 @@ object AtlasProjector {
             val rDeviceWorld = transpose3x3(rWorldDevice)
 
             val eulerBasis = buildProjectionBasisFromAngles(
-                yawDeg = frame.measuredAzimuthDeg,
-                pitchDeg = frame.measuredPitchDeg,
-                rollDeg = frame.measuredRollDeg,
+                yawDeg = baseYawDeg(frame, zenithLike = false),
+                pitchDeg = basePitchDeg(frame, zenithLike = false),
+                rollDeg = baseRollDeg(frame, zenithLike = false),
                 zenithLike = false
             )
 
@@ -426,9 +448,13 @@ object AtlasProjector {
             atan2(sinR.toDouble(), cosR.toDouble())
         ).toFloat()
 
-        val twistOffsetDeg = normalizeTwistDeg(tangentAzDeg - frame.measuredAzimuthDeg)
-        val pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchAbsDeg - frame.measuredPitchDeg)
-        val rollOffsetDeg = clampZenithRollOffsetDeg(residualRollDeg)
+        val baseYawDeg = baseYawDeg(frame, zenithLike = true)
+        val basePitchDeg = basePitchDeg(frame, zenithLike = true)
+        val baseRollDeg = baseRollDeg(frame, zenithLike = true)
+
+        val twistOffsetDeg = normalizeTwistDeg(tangentAzDeg - baseYawDeg)
+        val pitchOffsetDeg = clampZenithPitchOffsetDeg(pitchAbsDeg - basePitchDeg)
+        val rollOffsetDeg = clampZenithRollOffsetDeg(residualRollDeg - baseRollDeg)
 
         Log.d(
             "AtlasZenithMatrixSeed",
@@ -437,12 +463,14 @@ object AtlasProjector {
                     "yawTangent=${"%.2f".format(tangentAzDeg)} " +
                     "pitchAbs=${"%.2f".format(pitchAbsDeg)} " +
                     "rollResidual=${"%.2f".format(residualRollDeg)} " +
+                    "baseYaw=${"%.2f".format(baseYawDeg)} " +
+                    "basePitch=${"%.2f".format(basePitchDeg)} " +
+                    "baseRoll=${"%.2f".format(baseRollDeg)} " +
                     "twistOffset=${"%.2f".format(twistOffsetDeg)} " +
                     "pitchOffset=${"%.2f".format(pitchOffsetDeg)} " +
-                    "seedHard=${useHardZenithBranch}" +
-                    "rollOffset=${"%.2f".format(rollOffsetDeg)}"
+                    "rollOffset=${"%.2f".format(rollOffsetDeg)} " +
+                    "seedHard=$useHardZenithBranch"
         )
-
         return ZenithPoseEstimate(
             twistDeg = twistOffsetDeg,
             pitchOffsetDeg = pitchOffsetDeg,
@@ -608,6 +636,10 @@ object AtlasProjector {
 
         val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
 
+        val poseBaseYawDeg = baseYawDeg(frame, zenithLike)
+        val poseBasePitchDeg = basePitchDeg(frame, zenithLike)
+        val poseBaseRollDeg = baseRollDeg(frame, zenithLike)
+
         val effectiveZenithTwistDeg = zenithTwistDegOverride ?: ZENITH_TWIST_FALLBACK_DEG
         val effectiveZenithPitchOffsetDeg =
             zenithPitchOffsetDegOverride ?: ZENITH_PITCH_OFFSET_FALLBACK_DEG
@@ -615,24 +647,24 @@ object AtlasProjector {
             zenithRollOffsetDegOverride ?: ZENITH_ROLL_OFFSET_FALLBACK_DEG
 
         val projectionAzimuthDeg = if (zenithLike) {
-            frame.measuredAzimuthDeg + effectiveZenithTwistDeg
+            poseBaseYawDeg + effectiveZenithTwistDeg
         } else {
-            frame.measuredAzimuthDeg
+            poseBaseYawDeg
         }
 
         val projectionPitchDeg = if (zenithLike) {
-            (frame.measuredPitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
+            (poseBasePitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
         } else {
-            frame.measuredPitchDeg
+            poseBasePitchDeg
         }
 
         val projectionRollDeg = if (zenithLike) {
-            (frame.measuredRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
+            (poseBaseRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
                 ZENITH_ROLL_OFFSET_MIN_DEG,
                 ZENITH_ROLL_OFFSET_MAX_DEG
             )
         } else {
-            frame.measuredRollDeg
+            poseBaseRollDeg
         }
 
         val yawRad = Math.toRadians(
@@ -647,12 +679,18 @@ object AtlasProjector {
                 "AtlasPose",
                 "frame=${frame.frameId} ring=${frame.ringId} " +
                         "zenithLike=$zenithLike " +
+                        "yawBase=${"%.2f".format(poseBaseYawDeg)} " +
+                        "pitchBase=${"%.2f".format(poseBasePitchDeg)} " +
+                        "rollBase=${"%.2f".format(poseBaseRollDeg)} " +
                         "yawUsed=${"%.2f".format(projectionAzimuthDeg)} " +
                         "yawMeasured=${"%.2f".format(frame.measuredAzimuthDeg)} " +
+                        "yawAbs=${"%.2f".format(frame.absAzimuthDeg ?: Float.NaN)} " +
                         "pitchUsed=${"%.2f".format(projectionPitchDeg)} " +
                         "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
+                        "pitchAbs=${"%.2f".format(frame.absPitchDeg ?: Float.NaN)} " +
                         "rollUsed=${"%.2f".format(projectionRollDeg)} " +
                         "rollMeasured=${"%.2f".format(frame.measuredRollDeg)} " +
+                        "rollAbs=${"%.2f".format(frame.absRollDeg ?: Float.NaN)} " +
                         "twist=${"%.2f".format(effectiveZenithTwistDeg)} " +
                         "pitchOffset=${"%.2f".format(effectiveZenithPitchOffsetDeg)} " +
                         "rollOffset=${"%.2f".format(effectiveZenithRollOffsetDeg)}"

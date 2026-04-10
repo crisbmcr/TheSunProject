@@ -88,6 +88,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var gameRollDeg = 0f
 
     private var absoluteYawDeg = 0f
+    private var absolutePitchDeg = 0f
+    private var absoluteRollDeg = 0f
     private var displayNorthOffsetDeg = 0f
     private var displayOffsetInitialized = false
 
@@ -162,6 +164,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val azimuthDeg: Float,
         val pitchDeg: Float,
         val rollDeg: Float,
+
+        val absAzimuthDeg: Float?,
+        val absPitchDeg: Float?,
+        val absRollDeg: Float?,
+
         val rotationM00: Float?,
         val rotationM01: Float?,
         val rotationM02: Float?,
@@ -171,6 +178,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val rotationM20: Float?,
         val rotationM21: Float?,
         val rotationM22: Float?,
+
         val capturedAtUtcMs: Long
     )
 
@@ -368,6 +376,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 lastRoll = captureAngles[2]
 
                 absoluteYawDeg = lastAzimuth
+                absolutePitchDeg = lastPitch
+                absoluteRollDeg = lastRoll
 
                 if (!displayOffsetInitialized && gameRotationVectorSensor == null) {
                     displayAzimuth = lastAzimuth
@@ -651,6 +661,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             azimuthDeg = displayAzimuth,
             pitchDeg = displayPitchDeg,
             rollDeg = displayRollDeg,
+
+            absAzimuthDeg = if (hasLastAbsRotationMatrix) absoluteYawDeg else null,
+            absPitchDeg = if (hasLastAbsRotationMatrix) absolutePitchDeg else null,
+            absRollDeg = if (hasLastAbsRotationMatrix) absoluteRollDeg else null,
+
             rotationM00 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[0] else null,
             rotationM01 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[1] else null,
             rotationM02 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[2] else null,
@@ -660,6 +675,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             rotationM20 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[6] else null,
             rotationM21 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[7] else null,
             rotationM22 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[8] else null,
+
             capturedAtUtcMs = System.currentTimeMillis()
         )
 
@@ -994,11 +1010,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             shotIndex = shotIndex,
             originalPath = file.absolutePath,
             capturedAtUtcMs = pose.capturedAtUtcMs,
+
             targetAzimuthDeg = target.azimuth,
             targetPitchDeg = target.pitch,
+
             measuredAzimuthDeg = pose.azimuthDeg,
             measuredPitchDeg = pose.pitchDeg,
             measuredRollDeg = pose.rollDeg,
+
+            absAzimuthDeg = pose.absAzimuthDeg,
+            absPitchDeg = pose.absPitchDeg,
+            absRollDeg = pose.absRollDeg,
+
             rotationM00 = pose.rotationM00,
             rotationM01 = pose.rotationM01,
             rotationM02 = pose.rotationM02,
@@ -1008,6 +1031,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             rotationM20 = pose.rotationM20,
             rotationM21 = pose.rotationM21,
             rotationM22 = pose.rotationM22,
+
             latitudeDeg = loc?.latitude,
             longitudeDeg = loc?.longitude,
             altitudeM = loc?.altitude,
