@@ -55,6 +55,15 @@ class JsonSessionStore : SessionRepository {
             .put("measuredAzimuthDeg", frame.measuredAzimuthDeg)
             .put("measuredPitchDeg", frame.measuredPitchDeg)
             .put("measuredRollDeg", frame.measuredRollDeg)
+            .put("rotationM00", frame.rotationM00)
+            .put("rotationM01", frame.rotationM01)
+            .put("rotationM02", frame.rotationM02)
+            .put("rotationM10", frame.rotationM10)
+            .put("rotationM11", frame.rotationM11)
+            .put("rotationM12", frame.rotationM12)
+            .put("rotationM20", frame.rotationM20)
+            .put("rotationM21", frame.rotationM21)
+            .put("rotationM22", frame.rotationM22)
             .put("latitudeDeg", frame.latitudeDeg)
             .put("longitudeDeg", frame.longitudeDeg)
             .put("altitudeM", frame.altitudeM)
@@ -86,10 +95,15 @@ class JsonSessionStore : SessionRepository {
         )
     }
 
+    private fun JSONObject.optFloatOrNull(name: String): Float? =
+        if (has(name) && !isNull(name)) getDouble(name).toFloat() else null
+
     override fun loadFrames(paths: SessionPaths): List<FrameRecord> {
         if (!paths.framesJson.exists()) return emptyList()
+
         val arr = JSONArray(paths.framesJson.readText())
         val out = mutableListOf<FrameRecord>()
+
         for (i in 0 until arr.length()) {
             val o = arr.getJSONObject(i)
             out += FrameRecord(
@@ -104,6 +118,15 @@ class JsonSessionStore : SessionRepository {
                 measuredAzimuthDeg = o.getDouble("measuredAzimuthDeg").toFloat(),
                 measuredPitchDeg = o.getDouble("measuredPitchDeg").toFloat(),
                 measuredRollDeg = o.getDouble("measuredRollDeg").toFloat(),
+                rotationM00 = o.optFloatOrNull("rotationM00"),
+                rotationM01 = o.optFloatOrNull("rotationM01"),
+                rotationM02 = o.optFloatOrNull("rotationM02"),
+                rotationM10 = o.optFloatOrNull("rotationM10"),
+                rotationM11 = o.optFloatOrNull("rotationM11"),
+                rotationM12 = o.optFloatOrNull("rotationM12"),
+                rotationM20 = o.optFloatOrNull("rotationM20"),
+                rotationM21 = o.optFloatOrNull("rotationM21"),
+                rotationM22 = o.optFloatOrNull("rotationM22"),
                 latitudeDeg = o.optDouble("latitudeDeg").takeIf { !it.isNaN() },
                 longitudeDeg = o.optDouble("longitudeDeg").takeIf { !it.isNaN() },
                 altitudeM = o.optDouble("altitudeM").takeIf { !it.isNaN() },
