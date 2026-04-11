@@ -64,6 +64,8 @@ object ZenithTopFaceRefiner {
     private const val COLOR_MATCH_NEUTRAL_AT_ALT_DEG = 84f
     private const val MIN_COLOR_CORRECTION_STRENGTH = 0.35f
     private const val COLOR_GAIN_CLAMP_EPS = 0.002f
+    private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = 90f
+
     data class TopFace(
         val rgba: Mat,
         val gray32: Mat,
@@ -238,8 +240,14 @@ object ZenithTopFaceRefiner {
                     absolutePitchDegOverride != null &&
                     absoluteRollDegOverride != null
 
+        val rawAbsoluteYawDeg = if (hasAbsoluteSeed) {
+            absoluteYawDegOverride!!
+        } else {
+            Float.NaN
+        }
+
         val yawDeg = if (hasAbsoluteSeed) {
-            normalizeDeg(absoluteYawDegOverride!!)
+            normalizeDeg(rawAbsoluteYawDeg + ZENITH_TOPFACE_YAW_OFFSET_DEG)
         } else {
             normalizeDeg(frame.measuredAzimuthDeg + baseTwistDeg)
         }
@@ -262,7 +270,8 @@ object ZenithTopFaceRefiner {
                     "source=${if (hasAbsoluteSeed) "absolute" else "legacy"} " +
                     "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
                     "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
-                    "yawSeed=${"%.2f".format(yawDeg)} " +
+                    "rawAbsYaw=${if (hasAbsoluteSeed) "%.2f".format(rawAbsoluteYawDeg) else "NaN"} " +
+                    "topFaceYaw=${"%.2f".format(yawDeg)} " +
                     "pitchSeed=${"%.2f".format(pitchDeg)} " +
                     "rollSeed=${"%.2f".format(rollDeg)}"
         )

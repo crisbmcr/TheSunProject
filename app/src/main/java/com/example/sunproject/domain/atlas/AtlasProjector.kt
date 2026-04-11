@@ -10,12 +10,17 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 import kotlin.math.tan
+import kotlin.math.acos
+
 import android.util.Log
 import android.graphics.Color
 import android.os.SystemClock
 import com.example.sunproject.domain.atlas.ZenithTopFaceRefiner
 import kotlin.math.atan2
 import kotlin.math.asin
+import com.example.sunproject.SunProjectApp
+import com.example.sunproject.data.model.CameraMountCalibration
+import com.example.sunproject.data.storage.CameraMountCalibrationStore
 
 private const val ZENITH_TWIST_FALLBACK_DEG = 90f
 private const val ZENITH_PITCH_OFFSET_FALLBACK_DEG = 0f
@@ -60,6 +65,10 @@ private const val ZENITH_ESTIMATE_DISTINCT_ROLL_DEG = 1.5f
 private const val ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG = 85.5f
 private const val ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_ROLL_DEG = 6.0f
 private const val ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_PITCH_OFFSET_DEG = 4.5f
+
+private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
+private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
+private const val PERSISTED_MOUNT_MAX_FORWARD_TILT_DEG = 4.5f
 
 private const val FRAME_RGB_GAIN_MIN = 0.92f
 private const val FRAME_RGB_GAIN_MAX = 1.08f
@@ -325,6 +334,103 @@ object AtlasProjector {
             legacyPitchOffsetDeg = clampZenithPitchOffsetDeg(projectedPitchAbs - basePitch),
             legacyRollOffsetDeg = clampZenithRollOffsetDeg(rollAbs - baseRoll)
         )
+    }
+
+    private data class SelectedMountBasis(
+        val basis: CameraMountBasis?,
+        val source: String
+    )
+
+    private fun angleBetweenDeg(a: FloatArray, b: FloatArray): Float {
+        val aa = normalize(a)
+        val bb = normalize(b)
+        val c = dot(aa, bb).coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(c.toDouble())).toFloat()
+    }
+
+    private fun mountQualityScore(basis: CameraMountBasis): Float {
+        val idealForward = floatArrayOf(0f, 0f, -1f)
+        val idealRight = floatArrayOf(1f, 0f, 0f)
+        val idealUp = floatArrayOf(0f, -1f, 0f)
+
+        val f = dot(normalize(basis.forwardInDevice), idealForward).coerceIn(-1f, 1f)
+        val r = dot(normalize(basis.rightInDevice), idealRight).coerceIn(-1f, 1f)
+        val u = dot(normalize(basis.upInDevice), idealUp).coerceIn(-1f, 1f)
+
+        return ((f + r + u) / 3f).coerceIn(-1f, 1f)
+    }
+
+    private fun isGoodPersistentMountCandidate(basis: CameraMountBasis): Boolean {
+        val forwardTiltDeg = angleBetweenDeg(
+            basis.forwardInDevice,
+            floatArrayOf(0f, 0f, -1f)
+        )
+        val quality = mountQualityScore(basis)
+
+        return basis.sampleCount >= PERSISTED_MOUNT_MIN_SAMPLE_COUNT &&
+                quality >= PERSISTED_MOUNT_MIN_QUALITY_SCORE &&
+                forwardTiltDeg <= PERSISTED_MOUNT_MAX_FORWARD_TILT_DEG
+    }
+
+    private fun toCameraMountCalibration(basis: CameraMountBasis): CameraMountCalibration {
+        return CameraMountCalibration(
+            forwardInDevice = basis.forwardInDevice.copyOf(),
+            rightInDevice = basis.rightInDevice.copyOf(),
+            upInDevice = basis.upInDevice.copyOf(),
+            sampleCount = basis.sampleCount,
+            qualityScore = mountQualityScore(basis),
+            updatedAtUtcMs = System.currentTimeMillis()
+        )
+    }
+
+    private fun fromCameraMountCalibration(calibration: CameraMountCalibration): CameraMountBasis {
+        return CameraMountBasis(
+            forwardInDevice = calibration.forwardInDevice.copyOf(),
+            rightInDevice = calibration.rightInDevice.copyOf(),
+            upInDevice = calibration.upInDevice.copyOf(),
+            sampleCount = calibration.sampleCount
+        )
+    }
+
+    private fun loadPersistedMountCalibration(): CameraMountBasis? {
+        return try {
+            CameraMountCalibrationStore
+                .load(SunProjectApp.appContext())
+                ?.let(::fromCameraMountCalibration)
+        } catch (t: Throwable) {
+            Log.w("AtlasMatrixMount", "load persisted calibration failed", t)
+            null
+        }
+    }
+
+    private fun savePersistedMountCalibration(basis: CameraMountBasis) {
+        if (!isGoodPersistentMountCandidate(basis)) return
+
+        try {
+            val calibration = toCameraMountCalibration(basis)
+            CameraMountCalibrationStore.save(SunProjectApp.appContext(), calibration)
+            Log.d(
+                "AtlasMatrixMount",
+                "persisted quality=${"%.4f".format(calibration.qualityScore)} " +
+                        "sampleCount=${calibration.sampleCount}"
+            )
+        } catch (t: Throwable) {
+            Log.w("AtlasMatrixMount", "save persisted calibration failed", t)
+        }
+    }
+
+    private fun selectCameraMountBasis(
+        sessionBasis: CameraMountBasis?,
+        persistedBasis: CameraMountBasis?
+    ): SelectedMountBasis {
+        val sessionIsGood = sessionBasis != null && isGoodPersistentMountCandidate(sessionBasis)
+
+        return when {
+            sessionIsGood -> SelectedMountBasis(sessionBasis, "session")
+            persistedBasis != null -> SelectedMountBasis(persistedBasis, "persisted")
+            sessionBasis != null -> SelectedMountBasis(sessionBasis, "session_unstable")
+            else -> SelectedMountBasis(null, "none")
+        }
     }
     private fun transpose3x3(m: FloatArray): FloatArray {
         return floatArrayOf(
@@ -613,7 +719,24 @@ object AtlasProjector {
         val ordered = frames.sortedBy { it.shotIndex }
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
         val zenithFrames = ordered.filter { isZenithFrame(it) }
-        val cameraMountBasis = estimateCameraMountBasis(nonZenithFrames)
+        val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
+        val persistedMountBasis = loadPersistedMountCalibration()
+        val selectedMount = selectCameraMountBasis(
+            sessionBasis = sessionMountBasis,
+            persistedBasis = persistedMountBasis
+        )
+        val cameraMountBasis = selectedMount.basis
+
+        if (sessionMountBasis != null && selectedMount.source == "session") {
+            savePersistedMountCalibration(sessionMountBasis)
+        }
+
+        Log.d(
+            "AtlasMatrixMount",
+            "selectedSource=${selectedMount.source} " +
+                    "hasSession=${sessionMountBasis != null} " +
+                    "hasPersisted=${persistedMountBasis != null}"
+        )
         nonZenithFrames.forEach { frame ->
             val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
                 Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
