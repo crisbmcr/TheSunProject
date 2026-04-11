@@ -211,7 +211,57 @@ object AtlasProjector {
     private fun baseRollDeg(frame: FrameRecord): Float {
         return frame.absRollDeg ?: frame.measuredRollDeg
     }
+    private const val MOUNT_REF_MAX_YAW_ERR_DEG = 10f
+    private const val MOUNT_REF_MAX_PITCH_ERR_DEG = 6f
+    private const val MOUNT_REF_MAX_ABS_ROLL_DEG = 8f
+    private const val MOUNT_REF_MIN_WEIGHT = 0.20f
 
+    private fun angularDeltaDeg(a: Float, b: Float): Float {
+        val d = ((a - b + 540f) % 360f) - 180f
+        return abs(d)
+    }
+
+    private fun projectOntoPlane(v: FloatArray, normal: FloatArray): FloatArray {
+        return add(v, scale(normal, -dot(v, normal)))
+    }
+
+    private fun visualFallbackBaseYawDeg(frame: FrameRecord): Float {
+        return if (isZenithFrame(frame)) {
+            frame.measuredAzimuthDeg
+        } else {
+            baseYawDeg(frame)
+        }
+    }
+
+    private fun visualFallbackBasePitchDeg(frame: FrameRecord): Float {
+        return if (isZenithFrame(frame)) {
+            frame.measuredPitchDeg
+        } else {
+            basePitchDeg(frame)
+        }
+    }
+
+    private fun visualFallbackBaseRollDeg(frame: FrameRecord): Float {
+        return if (isZenithFrame(frame)) {
+            frame.measuredRollDeg
+        } else {
+            baseRollDeg(frame)
+        }
+    }
+
+    private fun mountReferenceWeight(frame: FrameRecord): Float {
+        if (isZenithFrame(frame)) return 0f
+
+        val yawErr = angularDeltaDeg(frame.measuredAzimuthDeg, frame.targetAzimuthDeg)
+        val pitchErr = abs(frame.measuredPitchDeg - frame.targetPitchDeg)
+        val rollMag = abs(frame.measuredRollDeg)
+
+        val yawScore = 1f - (yawErr / MOUNT_REF_MAX_YAW_ERR_DEG).coerceIn(0f, 1f)
+        val pitchScore = 1f - (pitchErr / MOUNT_REF_MAX_PITCH_ERR_DEG).coerceIn(0f, 1f)
+        val rollScore = 1f - (rollMag / MOUNT_REF_MAX_ABS_ROLL_DEG).coerceIn(0f, 1f)
+
+        return (yawScore * pitchScore * rollScore).coerceIn(0f, 1f)
+    }
     private fun buildZenithPoseEstimateFromLegacy(
         frame: FrameRecord,
         twistDeg: Float,
@@ -221,18 +271,22 @@ object AtlasProjector {
         comparedPixels: Int,
         confidence: Float
     ): ZenithPoseEstimate {
-        val baseYaw = baseYawDeg(frame)
-        val basePitch = basePitchDeg(frame)
-        val baseRoll = baseRollDeg(frame)
+        val baseYaw = visualFallbackBaseYawDeg(frame)
+        val basePitch = visualFallbackBasePitchDeg(frame)
+        val baseRoll = visualFallbackBaseRollDeg(frame)
 
         val normTwist = normalizeTwistDeg(twistDeg)
         val normPitch = clampZenithPitchOffsetDeg(pitchOffsetDeg)
         val normRoll = clampZenithRollOffsetDeg(rollOffsetDeg)
 
+        val absoluteYaw = normalizeTwistDeg(baseYaw + normTwist)
+        val absolutePitch = (basePitch + normPitch).coerceIn(84f, 90f)
+        val absoluteRoll = baseRoll + normRoll
+
         return ZenithPoseEstimate(
-            absoluteYawDeg = normalizeTwistDeg(baseYaw + normTwist),
-            absolutePitchDeg = (basePitch + normPitch).coerceIn(84f, 90f),
-            absoluteRollDeg = baseRoll + normRoll,
+            absoluteYawDeg = absoluteYaw,
+            absolutePitchDeg = absolutePitch,
+            absoluteRollDeg = absoluteRoll,
             score = score,
             comparedPixels = comparedPixels,
             confidence = confidence,
@@ -346,6 +400,7 @@ object AtlasProjector {
 
     private fun estimateCameraMountBasis(frames: List<FrameRecord>): CameraMountBasis? {
         var count = 0
+        var weightSum = 0f
 
         var sumForwardDev = floatArrayOf(0f, 0f, 0f)
         var sumRightDev = floatArrayOf(0f, 0f, 0f)
@@ -353,52 +408,61 @@ object AtlasProjector {
 
         frames.forEach { frame ->
             if (isZenithFrame(frame)) return@forEach
+
             val rWorldDevice = storedDeviceToWorldMatrix(frame) ?: return@forEach
             val rDeviceWorld = transpose3x3(rWorldDevice)
 
-            val eulerBasis = buildProjectionBasisFromAngles(
+            val refWeight = mountReferenceWeight(frame)
+            if (refWeight < MOUNT_REF_MIN_WEIGHT) return@forEach
 
-                yawDeg = frame.absAzimuthDeg ?: frame.measuredAzimuthDeg,
-
-                pitchDeg = frame.absPitchDeg ?: frame.measuredPitchDeg,
-
-                rollDeg = frame.absRollDeg ?: frame.measuredRollDeg,
-
+            val referenceBasis = buildProjectionBasisFromAngles(
+                yawDeg = frame.targetAzimuthDeg,
+                pitchDeg = frame.targetPitchDeg,
+                rollDeg = frame.measuredRollDeg.coerceIn(-8f, 8f),
                 zenithLike = false
-
             )
 
-            val forwardDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.forward))
-            val rightDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.right))
-            val upDev = normalize(mulMat3Vec(rDeviceWorld, eulerBasis.up))
+            val forwardDev = normalize(mulMat3Vec(rDeviceWorld, referenceBasis.forward))
+            val rightDev = normalize(mulMat3Vec(rDeviceWorld, referenceBasis.right))
+            val upDev = normalize(mulMat3Vec(rDeviceWorld, referenceBasis.up))
 
-            sumForwardDev = add(sumForwardDev, forwardDev)
-            sumRightDev = add(sumRightDev, rightDev)
-            sumUpDev = add(sumUpDev, upDev)
+            sumForwardDev = add(sumForwardDev, scale(forwardDev, refWeight))
+            sumRightDev = add(sumRightDev, scale(rightDev, refWeight))
+            sumUpDev = add(sumUpDev, scale(upDev, refWeight))
+
+            weightSum += refWeight
             count++
         }
 
-        if (count < 3) {
+        if (count <= 0 || weightSum <= 0f) {
             Log.w("AtlasMatrixMount", "insufficientSamples=$count")
             return null
         }
 
-        var forward = normalize(sumForwardDev)
-        var right = add(sumRightDev, scale(forward, -dot(sumRightDev, forward)))
+        val forward = normalize(sumForwardDev)
+
+        var right = projectOntoPlane(sumRightDev, forward)
         if (length(right) < 1e-4f) {
-            right = floatArrayOf(1f, 0f, 0f)
+            right = cross(sumUpDev, forward)
+        }
+        if (length(right) < 1e-4f) {
+            Log.w("AtlasMatrixMount", "degenerateBasis count=$count weightSum=${"%.3f".format(weightSum)}")
+            return null
         }
         right = normalize(right)
 
-        var up = normalize(cross(forward, right))
-        if (dot(up, sumUpDev) < 0f) {
-            up = scale(up, -1f)
-            right = scale(right, -1f)
+        var up = cross(forward, right)
+        if (length(up) < 1e-4f) {
+            Log.w("AtlasMatrixMount", "degenerateUp count=$count weightSum=${"%.3f".format(weightSum)}")
+            return null
         }
+        up = normalize(up)
+
+        right = normalize(cross(up, forward))
 
         Log.d(
             "AtlasMatrixMount",
-            "samples=$count " +
+            "samples=$count weightSum=${"%.3f".format(weightSum)} " +
                     "forwardDev=${forward.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }} " +
                     "rightDev=${right.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }} " +
                     "upDev=${up.joinToString(prefix = "[", postfix = "]") { "%.3f".format(it) }}"
@@ -629,6 +693,9 @@ object AtlasProjector {
                             "legacyTwist=${"%.2f".format(zenithPose.legacyTwistDeg)} " +
                             "legacyPitchOffset=${"%.2f".format(zenithPose.legacyPitchOffsetDeg)} " +
                             "legacyRollOffset=${"%.2f".format(zenithPose.legacyRollOffsetDeg)} " +
+                            "visualBaseYaw=${"%.2f".format(visualFallbackBaseYawDeg(frame))} " +
+                            "visualBasePitch=${"%.2f".format(visualFallbackBasePitchDeg(frame))} " +
+                            "visualBaseRoll=${"%.2f".format(visualFallbackBaseRollDeg(frame))} " +
                             "score=${"%.5f".format(zenithPose.score)} " +
                             "compared=${zenithPose.comparedPixels} " +
                             "confidence=${"%.3f".format(zenithPose.confidence)}"
@@ -1558,6 +1625,8 @@ object AtlasProjector {
 
         return kotlin.math.abs(gx) + kotlin.math.abs(gy)
     }
+
+
     private fun estimateFrameRgbGain(
         atlas: SkyAtlas,
         frame: FrameRecord,
