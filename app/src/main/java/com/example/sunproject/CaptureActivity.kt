@@ -94,8 +94,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var absolutePitchDeg = 0f
 
     private var absoluteRollDeg = 0f
-    private var absolutePitchDeg = 0f
-    private var absoluteRollDeg = 0f
     private var displayNorthOffsetDeg = 0f
     private var displayOffsetInitialized = false
 
