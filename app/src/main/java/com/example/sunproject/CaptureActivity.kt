@@ -84,10 +84,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var magneticFieldNormUt: Float = 0f
 
     private var gameYawDeg = 0f
+
     private var gamePitchDeg = 0f
+
     private var gameRollDeg = 0f
 
     private var absoluteYawDeg = 0f
+
+    private var absolutePitchDeg = 0f
+
+    private var absoluteRollDeg = 0f
     private var absolutePitchDeg = 0f
     private var absoluteRollDeg = 0f
     private var displayNorthOffsetDeg = 0f
@@ -161,7 +167,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     )
 
     private data class CapturedPose(
+
         val azimuthDeg: Float,
+
         val pitchDeg: Float,
         val rollDeg: Float,
 
@@ -170,13 +178,21 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val absRollDeg: Float?,
 
         val rotationM00: Float?,
+
         val rotationM01: Float?,
+
         val rotationM02: Float?,
+
         val rotationM10: Float?,
+
         val rotationM11: Float?,
+
         val rotationM12: Float?,
+
         val rotationM20: Float?,
+
         val rotationM21: Float?,
+
         val rotationM22: Float?,
 
         val capturedAtUtcMs: Long
@@ -372,7 +388,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 val captureAngles = filterAngles(captureFilter, rawAz, rawPitch, rawRoll, alpha)
 
                 lastAzimuth = captureAngles[0]
+
                 lastPitch = captureAngles[1]
+
                 lastRoll = captureAngles[2]
 
                 absoluteYawDeg = lastAzimuth
@@ -658,8 +676,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val file = File(dir, fileName)
 
         val frozenPose = CapturedPose(
+
             azimuthDeg = displayAzimuth,
+
             pitchDeg = displayPitchDeg,
+
             rollDeg = displayRollDeg,
 
             absAzimuthDeg = if (hasLastAbsRotationMatrix) absoluteYawDeg else null,
@@ -667,13 +688,21 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             absRollDeg = if (hasLastAbsRotationMatrix) absoluteRollDeg else null,
 
             rotationM00 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[0] else null,
+
             rotationM01 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[1] else null,
+
             rotationM02 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[2] else null,
+
             rotationM10 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[3] else null,
+
             rotationM11 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[4] else null,
+
             rotationM12 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[5] else null,
+
             rotationM20 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[6] else null,
+
             rotationM21 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[7] else null,
+
             rotationM22 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[8] else null,
 
             capturedAtUtcMs = System.currentTimeMillis()
@@ -1004,18 +1033,26 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val (imgW, imgH) = readImageSize(file)
 
         val frame = FrameRecord(
-            frameId = file.nameWithoutExtension,
-            sessionId = currentSessionId ?: "unknown_session",
-            ringId = ringIdForTarget(target),
-            shotIndex = shotIndex,
-            originalPath = file.absolutePath,
-            capturedAtUtcMs = pose.capturedAtUtcMs,
 
+            frameId = file.nameWithoutExtension,
+
+            sessionId = currentSessionId ?: "unknown_session",
+
+            ringId = ringIdForTarget(target),
+
+            shotIndex = shotIndex,
+
+            originalPath = file.absolutePath,
+
+            capturedAtUtcMs = pose.capturedAtUtcMs,
             targetAzimuthDeg = target.azimuth,
+
             targetPitchDeg = target.pitch,
 
             measuredAzimuthDeg = pose.azimuthDeg,
+
             measuredPitchDeg = pose.pitchDeg,
+
             measuredRollDeg = pose.rollDeg,
 
             absAzimuthDeg = pose.absAzimuthDeg,
@@ -1023,21 +1060,35 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             absRollDeg = pose.absRollDeg,
 
             rotationM00 = pose.rotationM00,
+
             rotationM01 = pose.rotationM01,
+
             rotationM02 = pose.rotationM02,
+
             rotationM10 = pose.rotationM10,
+
             rotationM11 = pose.rotationM11,
+
             rotationM12 = pose.rotationM12,
+
             rotationM20 = pose.rotationM20,
+
             rotationM21 = pose.rotationM21,
+
             rotationM22 = pose.rotationM22,
 
             latitudeDeg = loc?.latitude,
+
             longitudeDeg = loc?.longitude,
+
             altitudeM = loc?.altitude,
+
             imageWidthPx = imgW,
+
             imageHeightPx = imgH,
+
             hfovDeg = currentHfovDeg,
+
             vfovDeg = currentVfovDeg
         )
 

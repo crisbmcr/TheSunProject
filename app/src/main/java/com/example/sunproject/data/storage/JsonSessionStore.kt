@@ -121,7 +121,9 @@ class JsonSessionStore : SessionRepository {
                 targetAzimuthDeg = o.getDouble("targetAzimuthDeg").toFloat(),
                 targetPitchDeg = o.getDouble("targetPitchDeg").toFloat(),
                 measuredAzimuthDeg = o.getDouble("measuredAzimuthDeg").toFloat(),
+
                 measuredPitchDeg = o.getDouble("measuredPitchDeg").toFloat(),
+
                 measuredRollDeg = o.getDouble("measuredRollDeg").toFloat(),
 
                 absAzimuthDeg = o.optFloatOrNull("absAzimuthDeg"),
