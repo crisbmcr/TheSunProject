@@ -98,7 +98,10 @@ object ZenithTopFaceRefiner {
         frameWeight: Float,
         seedTwistDeg: Float,
         seedPitchOffsetDeg: Float,
-        seedRollOffsetDeg: Float
+        seedRollOffsetDeg: Float,
+        seedAbsoluteYawDeg: Float? = null,
+        seedAbsolutePitchDeg: Float? = null,
+        seedAbsoluteRollDeg: Float? = null
     ): RefinementResult? {
         com.example.sunproject.SunProjectApp.requireOpenCv()
 
@@ -111,6 +114,9 @@ object ZenithTopFaceRefiner {
             baseTwistDeg = seedTwistDeg,
             basePitchOffsetDeg = seedPitchOffsetDeg,
             baseRollOffsetDeg = seedRollOffsetDeg,
+            absoluteYawDegOverride = seedAbsoluteYawDeg,
+            absolutePitchDegOverride = seedAbsolutePitchDeg,
+            absoluteRollDegOverride = seedAbsoluteRollDeg,
             faceSizePx = FACE_SIZE_PX
         )
 
@@ -211,6 +217,9 @@ object ZenithTopFaceRefiner {
         baseTwistDeg: Float,
         basePitchOffsetDeg: Float,
         baseRollOffsetDeg: Float,
+        absoluteYawDegOverride: Float? = null,
+        absolutePitchDegOverride: Float? = null,
+        absoluteRollDegOverride: Float? = null,
         faceSizePx: Int = FACE_SIZE_PX
     ): TopFace {
         val srcW = srcBitmap.width
@@ -224,13 +233,33 @@ object ZenithTopFaceRefiner {
         val tanHalfH = tan(Math.toRadians(hfov * 0.5).toFloat())
         val tanHalfV = tan(Math.toRadians(vfov * 0.5).toFloat())
 
-        val yawDeg = normalizeDeg(frame.measuredAzimuthDeg + baseTwistDeg)
-        val pitchDeg = (frame.measuredPitchDeg + basePitchOffsetDeg).coerceIn(84f, 90f)
-        val rollDeg = frame.measuredRollDeg + baseRollOffsetDeg
+        val hasAbsoluteSeed =
+            absoluteYawDegOverride != null &&
+                    absolutePitchDegOverride != null &&
+                    absoluteRollDegOverride != null
+
+        val yawDeg = if (hasAbsoluteSeed) {
+            normalizeDeg(absoluteYawDegOverride!!)
+        } else {
+            normalizeDeg(frame.measuredAzimuthDeg + baseTwistDeg)
+        }
+
+        val pitchDeg = if (hasAbsoluteSeed) {
+            absolutePitchDegOverride!!.coerceIn(84f, 90f)
+        } else {
+            (frame.measuredPitchDeg + basePitchOffsetDeg).coerceIn(84f, 90f)
+        }
+
+        val rollDeg = if (hasAbsoluteSeed) {
+            absoluteRollDegOverride!!
+        } else {
+            frame.measuredRollDeg + baseRollOffsetDeg
+        }
 
         Log.d(
             "AtlasZenithSeed",
             "frame=${frame.frameId} " +
+                    "source=${if (hasAbsoluteSeed) "absolute" else "legacy"} " +
                     "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
                     "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
                     "yawSeed=${"%.2f".format(yawDeg)} " +
@@ -243,14 +272,39 @@ object ZenithTopFaceRefiner {
         val rollRad = degToRad(-rollDeg)
         val forward = worldDirectionRad(yawRad, pitchRad)
 
-        var right0 = cross(forward, floatArrayOf(0f, 0f, 1f))
-        if (length(right0) < 1e-4f) {
-            right0 = floatArrayOf(cos(yawRad), sin(yawRad), 0f)
-        }
-        right0 = normalize(right0)
+        val useHardZenithBasis =
+            frame.ringId.equals("Z0", ignoreCase = true) ||
+                    frame.targetPitchDeg >= 88f ||
+                    pitchDeg >= 89.5f
 
-        var up0 = cross(right0, forward)
-        up0 = normalize(up0)
+        val right0: FloatArray
+        val up0: FloatArray
+
+        if (useHardZenithBasis) {
+            right0 = normalize(
+                floatArrayOf(
+                    cos(yawRad),
+                    sin(yawRad),
+                    0f
+                )
+            )
+            up0 = normalize(
+                floatArrayOf(
+                    -sin(yawRad),
+                    cos(yawRad),
+                    0f
+                )
+            )
+        } else {
+            var r = cross(forward, floatArrayOf(0f, 0f, 1f))
+            if (length(r) < 1e-4f) {
+                r = floatArrayOf(1f, 0f, 0f)
+            }
+            r = normalize(r)
+            val u = normalize(cross(r, forward))
+            right0 = r
+            up0 = u
+        }
 
         val cosR = cos(rollRad)
         val sinR = sin(rollRad)

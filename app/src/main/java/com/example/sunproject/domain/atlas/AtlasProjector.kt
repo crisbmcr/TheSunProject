@@ -57,6 +57,10 @@ private const val ZENITH_ESTIMATE_DISTINCT_TWIST_DEG = 20f
 private const val ZENITH_ESTIMATE_DISTINCT_PITCH_DEG = 0.75f
 private const val ZENITH_ESTIMATE_DISTINCT_ROLL_DEG = 1.5f
 
+private const val ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG = 85.5f
+private const val ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_ROLL_DEG = 6.0f
+private const val ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_PITCH_OFFSET_DEG = 4.5f
+
 private const val FRAME_RGB_GAIN_MIN = 0.92f
 private const val FRAME_RGB_GAIN_MAX = 1.08f
 private const val FRAME_GAIN_ESTIMATE_X_STEP = 6
@@ -252,18 +256,19 @@ object AtlasProjector {
         val baseRoll = baseRollDeg(frame)
 
         val yawAbs = normalizeTwistDeg(absoluteYawDeg)
-        val pitchAbs = absolutePitchDeg.coerceIn(84f, 90f)
+        val rawPitchAbs = absolutePitchDeg
+        val projectedPitchAbs = rawPitchAbs.coerceIn(84f, 90f)
         val rollAbs = absoluteRollDeg
 
         return ZenithPoseEstimate(
             absoluteYawDeg = yawAbs,
-            absolutePitchDeg = pitchAbs,
+            absolutePitchDeg = rawPitchAbs,
             absoluteRollDeg = rollAbs,
             score = score,
             comparedPixels = comparedPixels,
             confidence = confidence,
             legacyTwistDeg = normalizeTwistDeg(yawAbs - baseYaw),
-            legacyPitchOffsetDeg = clampZenithPitchOffsetDeg(pitchAbs - basePitch),
+            legacyPitchOffsetDeg = clampZenithPitchOffsetDeg(projectedPitchAbs - basePitch),
             legacyRollOffsetDeg = clampZenithRollOffsetDeg(rollAbs - baseRoll)
         )
     }
@@ -505,7 +510,8 @@ object AtlasProjector {
         ).toFloat()
 
         val yawAbsDeg = normalizeTwistDeg(tangentAzDeg)
-        val pitchUsedDeg = pitchAbsDeg.coerceIn(84f, 90f)
+        val rawPitchAbsDeg = pitchAbsDeg
+        val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
         val rollAbsDeg = residualRollDeg
 
         val baseYaw = baseYawDeg(frame)
@@ -517,7 +523,8 @@ object AtlasProjector {
             "frame=${frame.frameId} " +
                     "yawForward=${"%.2f".format(forwardAzDeg)} " +
                     "yawAbs=${"%.2f".format(yawAbsDeg)} " +
-                    "pitchAbs=${"%.2f".format(pitchUsedDeg)} " +
+                    "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
+                    "pitchAbsClamped=${"%.2f".format(pitchUsedDeg)} " +
                     "rollAbs=${"%.2f".format(rollAbsDeg)} " +
                     "baseYaw=${"%.2f".format(baseYaw)} " +
                     "basePitch=${"%.2f".format(basePitch)} " +
@@ -531,7 +538,7 @@ object AtlasProjector {
         return buildZenithPoseEstimateFromAbsolute(
             frame = frame,
             absoluteYawDeg = yawAbsDeg,
-            absolutePitchDeg = pitchUsedDeg,
+            absolutePitchDeg = rawPitchAbsDeg,
             absoluteRollDeg = rollAbsDeg,
             score = Float.POSITIVE_INFINITY,
             comparedPixels = 0,
@@ -584,19 +591,38 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val zenithPose = cameraMountBasis
+                val matrixSeed = cameraMountBasis
                     ?.let { deriveZenithPoseSeedFromMatrixTangent(frame, it) }
-                    ?: estimateZenithPoseDeg(
+
+                val useMatrixSeed = matrixSeed != null && isReliableMatrixZenithSeed(matrixSeed)
+
+                if (matrixSeed != null && !useMatrixSeed) {
+                    Log.w(
+                        "AtlasZenithMatrixSeed",
+                        "frame=${frame.frameId} rejected " +
+                                "yawAbs=${"%.2f".format(matrixSeed.absoluteYawDeg)} " +
+                                "rawPitchAbs=${"%.2f".format(matrixSeed.absolutePitchDeg)} " +
+                                "rollAbs=${"%.2f".format(matrixSeed.absoluteRollDeg)} " +
+                                "legacyPitchOffset=${"%.2f".format(matrixSeed.legacyPitchOffsetDeg)} " +
+                                "legacyRollOffset=${"%.2f".format(matrixSeed.legacyRollOffsetDeg)}"
+                    )
+                }
+
+                val zenithPose = if (useMatrixSeed) {
+                    matrixSeed!!
+                } else {
+                    estimateZenithPoseDeg(
                         frame = frame,
                         src = src,
                         baseAtlas = atlas,
                         frameWeight = frameWeight
                     )
+                }
 
                 Log.d(
                     "AtlasZenithPoseSeed",
                     "frame=${frame.frameId} " +
-                            "source=${if (cameraMountBasis != null && storedDeviceToWorldMatrix(frame) != null) "matrix" else "image"} " +
+                            "source=${if (useMatrixSeed) "matrix" else "image"} " +
                             "yawAbs=${"%.2f".format(zenithPose.absoluteYawDeg)} " +
                             "pitchAbs=${"%.2f".format(zenithPose.absolutePitchDeg)} " +
                             "rollAbs=${"%.2f".format(zenithPose.absoluteRollDeg)} " +
@@ -616,7 +642,10 @@ object AtlasProjector {
                         frameWeight = frameWeight,
                         seedTwistDeg = zenithPose.legacyTwistDeg,
                         seedPitchOffsetDeg = zenithPose.legacyPitchOffsetDeg,
-                        seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg
+                        seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg,
+                        seedAbsoluteYawDeg = zenithPose.absoluteYawDeg,
+                        seedAbsolutePitchDeg = zenithPose.absolutePitchDeg,
+                        seedAbsoluteRollDeg = zenithPose.absoluteRollDeg
                     )
 
                     if (refined == null) {
@@ -1472,6 +1501,13 @@ object AtlasProjector {
         val dstH = (src.height * scale).roundToInt().coerceAtLeast(1)
 
         return Bitmap.createScaledBitmap(src, dstW, dstH, true)
+    }
+
+    private fun isReliableMatrixZenithSeed(seed: ZenithPoseEstimate): Boolean {
+        val rawPitchOk = seed.absolutePitchDeg >= ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG
+        val legacyRollOk = abs(seed.legacyRollOffsetDeg) <= ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_ROLL_DEG
+        val legacyPitchOk = abs(seed.legacyPitchOffsetDeg) <= ZENITH_MATRIX_SEED_MAX_ABS_LEGACY_PITCH_OFFSET_DEG
+        return rawPitchOk && legacyRollOk && legacyPitchOk
     }
 
     private fun normalizeTwistDeg(value: Float): Float {
