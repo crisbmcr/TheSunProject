@@ -66,6 +66,11 @@ private const val ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG = 84.5f
 private const val ZENITH_MATRIX_SEED_MAX_ABS_ROLL_DEG = 3.0f
 private const val ZENITH_MATRIX_SEED_MAX_FORWARD_TILT_DEG = 6.0f
 
+private const val ZENITH_REFINER_MIN_RAW_PITCH_DEG = 88.5f
+private const val ZENITH_REFINER_MAX_ABS_ROLL_DEG = 1.0f
+private const val ZENITH_REFINER_MAX_ABS_ECC_ROT_DEG = 1.5f
+private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
+
 private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
 private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
 private const val PERSISTED_MOUNT_MAX_FORWARD_TILT_DEG = 4.5f
@@ -839,6 +844,31 @@ object AtlasProjector {
                 )
 
                 try {
+                    val shouldRefine = useMatrixSeed && shouldAttemptZenithRefiner(zenithPose)
+
+                    if (!shouldRefine) {
+                        Log.w(
+                            "AtlasZenithTopRefine",
+                            "skip frame=${frame.frameId} " +
+                                    "source=${if (useMatrixSeed) "matrix" else "image"} " +
+                                    "rawPitchAbs=${"%.2f".format(zenithPose.absolutePitchDeg)} " +
+                                    "rollAbs=${"%.2f".format(zenithPose.absoluteRollDeg)}"
+                        )
+
+                        projectBitmapToAtlas(
+                            frame = frame,
+                            src = src,
+                            atlas = atlas,
+                            frameWeight = frameWeight,
+                            zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
+                            zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
+                            zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
+                            emitLogs = true
+                        )
+                        src.recycle()
+                        continue
+                    }
+
                     val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
                         atlas = atlas,
                         frame = frame,
@@ -869,20 +899,17 @@ object AtlasProjector {
                             emitLogs = true
                         )
                     } else {
-                        try {
-                            Log.d(
-                                "AtlasZenithTopRefine",
-                                "frame=${frame.frameId} " +
-                                        "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
-                                        "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
-                                        "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
-                                        "eccTx=${"%.2f".format(refined.eccTxPx)} " +
-                                        "eccTy=${"%.2f".format(refined.eccTyPx)} " +
-                                        "eccScore=${"%.5f".format(refined.eccScore)}"
-                            )
-                        } finally {
-                            ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
-                        }
+                        Log.d(
+                            "AtlasZenithTopRefine",
+                            "frame=${frame.frameId} " +
+                                    "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
+                                    "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
+                                    "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
+                                    "eccTx=${"%.2f".format(refined.eccTxPx)} " +
+                                    "eccTy=${"%.2f".format(refined.eccTyPx)} " +
+                                    "eccScore=${"%.5f".format(refined.eccScore)}"
+                        )
+                        ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
                     }
                 } catch (t: Throwable) {
                     Log.e(
@@ -1664,7 +1691,10 @@ object AtlasProjector {
         val finalScore = 0.20f * lumScore + 0.80f * gradScore
         return finalScore to count
     }
-
+    private fun shouldAttemptZenithRefiner(seed: ZenithPoseEstimate): Boolean {
+        return seed.absolutePitchDeg >= ZENITH_REFINER_MIN_RAW_PITCH_DEG &&
+                abs(seed.absoluteRollDeg) <= ZENITH_REFINER_MAX_ABS_ROLL_DEG
+    }
     private fun isInformativeZenithSample(
         lumA: Double,
         lumB: Double,

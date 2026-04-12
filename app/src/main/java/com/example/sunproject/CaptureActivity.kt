@@ -127,11 +127,21 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val azTolDeg = 4f
     private val pitchTolDeg = 2.5f
     private val rollTolDeg = 3f
-    private val zenithPitchTolDeg = 2f
-    private val zenithRollTolDeg = 4f
+
+    private val zenithPitchTolDeg = 1.4f
+    private val zenithRollTolDeg = 2.2f
+
     private val holdMs = 800L
+    private val zenithHoldMs = 1300L
+    private val zenithSettleMs = 450L
+    private val zenithAbsPitchDriftTolDeg = 0.8f
+    private val zenithAbsRollDriftTolDeg = 1.2f
+
     private val cooldownMs = 1200L
     private var alignmentStartMs = 0L
+    private var zenithLockEnteredMs = 0L
+    private var zenithAbsPitchAnchorDeg = 0f
+    private var zenithAbsRollAnchorDeg = 0f
     private var lastShotMs = 0L
 
     private val capturedFiles = mutableListOf<File>()
@@ -446,32 +456,35 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     if (!zenithYawLocked) {
                         zenithYawLockedDeg = baseDisplayYaw
                         zenithYawLocked = true
+                        zenithLockEnteredMs = SystemClock.elapsedRealtime()
                     }
 
-                    val zenAlpha = adaptiveAlpha(dtSec, tauSec = 0.60f)
+                    val clampedPitch = gamePitchDeg.coerceIn(zenithAssistExitDeg, 89.7f)
+                    val targetZenithPitch = ((clampedPitch - zenithAssistExitDeg) / (90f - zenithAssistExitDeg))
+                        .coerceIn(0f, 1f) * 90f
 
                     if (!zenithDisplayInitialized) {
-                        zenithPitchSmoothedDeg = gamePitchDeg
-                        zenithRollSmoothedDeg = gameRollDeg * 0.05f
+                        zenithPitchSmoothedDeg = targetZenithPitch
+                        zenithRollSmoothedDeg = gameRollDeg
                         zenithDisplayInitialized = true
-                    } else {
-                        zenithPitchSmoothedDeg =
-                            lowPassScalar(zenithPitchSmoothedDeg, gamePitchDeg, zenAlpha)
-                        zenithRollSmoothedDeg =
-                            lowPassScalar(zenithRollSmoothedDeg, gameRollDeg * 0.05f, zenAlpha)
                     }
 
-                    displayAzimuth = zenithYawLockedDeg
+                    zenithPitchSmoothedDeg = 0.75f * zenithPitchSmoothedDeg + 0.25f * targetZenithPitch
+                    zenithRollSmoothedDeg = 0.80f * zenithRollSmoothedDeg + 0.20f * gameRollDeg
+
+                    displayAzimuth = normalizeDeg(zenithYawLockedDeg)
                     displayPitchDeg = zenithPitchSmoothedDeg
-                    displayRollDeg = zenithRollSmoothedDeg
+                    displayRollDeg = zenithRollSmoothedDeg * if (gamePitchDeg >= 82f) 0.05f else 0.10f
                 } else {
                     zenithDisplayInitialized = false
                     zenithYawLocked = false
+                    zenithLockEnteredMs = 0L
+                    zenithPitchSmoothedDeg = displayPitchDeg
+                    zenithRollSmoothedDeg = displayRollDeg
 
-                    displayAzimuth = baseDisplayYaw
+                    displayAzimuth = normalizeDeg(gameYawDeg + displayNorthOffsetDeg)
                     displayPitchDeg = gamePitchDeg
-                    displayRollDeg =
-                        if (kotlin.math.abs(gamePitchDeg) >= 70f) gameRollDeg * 0.10f else gameRollDeg
+                    displayRollDeg = gameRollDeg
                 }
 
                 guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
@@ -523,46 +536,61 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val pitchErr = abs(displayPitchDeg - target.pitch)
         val rollErr = abs(displayRollDeg)
 
-        val dirErr = directionErrorDeg(
-            displayAzimuth,
-            displayPitchDeg,
-            target.azimuth,
-            target.pitch
-        )
-
-        val aligned = when {
-            zenithMode -> {
-                pitchErr <= zenithPitchTolDeg &&
-                        rollErr <= zenithRollTolDeg
-            }
-            target.pitch >= 40f -> {
-                azErr <= azTolDeg &&
-                        pitchErr <= pitchTolDeg &&
-                        rollErr <= rollTolDeg
-            }
-            else -> {
-                azErr <= azTolDeg &&
-                        pitchErr <= pitchTolDeg &&
-                        rollErr <= rollTolDeg
-            }
+        val aligned = if (zenithMode) {
+            pitchErr <= zenithPitchTolDeg && rollErr <= zenithRollTolDeg
+        } else {
+            azErr <= azTolDeg && pitchErr <= pitchTolDeg && rollErr <= rollTolDeg
         }
-
-        Log.d(
-            "SunGuideAuto",
-            "target=${target.azimuth}/${target.pitch} " +
-                    "disp=${"%.2f".format(displayAzimuth)}/${"%.2f".format(displayPitchDeg)}/${"%.2f".format(displayRollDeg)} " +
-                    "meta=${"%.2f".format(lastAzimuth)}/${"%.2f".format(lastPitch)}/${"%.2f".format(lastRoll)} " +
-                    "dirErr=${"%.2f".format(dirErr)} " +
-                    "azErr=${"%.2f".format(azErr)} " +
-                    "pitchErr=${"%.2f".format(pitchErr)} " +
-                    "rollErr=${"%.2f".format(rollErr)} " +
-                    "zenith=$zenithMode aligned=$aligned"
-        )
 
         val now = SystemClock.elapsedRealtime()
 
         if (!aligned) {
             alignmentStartMs = 0L
+            return
+        }
+
+        if (zenithMode) {
+            val settled = zenithLockEnteredMs != 0L &&
+                    (now - zenithLockEnteredMs) >= zenithSettleMs
+
+            if (!settled || !hasLastAbsRotationMatrix) {
+                alignmentStartMs = 0L
+                return
+            }
+
+            if (alignmentStartMs == 0L) {
+                alignmentStartMs = now
+                zenithAbsPitchAnchorDeg = absolutePitchDeg
+                zenithAbsRollAnchorDeg = absoluteRollDeg
+                return
+            }
+
+            val absPitchDrift = abs(absolutePitchDeg - zenithAbsPitchAnchorDeg)
+            val absRollDrift = abs(absoluteRollDeg - zenithAbsRollAnchorDeg)
+
+            val stable =
+                absPitchDrift <= zenithAbsPitchDriftTolDeg &&
+                        absRollDrift <= zenithAbsRollDriftTolDeg
+
+            Log.d(
+                "SunGuideZenithHold",
+                "pitchDrift=${"%.2f".format(absPitchDrift)} " +
+                        "rollDrift=${"%.2f".format(absRollDrift)} " +
+                        "settled=$settled stable=$stable"
+            )
+
+            if (!stable) {
+                alignmentStartMs = 0L
+                return
+            }
+
+            val held = (now - alignmentStartMs) >= zenithHoldMs
+            val cooled = (now - lastShotMs) >= cooldownMs
+
+            if (held && cooled) {
+                takePhotoForTarget(target, reason = "AUTO")
+                alignmentStartMs = 0L
+            }
             return
         }
 
@@ -576,7 +604,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             alignmentStartMs = 0L
         }
     }
-
     private fun absAngleDiff(a: Float, b: Float): Float {
         var d = (a - b) % 360f
         if (d > 180f) d -= 360f

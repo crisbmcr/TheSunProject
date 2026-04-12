@@ -66,6 +66,15 @@ object ZenithTopFaceRefiner {
     private const val COLOR_GAIN_CLAMP_EPS = 0.002f
     private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = -90f
 
+    private const val MIN_FINAL_BLEND_ECC_SCORE = 0.18
+    private const val MAX_FINAL_BLEND_ABS_ROT_DEG = 2.5f
+
+    private const val POLAR_CAP_COLOR_STRENGTH_SCALE = 0.35f
+    private const val POLAR_CAP_MIN_COLOR_STRENGTH = 0.08f
+    private const val POLAR_CAP_FILL_WEIGHT_AT_EDGE = 0.70f
+    private const val POLAR_CAP_FILL_WEIGHT_AT_POLE = 0.45f
+
+
     data class TopFace(
         val rgba: Mat,
         val gray32: Mat,
@@ -145,6 +154,21 @@ object ZenithTopFaceRefiner {
                 eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
                 eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
             )
+
+            val acceptFinalBlend =
+                residualRefined.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
+                        abs(residualRefined.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG
+
+            if (!acceptFinalBlend) {
+                Log.w(
+                    "AtlasZenithTopRefine",
+                    "rejectBlend frame=${frame.frameId} " +
+                            "initialTwist=${"%.2f".format(residualInitialTwistDeg)} " +
+                            "eccRot=${"%.2f".format(residualRefined.eccRotationDeg)} " +
+                            "eccScore=${"%.5f".format(residualRefined.eccScore)}"
+                )
+                return null
+            }
 
             val colorCorrection = blendTopFaceIntoAtlas(
                 aligned = residualRefined.alignedTopFace,
@@ -780,6 +804,10 @@ object ZenithTopFaceRefiner {
         val topPixels = rgbaMatToArgb(aligned.rgba)
         val yBottom = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
 
+        val polarCorrectionStrength =
+            (computeColorCorrectionStrength(colorCorrection) * POLAR_CAP_COLOR_STRENGTH_SCALE)
+                .coerceIn(POLAR_CAP_MIN_COLOR_STRENGTH, 0.35f)
+
         var candidateCount = 0
         var filledCount = 0
         var directCount = 0
@@ -790,13 +818,19 @@ object ZenithTopFaceRefiner {
             val altDeg = AtlasMath.yToAltitude(y, atlas.config)
             if (altDeg < minAltitudeDeg) continue
 
+            val t = ((altDeg - minAltitudeDeg) / (90f - minAltitudeDeg).coerceAtLeast(1f))
+                .coerceIn(0f, 1f)
+            val smoothT = t * t * (3f - 2f * t)
+            val fillWeightScale =
+                POLAR_CAP_FILL_WEIGHT_AT_EDGE +
+                        (POLAR_CAP_FILL_WEIGHT_AT_POLE - POLAR_CAP_FILL_WEIGHT_AT_EDGE) * smoothT
+
             for (x in 0 until atlas.width) {
                 if (atlas.hasCoverageAt(x, y)) continue
 
                 candidateCount++
 
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
-
                 val sampled = sampleTopFaceWithFallback(
                     face = aligned,
                     facePixels = topPixels,
@@ -809,14 +843,30 @@ object ZenithTopFaceRefiner {
                     continue
                 }
 
-                val corrected = applyRgbGain(
-                    sampled.color,
-                    1f,
-                    1f,
-                    1f
+                val gainR = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.rGain,
+                    altDeg = altDeg,
+                    correctionStrength = polarCorrectionStrength
+                )
+                val gainG = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.gGain,
+                    altDeg = altDeg,
+                    correctionStrength = polarCorrectionStrength
+                )
+                val gainB = remapGainTowardNeutralByAltitude(
+                    gain = colorCorrection.bGain,
+                    altDeg = altDeg,
+                    correctionStrength = polarCorrectionStrength
                 )
 
-                atlas.blendPixel(x, y, corrected, frameWeight)
+                val corrected = applyRgbGain(
+                    sampled.color,
+                    gainR,
+                    gainG,
+                    gainB
+                )
+
+                atlas.blendPixel(x, y, corrected, frameWeight * fillWeightScale)
                 filledCount++
 
                 if (sampled.usedFallback) fallbackCount++ else directCount++
@@ -824,13 +874,11 @@ object ZenithTopFaceRefiner {
         }
 
         Log.d(
-            "AtlasZenithFill",
+            "AtlasZenithPolarFill",
             "minAlt=${"%.1f".format(minAltitudeDeg)} " +
-                    "candidates=$candidateCount " +
-                    "filled=$filledCount " +
-                    "direct=$directCount " +
-                    "fallback=$fallbackCount " +
-                    "missed=$missedCount"
+                    "correctionStrength=${"%.2f".format(polarCorrectionStrength)} " +
+                    "candidates=$candidateCount filled=$filledCount " +
+                    "direct=$directCount fallback=$fallbackCount missed=$missedCount"
         )
     }
 
