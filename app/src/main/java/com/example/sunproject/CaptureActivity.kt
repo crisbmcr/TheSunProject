@@ -551,7 +551,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         if (zenithMode) {
             val settled = zenithLockEnteredMs == 0L ||
-                    (now - zenithLockEnteredMs) >= 250L
+                    (now - zenithLockEnteredMs) >= 180L
 
             if (!settled) {
                 alignmentStartMs = 0L
@@ -569,7 +569,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             val absRollDrift = abs(absoluteRollDeg - zenithAbsRollAnchorDeg)
 
             val grosslyUnstable =
-                absPitchDrift > 2.5f || absRollDrift > 4.0f
+                absPitchDrift > 3.5f || absRollDrift > 6.0f
 
             Log.d(
                 "SunGuideZenithHold",
@@ -583,7 +583,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 return
             }
 
-            val held = (now - alignmentStartMs) >= 900L
+            val held = (now - alignmentStartMs) >= 700L
             val cooled = (now - lastShotMs) >= cooldownMs
 
             if (held && cooled) {
