@@ -70,6 +70,7 @@ private const val ZENITH_REFINER_MIN_RAW_PITCH_DEG = 88.5f
 private const val ZENITH_REFINER_MAX_ABS_ROLL_DEG = 1.0f
 private const val ZENITH_REFINER_MAX_ABS_ECC_ROT_DEG = 1.5f
 private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
+private const val ENABLE_ZENITH_TOPFACE_REFINER = false
 
 private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
 private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
@@ -866,6 +867,66 @@ object AtlasProjector {
                             emitLogs = true
                         )
                     } else {
+                        if (!ENABLE_ZENITH_TOPFACE_REFINER) {
+                            Log.w(
+                                "AtlasZenithTopRefine",
+                                "disabled frame=${frame.frameId}; using ERP absolute zenith"
+                            )
+
+                            projectBitmapToAtlas(
+                                frame = frame,
+                                src = src,
+                                atlas = atlas,
+                                frameWeight = frameWeight,
+                                zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
+                                zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
+                                zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
+                                emitLogs = true
+                            )
+                        } else {
+                            val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
+                                atlas = atlas,
+                                frame = frame,
+                                srcBitmap = src,
+                                frameWeight = frameWeight,
+                                seedTwistDeg = zenithPose.legacyTwistDeg,
+                                seedPitchOffsetDeg = zenithPose.legacyPitchOffsetDeg,
+                                seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg,
+                                seedAbsoluteYawDeg = zenithPose.absoluteYawDeg,
+                                seedAbsolutePitchDeg = zenithPose.absolutePitchDeg,
+                                seedAbsoluteRollDeg = zenithPose.absoluteRollDeg
+                            )
+
+                            if (refined == null) {
+                                Log.w(
+                                    "AtlasZenithTopRefine",
+                                    "frame=${frame.frameId} no refinement result; fallback to ERP zenith"
+                                )
+
+                                projectBitmapToAtlas(
+                                    frame = frame,
+                                    src = src,
+                                    atlas = atlas,
+                                    frameWeight = frameWeight,
+                                    zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
+                                    zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
+                                    zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
+                                    emitLogs = true
+                                )
+                            } else {
+                                Log.d(
+                                    "AtlasZenithTopRefine",
+                                    "frame=${frame.frameId} " +
+                                            "initialTwist=${"%.2f".format(refined.initialTwistDeg)} " +
+                                            "finalTwist=${"%.2f".format(refined.finalTwistDeg)} " +
+                                            "eccRot=${"%.2f".format(refined.eccRotationDeg)} " +
+                                            "eccTx=${"%.2f".format(refined.eccTxPx)} " +
+                                            "eccTy=${"%.2f".format(refined.eccTyPx)} " +
+                                            "eccScore=${"%.5f".format(refined.eccScore)}"
+                                )
+                                ZenithTopFaceRefiner.releaseTopFace(refined.alignedTopFace)
+                            }
+                        }
                         val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
                             atlas = atlas,
                             frame = frame,
