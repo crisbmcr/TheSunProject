@@ -532,17 +532,33 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val target = guideView.getActiveCapturePoint() ?: return
         val zenithMode = isZenithTarget(target)
 
+        val now = SystemClock.elapsedRealtime()
+
         val azErr = if (zenithMode) 0f else absAngleDiff(displayAzimuth, target.azimuth)
-        val pitchErr = abs(displayPitchDeg - target.pitch)
-        val rollErr = abs(displayRollDeg)
+
+        val capturePitchDeg = if (zenithMode) absolutePitchDeg else displayPitchDeg
+        val captureRollDeg = if (zenithMode) gameRollDeg else displayRollDeg
+
+        val pitchErr = abs(capturePitchDeg - target.pitch)
+        val rollErr = abs(captureRollDeg)
 
         val aligned = if (zenithMode) {
-            pitchErr <= 1.8f && rollErr <= 3.0f
+            pitchErr <= 2.0f && rollErr <= 10.0f
         } else {
             azErr <= azTolDeg && pitchErr <= pitchTolDeg && rollErr <= rollTolDeg
         }
 
-        val now = SystemClock.elapsedRealtime()
+        if (zenithMode) {
+            Log.d(
+                "SunGuideZenithAuto",
+                "targetPitch=${"%.2f".format(target.pitch)} " +
+                        "capturePitch=${"%.2f".format(capturePitchDeg)} " +
+                        "captureRoll=${"%.2f".format(captureRollDeg)} " +
+                        "pitchErr=${"%.2f".format(pitchErr)} " +
+                        "rollErr=${"%.2f".format(rollErr)} " +
+                        "aligned=$aligned"
+            )
+        }
 
         if (!aligned) {
             alignmentStartMs = 0L
@@ -550,6 +566,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         if (zenithMode) {
+            if (!hasLastAbsRotationMatrix) {
+                alignmentStartMs = 0L
+                return
+            }
+
             val settled = zenithLockEnteredMs == 0L ||
                     (now - zenithLockEnteredMs) >= 180L
 
