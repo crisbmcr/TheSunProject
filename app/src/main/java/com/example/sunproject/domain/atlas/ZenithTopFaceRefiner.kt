@@ -64,7 +64,7 @@ object ZenithTopFaceRefiner {
     private const val COLOR_MATCH_NEUTRAL_AT_ALT_DEG = 84f
     private const val MIN_COLOR_CORRECTION_STRENGTH = 0.35f
     private const val COLOR_GAIN_CLAMP_EPS = 0.002f
-    private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = 90f
+    private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = -90f
 
     data class TopFace(
         val rgba: Mat,
