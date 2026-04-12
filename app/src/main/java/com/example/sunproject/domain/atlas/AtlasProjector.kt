@@ -801,7 +801,7 @@ object AtlasProjector {
 
                     Log.w(
                         "AtlasZenithMatrixSeed",
-                        "frame=${frame.frameId} rejected " +
+                        "framee=${frame.frameId} rejected " +
                                 "yawAbs=${"%.2f".format(matrixSeed.absoluteYawDeg)} " +
                                 "rawPitchAbs=${"%.2f".format(matrixSeed.absolutePitchDeg)} " +
                                 "rollAbs=${"%.2f".format(matrixSeed.absoluteRollDeg)} " +
