@@ -537,7 +537,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val rollErr = abs(displayRollDeg)
 
         val aligned = if (zenithMode) {
-            pitchErr <= zenithPitchTolDeg && rollErr <= zenithRollTolDeg
+            pitchErr <= 1.8f && rollErr <= 3.0f
         } else {
             azErr <= azTolDeg && pitchErr <= pitchTolDeg && rollErr <= rollTolDeg
         }
@@ -550,10 +550,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         if (zenithMode) {
-            val settled = zenithLockEnteredMs != 0L &&
-                    (now - zenithLockEnteredMs) >= zenithSettleMs
+            val settled = zenithLockEnteredMs == 0L ||
+                    (now - zenithLockEnteredMs) >= 250L
 
-            if (!settled || !hasLastAbsRotationMatrix) {
+            if (!settled) {
                 alignmentStartMs = 0L
                 return
             }
@@ -568,23 +568,22 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             val absPitchDrift = abs(absolutePitchDeg - zenithAbsPitchAnchorDeg)
             val absRollDrift = abs(absoluteRollDeg - zenithAbsRollAnchorDeg)
 
-            val stable =
-                absPitchDrift <= zenithAbsPitchDriftTolDeg &&
-                        absRollDrift <= zenithAbsRollDriftTolDeg
+            val grosslyUnstable =
+                absPitchDrift > 2.5f || absRollDrift > 4.0f
 
             Log.d(
                 "SunGuideZenithHold",
                 "pitchDrift=${"%.2f".format(absPitchDrift)} " +
                         "rollDrift=${"%.2f".format(absRollDrift)} " +
-                        "settled=$settled stable=$stable"
+                        "settled=$settled grosslyUnstable=$grosslyUnstable"
             )
 
-            if (!stable) {
+            if (grosslyUnstable) {
                 alignmentStartMs = 0L
                 return
             }
 
-            val held = (now - alignmentStartMs) >= zenithHoldMs
+            val held = (now - alignmentStartMs) >= 900L
             val cooled = (now - lastShotMs) >= cooldownMs
 
             if (held && cooled) {
@@ -1461,6 +1460,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         SensorManager.getRotationMatrixFromVector(rawR, rotationVectorValues)
         System.arraycopy(rawR, 0, lastAbsRotationMatrix, 0, 9)
         hasLastAbsRotationMatrix = true
+    }
+    private fun normalizeDeg(value: Float): Float {
+        var out = value % 360f
+        if (out < 0f) out += 360f
+        return out
     }
     private fun applyDeclination(azimuthDeg: Float): Float {
         var out = azimuthDeg
