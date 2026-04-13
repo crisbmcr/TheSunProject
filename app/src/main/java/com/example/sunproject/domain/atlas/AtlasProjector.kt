@@ -860,6 +860,34 @@ object AtlasProjector {
                                     "rawPitchAbs=${"%.2f".format(zenithPose.absolutePitchDeg)} " +
                                     "rollAbs=${"%.2f".format(zenithPose.absoluteRollDeg)}"
                         )
+                        Log.d(
+                            "AtlasZenithOverlapStats",
+                            "frame=${frame.frameId} " +
+                                    "atlasLuma=${"%.1f".format(stats.atlasLuma)} " +
+                                    "zenithLuma=${"%.1f".format(stats.zenithLuma)} " +
+                                    "atlasR=${"%.1f".format(stats.atlasR)} " +
+                                    "zenithR=${"%.1f".format(stats.zenithR)} " +
+                                    "atlasG=${"%.1f".format(stats.atlasG)} " +
+                                    "zenithG=${"%.1f".format(stats.zenithG)} " +
+                                    "atlasB=${"%.1f".format(stats.atlasB)} " +
+                                    "zenithB=${"%.1f".format(stats.zenithB)} " +
+                                    "pixels=${stats.count}"
+                        )
+                        Log.d(
+                            "AtlasZenithBlend",
+                            "frame=${frame.frameId} " +
+                                    "frameWeight=${"%.3f".format(frameWeight)} " +
+                                    "mode=erp_absolute"
+                        )
+                        val zenithStats = computeBitmapRgbStats(src)
+                        Log.d(
+                            "AtlasZenithSourceStats",
+                            "frame=${frame.frameId} " +
+                                    "meanR=${"%.1f".format(zenithStats.meanR)} " +
+                                    "meanG=${"%.1f".format(zenithStats.meanG)} " +
+                                    "meanB=${"%.1f".format(zenithStats.meanB)} " +
+                                    "luma=${"%.1f".format(zenithStats.meanLuma)}"
+                        )
 
                         projectBitmapToAtlas(
                             frame = frame,
@@ -1788,7 +1816,47 @@ object AtlasProjector {
             ZENITH_ROLL_OFFSET_MAX_DEG
         )
     }
+    private data class BitmapRgbStats(
+        val meanR: Float,
+        val meanG: Float,
+        val meanB: Float,
+        val meanLuma: Float
+    )
 
+    private fun computeBitmapRgbStats(bitmap: Bitmap): BitmapRgbStats {
+        val w = bitmap.width
+        val h = bitmap.height
+        val pixels = IntArray(w * h)
+        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        var sumR = 0.0
+        var sumG = 0.0
+        var sumB = 0.0
+        var count = 0
+
+        for (c in pixels) {
+            val a = (c ushr 24) and 0xFF
+            if (a == 0) continue
+            val r = (c ushr 16) and 0xFF
+            val g = (c ushr 8) and 0xFF
+            val b = c and 0xFF
+            sumR += r.toDouble()
+            sumG += g.toDouble()
+            sumB += b.toDouble()
+            count++
+        }
+
+        if (count == 0) {
+            return BitmapRgbStats(0f, 0f, 0f, 0f)
+        }
+
+        val meanR = (sumR / count).toFloat()
+        val meanG = (sumG / count).toFloat()
+        val meanB = (sumB / count).toFloat()
+        val meanLuma = (0.2126f * meanR + 0.7152f * meanG + 0.0722f * meanB)
+
+        return BitmapRgbStats(meanR, meanG, meanB, meanLuma)
+    }
     private fun gradientMag(atlas: SkyAtlas, x: Int, y: Int): Double {
         val xl = if (x > 0) x - 1 else x
         val xr = if (x < atlas.width - 1) x + 1 else x
