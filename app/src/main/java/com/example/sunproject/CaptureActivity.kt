@@ -535,7 +535,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (zenithMode) {
             val capturePitchDeg = absolutePitchDeg
             val pitchErr = abs(capturePitchDeg - target.pitch)
-
             val aligned = pitchErr <= 2.0f
 
             Log.d(
