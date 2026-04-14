@@ -81,6 +81,7 @@ private const val FRAME_RGB_GAIN_MAX = 1.08f
 private const val FRAME_GAIN_ESTIMATE_X_STEP = 6
 private const val FRAME_GAIN_ESTIMATE_Y_STEP = 3
 private const val FRAME_GAIN_ESTIMATE_MIN_SAMPLES = 400
+private const val ZENITH_ERP_MAX_WEIGHT = 0.55f
 
 private data class RgbGain(
     val r: Float,
@@ -860,25 +861,17 @@ object AtlasProjector {
                                     "rawPitchAbs=${"%.2f".format(zenithPose.absolutePitchDeg)} " +
                                     "rollAbs=${"%.2f".format(zenithPose.absoluteRollDeg)}"
                         )
-                        Log.d(
-                            "AtlasZenithOverlapStats",
-                            "frame=${frame.frameId} " +
-                                    "atlasLuma=${"%.1f".format(stats.atlasLuma)} " +
-                                    "zenithLuma=${"%.1f".format(stats.zenithLuma)} " +
-                                    "atlasR=${"%.1f".format(stats.atlasR)} " +
-                                    "zenithR=${"%.1f".format(stats.zenithR)} " +
-                                    "atlasG=${"%.1f".format(stats.atlasG)} " +
-                                    "zenithG=${"%.1f".format(stats.zenithG)} " +
-                                    "atlasB=${"%.1f".format(stats.atlasB)} " +
-                                    "zenithB=${"%.1f".format(stats.zenithB)} " +
-                                    "pixels=${stats.count}"
-                        )
+
+                        val effectiveZenithWeight = frameWeight.coerceAtMost(ZENITH_ERP_MAX_WEIGHT)
+
                         Log.d(
                             "AtlasZenithBlend",
                             "frame=${frame.frameId} " +
                                     "frameWeight=${"%.3f".format(frameWeight)} " +
+                                    "effectiveWeight=${"%.3f".format(effectiveZenithWeight)} " +
                                     "mode=erp_absolute"
                         )
+
                         val zenithStats = computeBitmapRgbStats(src)
                         Log.d(
                             "AtlasZenithSourceStats",
@@ -893,7 +886,7 @@ object AtlasProjector {
                             frame = frame,
                             src = src,
                             atlas = atlas,
-                            frameWeight = frameWeight,
+                            frameWeight = effectiveZenithWeight,
                             zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
                             zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
                             zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
@@ -923,7 +916,7 @@ object AtlasProjector {
                                 frame = frame,
                                 src = src,
                                 atlas = atlas,
-                                frameWeight = frameWeight,
+                                frameWeight = frameWeight.coerceAtMost(ZENITH_ERP_MAX_WEIGHT),
                                 zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
                                 zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
                                 zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
@@ -954,7 +947,7 @@ object AtlasProjector {
                         frame = frame,
                         src = src,
                         atlas = atlas,
-                        frameWeight = frameWeight,
+                        frameWeight = frameWeight.coerceAtMost(ZENITH_ERP_MAX_WEIGHT),
                         zenithAbsoluteYawDegOverride = zenithPose.absoluteYawDeg,
                         zenithAbsolutePitchDegOverride = zenithPose.absolutePitchDeg,
                         zenithAbsoluteRollDegOverride = zenithPose.absoluteRollDeg,
@@ -1739,7 +1732,38 @@ object AtlasProjector {
         val maxGrad = if (gradA > gradB) gradA else gradB
         return maxGrad >= ZENITH_ESTIMATE_MIN_GRADIENT
     }
+    private fun safeOverlapChannelGain(atlasMean: Float, zenithMean: Float): Float {
+        if (!atlasMean.isFinite() || !zenithMean.isFinite() || zenithMean <= 1f) return 1f
+        return (atlasMean / zenithMean).coerceIn(FRAME_RGB_GAIN_MIN, FRAME_RGB_GAIN_MAX)
+    }
 
+    private fun applyRgbGainToBitmap(src: Bitmap, gain: RgbGain): Bitmap {
+        val identity =
+            abs(gain.r - 1f) < 1e-3f &&
+                    abs(gain.g - 1f) < 1e-3f &&
+                    abs(gain.b - 1f) < 1e-3f
+
+        if (identity) return src
+
+        val out = src.copy(Bitmap.Config.ARGB_8888, true)
+        val w = out.width
+        val h = out.height
+        val pixels = IntArray(w * h)
+
+        out.getPixels(pixels, 0, w, 0, 0, w, h)
+
+        for (i in pixels.indices) {
+            val c = pixels[i]
+            val a = Color.alpha(c)
+            val r = (Color.red(c).toFloat() * gain.r).roundToInt().coerceIn(0, 255)
+            val g = (Color.green(c).toFloat() * gain.g).roundToInt().coerceIn(0, 255)
+            val b = (Color.blue(c).toFloat() * gain.b).roundToInt().coerceIn(0, 255)
+            pixels[i] = Color.argb(a, r, g, b)
+        }
+
+        out.setPixels(pixels, 0, w, 0, 0, w, h)
+        return out
+    }
     private fun zenithSampleWeight(
         baseWeight: Double,
         candidateWeight: Double,
