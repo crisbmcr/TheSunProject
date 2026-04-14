@@ -997,11 +997,18 @@ object AtlasProjector {
         val effectiveZenithRollOffsetDeg =
             zenithRollOffsetDegOverride ?: ZENITH_ROLL_OFFSET_FALLBACK_DEG
 
+        val zenithBaseYawDeg = baseYawDeg(frame)
+        val zenithBasePitchDeg = basePitchDeg(frame)
+        val zenithBaseRollDeg = frame.measuredRollDeg.coerceIn(
+            ZENITH_ROLL_OFFSET_MIN_DEG,
+            ZENITH_ROLL_OFFSET_MAX_DEG
+        )
+
         val projectionAzimuthDeg = if (zenithLike) {
             if (hasAbsoluteZenithOverride) {
                 normalizeTwistDeg(zenithAbsoluteYawDegOverride!!)
             } else {
-                frame.measuredAzimuthDeg + effectiveZenithTwistDeg
+                normalizeTwistDeg(zenithBaseYawDeg + effectiveZenithTwistDeg)
             }
         } else {
             frame.measuredAzimuthDeg
@@ -1011,7 +1018,7 @@ object AtlasProjector {
             if (hasAbsoluteZenithOverride) {
                 zenithAbsolutePitchDegOverride!!.coerceIn(84f, 90f)
             } else {
-                (frame.measuredPitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
+                (zenithBasePitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
             }
         } else {
             frame.measuredPitchDeg
@@ -1019,9 +1026,9 @@ object AtlasProjector {
 
         val projectionRollDeg = if (zenithLike) {
             if (hasAbsoluteZenithOverride) {
-                zenithAbsoluteRollDegOverride!!
+                0f
             } else {
-                (frame.measuredRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
+                (zenithBaseRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
                     ZENITH_ROLL_OFFSET_MIN_DEG,
                     ZENITH_ROLL_OFFSET_MAX_DEG
                 )
@@ -1798,10 +1805,9 @@ object AtlasProjector {
         basis: CameraMountBasis
     ): Boolean {
         val rawPitchOk = seed.absolutePitchDeg >= ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG
-        val rollOk = abs(seed.absoluteRollDeg) <= ZENITH_MATRIX_SEED_MAX_ABS_ROLL_DEG
         val forwardTiltOk = forwardTiltDeg(basis) <= ZENITH_MATRIX_SEED_MAX_FORWARD_TILT_DEG
 
-        return rawPitchOk && rollOk && forwardTiltOk
+        return rawPitchOk && forwardTiltOk
     }
 
     private fun normalizeTwistDeg(value: Float): Float {
