@@ -242,27 +242,15 @@ object AtlasProjector {
     }
 
     private fun visualFallbackBaseYawDeg(frame: FrameRecord): Float {
-        return if (isZenithFrame(frame)) {
-            frame.measuredAzimuthDeg
-        } else {
-            baseYawDeg(frame)
-        }
+        return baseYawDeg(frame)
     }
 
     private fun visualFallbackBasePitchDeg(frame: FrameRecord): Float {
-        return if (isZenithFrame(frame)) {
-            frame.measuredPitchDeg
-        } else {
-            basePitchDeg(frame)
-        }
+        return basePitchDeg(frame)
     }
 
     private fun visualFallbackBaseRollDeg(frame: FrameRecord): Float {
-        return if (isZenithFrame(frame)) {
-            frame.measuredRollDeg
-        } else {
-            baseRollDeg(frame)
-        }
+        return baseRollDeg(frame)
     }
 
     private fun mountReferenceWeight(frame: FrameRecord): Float {
@@ -676,12 +664,16 @@ object AtlasProjector {
             )
         }
 
+        val centerYawDeg = normalizeTwistDeg(forwardAzDeg)
+        val rawPitchAbsDeg = maxOf(pitchAbsDeg, basePitch)
+        val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
+
         val zeroRollBasis = buildProjectionBasisFromAngles(
-            yawDeg = tangentAzDeg,
-            pitchDeg = pitchAbsDeg,
+            yawDeg = centerYawDeg,
+            pitchDeg = pitchUsedDeg,
             rollDeg = 0f,
             zenithLike = true,
-            forceHardZenith = useHardZenithBranch
+            forceHardZenith = true
         )
 
         val zeroRightT = safeNormalizeTangent(zeroRollBasis.right, forward) ?: return null
@@ -693,35 +685,29 @@ object AtlasProjector {
             atan2(sinR.toDouble(), cosR.toDouble())
         ).toFloat()
 
-        val yawAbsDeg = normalizeTwistDeg(tangentAzDeg)
-        val rawPitchAbsDeg = pitchAbsDeg
-        val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
         val rollAbsDeg = residualRollDeg
-
-        val baseYaw = baseYawDeg(frame)
-        val basePitch = basePitchDeg(frame)
-        val baseRoll = baseRollDeg(frame)
 
         Log.d(
             "AtlasZenithMatrixSeed",
             "frame=${frame.frameId} " +
                     "yawForward=${"%.2f".format(forwardAzDeg)} " +
-                    "yawAbs=${"%.2f".format(yawAbsDeg)} " +
+                    "yawTangent=${"%.2f".format(tangentAzDeg)} " +
+                    "yawUsed=${"%.2f".format(centerYawDeg)} " +
                     "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
                     "pitchAbsClamped=${"%.2f".format(pitchUsedDeg)} " +
                     "rollAbs=${"%.2f".format(rollAbsDeg)} " +
                     "baseYaw=${"%.2f".format(baseYaw)} " +
                     "basePitch=${"%.2f".format(basePitch)} " +
                     "baseRoll=${"%.2f".format(baseRoll)} " +
-                    "legacyTwist=${"%.2f".format(normalizeTwistDeg(yawAbsDeg - baseYaw))} " +
+                    "legacyTwist=${"%.2f".format(normalizeTwistDeg(centerYawDeg - baseYaw))} " +
                     "legacyPitchOffset=${"%.2f".format(clampZenithPitchOffsetDeg(pitchUsedDeg - basePitch))} " +
                     "legacyRollOffset=${"%.2f".format(clampZenithRollOffsetDeg(rollAbsDeg - baseRoll))} " +
-                    "seedHard=$useHardZenithBranch"
+                    "seedHard=true"
         )
 
         return buildZenithPoseEstimateFromAbsolute(
             frame = frame,
-            absoluteYawDeg = yawAbsDeg,
+            absoluteYawDeg = centerYawDeg,
             absolutePitchDeg = rawPitchAbsDeg,
             absoluteRollDeg = rollAbsDeg,
             score = Float.POSITIVE_INFINITY,
