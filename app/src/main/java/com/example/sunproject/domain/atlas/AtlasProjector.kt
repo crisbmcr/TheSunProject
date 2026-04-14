@@ -465,7 +465,7 @@ object AtlasProjector {
         val right0: FloatArray
         val up0: FloatArray
 
-        val useHardZenithBasis = forceHardZenith || (zenithLike && pitchDeg >= 89.5f)
+        val useHardZenithBasis = forceHardZenith || (zenithLike && pitchDeg >= 84f)
 
         if (useHardZenithBasis) {
             right0 = normalize(
