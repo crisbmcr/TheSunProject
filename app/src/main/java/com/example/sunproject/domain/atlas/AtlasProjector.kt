@@ -2074,23 +2074,66 @@ object AtlasProjector {
         return Color.argb(a, r, g, b)
     }
     private fun qualityWeightForFrame(frame: FrameRecord): Float {
-        val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
+        val zenithLike = isZenithFrame(frame)
 
-        val azErr = if (zenithLike) 0f
-        else angleDiffDeg(frame.targetAzimuthDeg, frame.measuredAzimuthDeg)
+        if (zenithLike) {
+            val pitchBase = frame.absPitchDeg ?: frame.measuredPitchDeg
+            val pitchErr = abs(frame.targetPitchDeg - pitchBase)
 
+            // Para Z0 no usar measuredRollDeg como criterio de descarte:
+            // cerca del zenith el roll visual/sensorial es inestable y ya vimos
+            // que la autocaptura correcta quedó gobernada por absolutePitchDeg.
+            val maxZenithPitchErr = if (frame.absPitchDeg != null) 4.0f else 2.0f
+
+            if (pitchErr > maxZenithPitchErr) {
+                Log.d(
+                    "AtlasWeight",
+                    "reject frame=${frame.frameId} ring=${frame.ringId} reason=zenithPitchErr " +
+                            "target=${frame.targetAzimuthDeg}/${frame.targetPitchDeg} " +
+                            "pitchBase=${"%.2f".format(pitchBase)} " +
+                            "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
+                            "pitchAbs=${"%.2f".format(frame.absPitchDeg ?: Float.NaN)} " +
+                            "rollMeasured=${"%.2f".format(frame.measuredRollDeg)} " +
+                            "rollAbs=${"%.2f".format(frame.absRollDeg ?: Float.NaN)} " +
+                            "pitchErr=${"%.2f".format(pitchErr)} max=${"%.2f".format(maxZenithPitchErr)}"
+                )
+                return 0f
+            }
+
+            val pitchScore = (1f - pitchErr / maxZenithPitchErr).coerceIn(0f, 1f)
+
+            // Darle un piso al Z0 para que no vuelva a quedar anulado por inestabilidad
+            // residual. Luego AtlasZenithBlend ya lo capará con ZENITH_ERP_MAX_WEIGHT.
+            val weight = (0.45f + 0.55f * pitchScore).coerceIn(0.45f, 1f)
+
+            Log.d(
+                "AtlasWeight",
+                "accept frame=${frame.frameId} ring=${frame.ringId} zenith=true " +
+                        "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                        "pitchBase=${"%.2f".format(pitchBase)} " +
+                        "pitchMeasured=${"%.2f".format(frame.measuredPitchDeg)} " +
+                        "pitchAbs=${"%.2f".format(frame.absPitchDeg ?: Float.NaN)} " +
+                        "rollMeasured=${"%.2f".format(frame.measuredRollDeg)} " +
+                        "rollAbs=${"%.2f".format(frame.absRollDeg ?: Float.NaN)} " +
+                        "pitchErr=${"%.2f".format(pitchErr)} " +
+                        "weight=${"%.3f".format(weight)}"
+            )
+
+            return weight
+        }
+
+        val azErr = angleDiffDeg(frame.targetAzimuthDeg, frame.measuredAzimuthDeg)
         val pitchErr = abs(frame.targetPitchDeg - frame.measuredPitchDeg)
         val rollAbs = abs(frame.measuredRollDeg)
 
         val maxAzErr = when {
-            zenithLike -> Float.MAX_VALUE
             frame.targetPitchDeg >= 40f -> 4.5f
             else -> 4.0f
         }
-        val maxPitchErr = if (zenithLike) 2.0f else 2.75f
-        val maxRollErr = if (zenithLike) 4.5f else 3.5f
+        val maxPitchErr = 2.75f
+        val maxRollErr = 3.5f
 
-        if (!zenithLike && azErr > maxAzErr) {
+        if (azErr > maxAzErr) {
             Log.d(
                 "AtlasWeight",
                 "reject frame=${frame.frameId} reason=azErr " +
@@ -2123,9 +2166,7 @@ object AtlasProjector {
             return 0f
         }
 
-        val azScore = if (zenithLike) 1f
-        else (1f - azErr / maxAzErr).coerceIn(0f, 1f)
-
+        val azScore = (1f - azErr / maxAzErr).coerceIn(0f, 1f)
         val pitchScore = (1f - pitchErr / maxPitchErr).coerceIn(0f, 1f)
         val rollScore = (1f - rollAbs / maxRollErr).coerceIn(0f, 1f)
 
