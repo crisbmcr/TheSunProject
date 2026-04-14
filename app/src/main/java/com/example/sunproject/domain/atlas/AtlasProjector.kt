@@ -663,8 +663,12 @@ object AtlasProjector {
                 ).toFloat()
             )
         }
-
         val centerYawDeg = normalizeTwistDeg(forwardAzDeg)
+
+        val baseYaw = baseYawDeg(frame)
+        val basePitch = basePitchDeg(frame)
+        val baseRoll = baseRollDeg(frame)
+
         val rawPitchAbsDeg = maxOf(pitchAbsDeg, basePitch)
         val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
 
