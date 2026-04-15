@@ -447,6 +447,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val zenithTargetActive = isZenithTarget(guideView.getActiveCapturePoint())
+
                 val nearZenith = updateZenithAssistLatch(zenithTargetActive, absolutePitchDeg)
 
                 val baseDisplayYaw = if (displayOffsetInitialized) {
@@ -456,11 +457,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 if (nearZenith) {
-
                     val zenithAbsPitch = absolutePitchDeg
                     val zenithAbsRoll = absoluteRollDeg
 
-                    // No congelar yaw demasiado temprano durante la transición H45 -> Z0.
                     if (!zenithYawLocked && zenithAbsPitch >= 78f) {
                         zenithYawLockedDeg = baseDisplayYaw
                         zenithYawLocked = true
@@ -497,7 +496,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     }
 
                 } else {
-
                     zenithDisplayInitialized = false
                     zenithYawLocked = false
                     zenithLockEnteredMs = 0L
