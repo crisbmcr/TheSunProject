@@ -461,6 +461,18 @@ class GuideView @JvmOverloads constructor(
 
         zenithMode = candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
         updateVisualZenithLatch()
+        if (zenithMode && candidates.size == 1) {
+            val only = candidates.first()
+
+            if (activePoint !== only) {
+                logTargetChange(activePoint, only, "zenith_single")
+            }
+
+            activePoint = only
+            pendingActivePoint = null
+            pendingActiveFrames = 0
+            return
+        }
         if (candidates.isEmpty()) {
             activePoint = null
             pendingActivePoint = null

@@ -221,8 +221,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var zenithYawLocked = false
 
     private var zenithAssistLatched = false
-    private val zenithAssistEnterDeg = 66f
-    private val zenithAssistExitDeg = 60f
+
+    // Deben coincidir con GuideView para que el target visual y la lógica de captura
+// entren/salgan del modo zenital en el mismo momento.
+    private val zenithAssistEnterDeg = 70f
+
+    private val zenithAssistExitDeg = 64f
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
@@ -443,7 +447,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 val zenithTargetActive = isZenithTarget(guideView.getActiveCapturePoint())
-                val nearZenith = updateZenithAssistLatch(zenithTargetActive, gamePitchDeg)
+                val nearZenith = updateZenithAssistLatch(zenithTargetActive, absolutePitchDeg)
 
                 val baseDisplayYaw = if (displayOffsetInitialized) {
                     normalize360(gameYawDeg + displayNorthOffsetDeg)
@@ -452,29 +456,48 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 }
 
                 if (nearZenith) {
-                    if (!zenithYawLocked) {
+
+                    val zenithAbsPitch = absolutePitchDeg
+                    val zenithAbsRoll = absoluteRollDeg
+
+                    // No congelar yaw demasiado temprano durante la transición H45 -> Z0.
+                    if (!zenithYawLocked && zenithAbsPitch >= 78f) {
                         zenithYawLockedDeg = baseDisplayYaw
                         zenithYawLocked = true
                         zenithLockEnteredMs = SystemClock.elapsedRealtime()
                     }
 
-                    val clampedPitch = gamePitchDeg.coerceIn(zenithAssistExitDeg, 89.7f)
-                    val targetZenithPitch = ((clampedPitch - zenithAssistExitDeg) / (90f - zenithAssistExitDeg))
-                        .coerceIn(0f, 1f) * 90f
+                    val clampedPitch = zenithAbsPitch.coerceIn(zenithAssistExitDeg, 89.7f)
+                    val targetZenithPitch =
+                        ((clampedPitch - zenithAssistExitDeg) / (90f - zenithAssistExitDeg))
+                            .coerceIn(0f, 1f) * 90f
 
                     if (!zenithDisplayInitialized) {
                         zenithPitchSmoothedDeg = targetZenithPitch
-                        zenithRollSmoothedDeg = gameRollDeg
+                        zenithRollSmoothedDeg = zenithAbsRoll
                         zenithDisplayInitialized = true
                     }
 
-                    zenithPitchSmoothedDeg = 0.75f * zenithPitchSmoothedDeg + 0.25f * targetZenithPitch
-                    zenithRollSmoothedDeg = 0.80f * zenithRollSmoothedDeg + 0.20f * gameRollDeg
+                    zenithPitchSmoothedDeg =
+                        0.82f * zenithPitchSmoothedDeg + 0.18f * targetZenithPitch
 
-                    displayAzimuth = normalizeDeg(zenithYawLockedDeg)
+                    zenithRollSmoothedDeg =
+                        0.88f * zenithRollSmoothedDeg + 0.12f * zenithAbsRoll
+
+                    displayAzimuth = normalizeDeg(
+                        if (zenithYawLocked) zenithYawLockedDeg else baseDisplayYaw
+                    )
+
                     displayPitchDeg = zenithPitchSmoothedDeg
-                    displayRollDeg = zenithRollSmoothedDeg * if (gamePitchDeg >= 82f) 0.05f else 0.10f
+
+                    displayRollDeg = when {
+                        zenithAbsPitch >= 84f -> zenithRollSmoothedDeg * 0.02f
+                        zenithAbsPitch >= 80f -> zenithRollSmoothedDeg * 0.05f
+                        else -> zenithRollSmoothedDeg * 0.10f
+                    }
+
                 } else {
+
                     zenithDisplayInitialized = false
                     zenithYawLocked = false
                     zenithLockEnteredMs = 0L
