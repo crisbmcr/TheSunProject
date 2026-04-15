@@ -131,53 +131,71 @@ object AtlasProjector {
         val hfov = (frame.hfovDeg ?: 65f).coerceIn(1f, 179f)
         val vfov = (frame.vfovDeg ?: 50f).coerceIn(1f, 179f)
 
-        val centerAz = AtlasMath.normalizeAzimuthDeg(frame.measuredAzimuthDeg)
-        val centerAlt = frame.measuredPitchDeg.coerceIn(0f, 90f)
-        val rollAbs = abs(frame.measuredRollDeg)
+        val centerYawDeg = normalizeTwistDeg(baseYawDeg(frame))
+        val centerPitchDeg = basePitchDeg(frame).coerceIn(0f, 90f)
+        val zenithLike = frame.targetPitchDeg >= 80f || centerPitchDeg >= 80f
+        val rollDeg = if (zenithLike && centerPitchDeg >= 84f) 0f else baseRollDeg(frame)
 
-        val cosAlt = cos(Math.toRadians(centerAlt.toDouble())).toFloat().coerceAtLeast(0.08f)
+        val basis = buildProjectionBasisFromAngles(
+            yawDeg = centerYawDeg,
+            pitchDeg = centerPitchDeg,
+            rollDeg = rollDeg,
+            zenithLike = zenithLike,
+            forceHardZenith = zenithLike && centerPitchDeg >= 84f
+        )
 
-        val azHalf = when {
-            centerAlt >= 80f -> 180f
-            centerAlt >= 60f -> (
-                    hfov * 0.5f * (1f / cosAlt).coerceAtMost(2.2f) +
-                            (rollAbs * 0.15f).coerceAtMost(6f)
-                    ).coerceIn(hfov * 0.5f, 180f)
-            centerAlt >= 40f -> (
-                    hfov * 0.5f * (1f / cosAlt).coerceAtMost(1.6f) +
-                            (rollAbs * 0.10f).coerceAtMost(4f)
-                    ).coerceIn(hfov * 0.5f, 180f)
-            else -> (
-                    hfov * 0.5f +
-                            (rollAbs * 0.05f).coerceAtMost(2f)
-                    ).coerceIn(hfov * 0.5f, 180f)
+        val tanHalfH = tan(Math.toRadians(hfov / 2.0)).toFloat()
+        val tanHalfV = tan(Math.toRadians(vfov / 2.0)).toFloat()
+
+        var minYawDelta = Float.POSITIVE_INFINITY
+        var maxYawDelta = Float.NEGATIVE_INFINITY
+        var minAlt = Float.POSITIVE_INFINITY
+        var maxAlt = Float.NEGATIVE_INFINITY
+
+        fun sample(nx: Float, ny: Float) {
+            val camX = nx * tanHalfH
+            val camY = -ny * tanHalfV
+
+            val rayWorld = normalize(
+                add(
+                    add(scale(basis.right, camX), scale(basis.up, camY)),
+                    basis.forward
+                )
+            )
+
+            val azDeg = normalizeTwistDeg(
+                Math.toDegrees(
+                    atan2(rayWorld[0].toDouble(), rayWorld[1].toDouble())
+                ).toFloat()
+            )
+
+            val altDeg = Math.toDegrees(
+                asin(rayWorld[2].coerceIn(-1f, 1f).toDouble())
+            ).toFloat()
+
+            val yawDelta = shortestAngleDeltaDeg(centerYawDeg, azDeg)
+            minYawDelta = minOf(minYawDelta, yawDelta)
+            maxYawDelta = maxOf(maxYawDelta, yawDelta)
+            minAlt = minOf(minAlt, altDeg)
+            maxAlt = maxOf(maxAlt, altDeg)
         }
 
-        val altHalf = (
-                vfov * 0.5f +
-                        when {
-                            centerAlt >= 80f -> 6f
-                            centerAlt >= 60f -> 3f
-                            else -> 0f
-                        } +
-                        (rollAbs * 0.08f).coerceAtMost(3f)
-                ).coerceIn(vfov * 0.5f, 90f)
+        val steps = 24
+        for (i in 0..steps) {
+            val t = i / steps.toFloat()
+            val v = -1f + 2f * t
 
-        val fullAzimuth = centerAlt >= 80f || azHalf >= 179.5f
-
-        val minAlt = (centerAlt - altHalf).coerceIn(0f, 90f)
-        val maxAlt = (centerAlt + altHalf).coerceIn(0f, 90f)
-
-        val constrainedMinAlt = when {
-            frame.targetPitchDeg >= 80f || centerAlt >= 80f -> max(minAlt, 68f)
-            else -> minAlt
+            sample(v, -1f)   // borde superior
+            sample(1f, v)    // borde derecho
+            sample(-v, 1f)   // borde inferior
+            sample(-1f, -v)  // borde izquierdo
         }
 
         return FrameFootprint(
-            minAzimuthDeg = if (fullAzimuth) -180f else centerAz - azHalf,
-            maxAzimuthDeg = if (fullAzimuth) 180f else centerAz + azHalf,
-            minAltitudeDeg = constrainedMinAlt,
-            maxAltitudeDeg = maxAlt
+            minAzimuthDeg = centerYawDeg + minYawDelta,
+            maxAzimuthDeg = centerYawDeg + maxYawDelta,
+            minAltitudeDeg = minAlt.coerceIn(0f, 90f),
+            maxAltitudeDeg = maxAlt.coerceIn(0f, 90f)
         )
     }
 
@@ -235,6 +253,23 @@ object AtlasProjector {
     private fun angularDeltaDeg(a: Float, b: Float): Float {
         val d = ((a - b + 540f) % 360f) - 180f
         return abs(d)
+    }
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        if (edge1 <= edge0) return if (x >= edge1) 1f else 0f
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
+    private fun shortestAngleDeltaDeg(fromDeg: Float, toDeg: Float): Float {
+        var d = (toDeg - fromDeg) % 360f
+        if (d > 180f) d -= 360f
+        if (d < -180f) d += 360f
+        return d
+    }
+
+    private fun lerpAngleDeg(aDeg: Float, bDeg: Float, t: Float): Float {
+        return normalizeTwistDeg(aDeg + shortestAngleDeltaDeg(aDeg, bDeg) * t)
     }
 
     private fun projectOntoPlane(v: FloatArray, normal: FloatArray): FloatArray {
@@ -460,8 +495,8 @@ object AtlasProjector {
         val yawRad = Math.toRadians(yawDeg.toDouble()).toFloat()
         val pitchRad = Math.toRadians(pitchDeg.toDouble()).toFloat()
         val rollRad = Math.toRadians(rollDeg.toDouble()).toFloat()
-        val forward = worldDirectionRad(yawRad, pitchRad)
 
+        val forward = worldDirectionRad(yawRad, pitchRad)
         val right0: FloatArray
         val up0: FloatArray
 
@@ -475,6 +510,7 @@ object AtlasProjector {
                     0f
                 )
             )
+
             up0 = normalize(
                 floatArrayOf(
                     -sin(yawRad),
@@ -487,6 +523,7 @@ object AtlasProjector {
             if (length(r) < 1e-4f) {
                 r = floatArrayOf(1f, 0f, 0f)
             }
+
             r = normalize(r)
             val u = normalize(cross(r, forward))
             right0 = r
@@ -505,7 +542,6 @@ object AtlasProjector {
             up = up
         )
     }
-
     private fun estimateCameraMountBasis(frames: List<FrameRecord>): CameraMountBasis? {
         var count = 0
         var weightSum = 0f
@@ -619,6 +655,10 @@ object AtlasProjector {
             return if (length(projected) < 1e-4f) null else normalize(projected)
         }
 
+        val baseYaw = baseYawDeg(frame)
+        val basePitch = basePitchDeg(frame)
+        val baseRoll = baseRollDeg(frame)
+
         val forward = normalize(mulMat3Vec(rWorldDevice, mount.forwardInDevice))
         val right = normalize(mulMat3Vec(rWorldDevice, mount.rightInDevice))
         val up = normalize(mulMat3Vec(rWorldDevice, mount.upInDevice))
@@ -628,7 +668,6 @@ object AtlasProjector {
         ).toFloat()
 
         val (northT, eastT) = buildLocalTangentBasis(forward)
-
         val rightT = safeNormalizeTangent(right, forward) ?: return null
         val upT = safeNormalizeTangent(up, forward) ?: return null
 
@@ -663,14 +702,25 @@ object AtlasProjector {
                 ).toFloat()
             )
         }
-        val centerYawDeg = normalizeTwistDeg(forwardAzDeg)
-
-        val baseYaw = baseYawDeg(frame)
-        val basePitch = basePitchDeg(frame)
-        val baseRoll = baseRollDeg(frame)
 
         val rawPitchAbsDeg = maxOf(pitchAbsDeg, basePitch)
         val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
+
+        val yawTrust = 1f - smoothstep(84f, 87.5f, rawPitchAbsDeg)
+
+        val rawYawDelta = shortestAngleDeltaDeg(baseYaw, forwardAzDeg)
+        val maxYawDelta = when {
+            rawPitchAbsDeg >= 88.5f -> 4f
+            rawPitchAbsDeg >= 87f -> 7f
+            rawPitchAbsDeg >= 85f -> 12f
+            else -> 20f
+        }
+
+        val clampedMatrixYaw = normalizeTwistDeg(
+            baseYaw + rawYawDelta.coerceIn(-maxYawDelta, maxYawDelta)
+        )
+
+        val centerYawDeg = lerpAngleDeg(baseYaw, clampedMatrixYaw, yawTrust)
 
         val zeroRollBasis = buildProjectionBasisFromAngles(
             yawDeg = centerYawDeg,
@@ -689,7 +739,7 @@ object AtlasProjector {
             atan2(sinR.toDouble(), cosR.toDouble())
         ).toFloat()
 
-        val rollAbsDeg = residualRollDeg
+        val rollAbsDeg = 0f
 
         Log.d(
             "AtlasZenithMatrixSeed",
@@ -697,8 +747,10 @@ object AtlasProjector {
                     "yawForward=${"%.2f".format(forwardAzDeg)} " +
                     "yawTangent=${"%.2f".format(tangentAzDeg)} " +
                     "yawUsed=${"%.2f".format(centerYawDeg)} " +
+                    "yawTrust=${"%.3f".format(yawTrust)} " +
                     "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
                     "pitchAbsClamped=${"%.2f".format(pitchUsedDeg)} " +
+                    "residualRoll=${"%.2f".format(residualRollDeg)} " +
                     "rollAbs=${"%.2f".format(rollAbsDeg)} " +
                     "baseYaw=${"%.2f".format(baseYaw)} " +
                     "basePitch=${"%.2f".format(basePitch)} " +
@@ -712,7 +764,7 @@ object AtlasProjector {
         return buildZenithPoseEstimateFromAbsolute(
             frame = frame,
             absoluteYawDeg = centerYawDeg,
-            absolutePitchDeg = rawPitchAbsDeg,
+            absolutePitchDeg = pitchUsedDeg,
             absoluteRollDeg = rollAbsDeg,
             score = Float.POSITIVE_INFINITY,
             comparedPixels = 0,
