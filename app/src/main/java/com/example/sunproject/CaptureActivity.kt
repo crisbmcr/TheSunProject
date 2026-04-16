@@ -466,38 +466,36 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     val zenithAbsPitch = absolutePitchDeg
                     val zenithAbsRoll = absoluteRollDeg
 
-                    if (!zenithYawLocked && zenithAbsPitch >= 78f) {
+                    if (!zenithYawLocked && zenithAbsPitch >= 82f) {
                         zenithYawLockedDeg = baseDisplayYaw
                         zenithYawLocked = true
                         zenithLockEnteredMs = SystemClock.elapsedRealtime()
                     }
 
-                    val clampedPitch = zenithAbsPitch.coerceIn(zenithAssistExitDeg, 89.7f)
-                    val targetZenithPitch =
-                        ((clampedPitch - zenithAssistExitDeg) / (90f - zenithAssistExitDeg))
-                            .coerceIn(0f, 1f) * 90f
-
                     if (!zenithDisplayInitialized) {
-                        zenithPitchSmoothedDeg = targetZenithPitch
+                        zenithPitchSmoothedDeg = zenithAbsPitch
                         zenithRollSmoothedDeg = zenithAbsRoll
                         zenithDisplayInitialized = true
                     }
 
                     zenithPitchSmoothedDeg =
-                        0.82f * zenithPitchSmoothedDeg + 0.18f * targetZenithPitch
+                        0.90f * zenithPitchSmoothedDeg + 0.10f * zenithAbsPitch
 
                     zenithRollSmoothedDeg =
-                        0.88f * zenithRollSmoothedDeg + 0.12f * zenithAbsRoll
+                        0.92f * zenithRollSmoothedDeg + 0.08f * zenithAbsRoll
 
                     displayAzimuth = normalizeDeg(
                         if (zenithYawLocked) zenithYawLockedDeg else baseDisplayYaw
                     )
 
+                    // En zenith ya no remapeamos el pitch a una escala artificial.
+                    // GuideView ya centra el target zenital por su cuenta.
                     displayPitchDeg = zenithPitchSmoothedDeg
 
                     displayRollDeg = when {
-                        zenithAbsPitch >= 84f -> zenithRollSmoothedDeg * 0.02f
-                        zenithAbsPitch >= 80f -> zenithRollSmoothedDeg * 0.05f
+                        zenithAbsPitch >= 86f -> 0f
+                        zenithAbsPitch >= 82f -> zenithRollSmoothedDeg * 0.02f
+                        zenithAbsPitch >= 78f -> zenithRollSmoothedDeg * 0.05f
                         else -> zenithRollSmoothedDeg * 0.10f
                     }
 
