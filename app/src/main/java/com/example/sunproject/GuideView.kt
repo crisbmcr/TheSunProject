@@ -41,8 +41,14 @@ class GuideView @JvmOverloads constructor(
 
     private val capturePoints = mutableListOf<CapturePoint>()
     private var cameraAzimuth: Float = 0f
+
     private var cameraPitch: Float = 0f
+
     private var cameraRoll: Float = 0f
+
+    // Pitch físico absoluto usado SOLO para decidir la entrada/salida del modo visual zenital.
+// No debe depender del pitch remapeado que se usa para dibujar.
+    private var cameraAbsolutePitchForZenithLatch: Float = 0f
 
     private var horizontalFov = 0f
     private var verticalFov = 0f
@@ -95,16 +101,28 @@ class GuideView @JvmOverloads constructor(
 
     data class CapturePoint(val azimuth: Float, val pitch: Float, var isCaptured: Boolean = false)
 
-    fun updateOrientation(azimuth: Float, pitch: Float, roll: Float) {
+    fun updateOrientation(
+        azimuth: Float,
+        pitch: Float,
+        roll: Float,
+        absolutePitchForZenithLatch: Float = pitch
+    ) {
         this.cameraAzimuth = azimuth
         this.cameraPitch = pitch
         this.cameraRoll = roll
+        this.cameraAbsolutePitchForZenithLatch = absolutePitchForZenithLatch
+
         updateVisualZenithLatch()
+
         buildCameraBasis(azimuth, pitch, roll)
 
         Log.d(
             "SunGuidePose",
-            "az=${"%.2f".format(azimuth)} pitch=${"%.2f".format(pitch)} roll=${"%.2f".format(roll)} zenith=$zenithMode"
+            "az=${"%.2f".format(azimuth)} " +
+                    "pitch=${"%.2f".format(pitch)} " +
+                    "roll=${"%.2f".format(roll)} " +
+                    "absPitchLatch=${"%.2f".format(absolutePitchForZenithLatch)} " +
+                    "zenith=$zenithMode visualLatch=$visualZenithLatched"
         )
 
         updateActivePoint()
@@ -440,6 +458,11 @@ class GuideView @JvmOverloads constructor(
         return "H0=$h0 H45=$h45 Z0=$z0 active=${activePoint?.azimuth}/${activePoint?.pitch} zenithMode=$zenithMode"
     }
 
+    fun isZenithStageActive(): Boolean {
+        val candidates = stageCandidates()
+        return candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
+    }
+
     private fun isVisualZenithMode(): Boolean = visualZenithLatched
 
     private fun updateVisualZenithLatch() {
@@ -448,7 +471,7 @@ class GuideView @JvmOverloads constructor(
             return
         }
 
-        val absPitch = kotlin.math.abs(cameraPitch)
+        val absPitch = kotlin.math.abs(cameraAbsolutePitchForZenithLatch)
         visualZenithLatched = if (visualZenithLatched) {
             absPitch >= visualZenithExitDeg
         } else {
@@ -457,10 +480,9 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun updateActivePoint() {
-
         val candidates = stageCandidates()
 
-        zenithMode = candidates.isNotEmpty() && candidates.all { it.pitch >= 80f }
+        zenithMode = isZenithStageActive()
 
         updateVisualZenithLatch()
 
@@ -476,18 +498,7 @@ class GuideView @JvmOverloads constructor(
             pendingActiveFrames = 0
             return
         }
-        if (zenithMode && candidates.size == 1) {
-            val only = candidates.first()
 
-            if (activePoint !== only) {
-                logTargetChange(activePoint, only, "zenith_single")
-            }
-
-            activePoint = only
-            pendingActivePoint = null
-            pendingActiveFrames = 0
-            return
-        }
         if (candidates.isEmpty()) {
             activePoint = null
             pendingActivePoint = null
@@ -498,23 +509,25 @@ class GuideView @JvmOverloads constructor(
         val now = SystemClock.elapsedRealtime()
         val visible = visibleCandidates(candidates)
         val bestVisible = visible.firstOrNull()
-
         val current = activePoint?.takeUnless { it.isCaptured }
+
         if (current == null) {
             val initial = bestVisible?.point ?: candidates.minByOrNull { candidateScore(it) }
+
             activePoint = initial
             pendingActivePoint = null
             pendingActiveFrames = 0
             lastSwitchAtMs = now
+
             logTargetChange(null, initial, "init")
             return
         }
 
         val currentDist = screenDistancePx(current)
         val bestPoint = bestVisible?.point ?: candidates.minByOrNull { candidateScore(it) }
-        val bestDist = bestVisible?.distPx ?: candidateScore(bestPoint!!)
-
         if (bestPoint == null) return
+
+        val bestDist = bestVisible?.distPx ?: candidateScore(bestPoint)
 
         if (current == bestPoint) {
             pendingActivePoint = null
@@ -546,7 +559,9 @@ class GuideView @JvmOverloads constructor(
             return
         }
 
-        if (bestScore + margin < currentScore && (now - lastSwitchAtMs) >= activeSwitchCooldownMs) {
+        if (bestScore + margin < currentScore &&
+            (now - lastSwitchAtMs) >= activeSwitchCooldownMs
+        ) {
             if (pendingActivePoint == bestPoint) {
                 pendingActiveFrames++
             } else {
@@ -566,6 +581,7 @@ class GuideView @JvmOverloads constructor(
             pendingActivePoint = null
             pendingActiveFrames = 0
         }
+
         Log.d("SunGuideStage", "update ${getStageDebugString()}")
     }
 }

@@ -422,7 +422,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                                 "dispRoll=${"%.2f".format(displayRollDeg)} " +
                                 "zenith="
                     )
-                    guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+                    guideView.updateOrientation(
+                        displayAzimuth,
+                        displayPitchDeg,
+                        displayRollDeg,
+                        absolutePitchDeg
+                    )
                     checkAutoCapture()
 
                 }
@@ -446,7 +451,8 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     displayOffsetInitialized = true
                 }
 
-                val zenithTargetActive = isZenithTarget(guideView.getActiveCapturePoint())
+                val zenithTargetActive =
+                    guideView.isZenithStageActive() || isZenithTarget(guideView.getActiveCapturePoint())
 
                 val nearZenith = updateZenithAssistLatch(zenithTargetActive, absolutePitchDeg)
 
@@ -507,7 +513,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     displayRollDeg = gameRollDeg
                 }
 
-                guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+                guideView.updateOrientation(
+                    displayAzimuth,
+                    displayPitchDeg,
+                    displayRollDeg,
+                    absolutePitchDeg
+                )
 
                 Log.d(
                     "SunSensorFusion",
@@ -790,7 +801,12 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     Log.d("SunGuideStage", "after_save ${guideView.getStageDebugString()}")
 
                     runOnUiThread {
-                        guideView.updateOrientation(displayAzimuth, displayPitchDeg, displayRollDeg)
+                        guideView.updateOrientation(
+                            displayAzimuth,
+                            displayPitchDeg,
+                            displayRollDeg,
+                            absolutePitchDeg
+                        )
                         guideView.invalidate()
                     }
 
