@@ -78,8 +78,15 @@ class GuideView @JvmOverloads constructor(
     private var latchedProjectionYawDeg = 0f
 
     private var visualZenithLatched = false
-    private val visualZenithEnterDeg = 70f
-    private val visualZenithExitDeg = 64f
+
+    // El assist zenital puede arrancar antes, pero el centrado visual del Z0 no debe
+// colapsar sobre la mira apenas cruzamos 70°.
+    private val visualZenithEnterDeg = 82f
+    private val visualZenithExitDeg = 76f
+
+    // Ventana de transición suave hacia el centro para el punto Z0.
+    private val zenithCenterBlendStartDeg = 78f
+    private val zenithCenterBlendEndDeg = 84f
 
     init {
         setupCapturePoints()
@@ -161,10 +168,6 @@ class GuideView @JvmOverloads constructor(
     }
 
     private fun projectToScreen(targetAzimuth: Float, targetPitch: Float): Pair<Float, Float>? {
-        if (isVisualZenithMode() && targetPitch >= 80f) {
-            return Pair(width / 2f, height / 2f)
-        }
-
         val dir = worldDir(targetAzimuth, targetPitch)
 
         val camX = dot(dir, camRight)
@@ -175,23 +178,51 @@ class GuideView @JvmOverloads constructor(
 
         val nx = (camX / camZ) / tanHorizontalFovHalf
         val ny = (camY / camZ) / tanVerticalFovHalf
+
         if (targetPitch == 45f || targetPitch >= 80f || targetPitch == 0f) {
             Log.d(
                 "SunProjectToScreen",
                 "target=$targetAzimuth/$targetPitch camZ=${"%.3f".format(camZ)} " +
                         "camX=${"%.3f".format(camX)} camY=${"%.3f".format(camY)} " +
-                        "nx=${"%.3f".format(nx)} ny=${"%.3f".format(ny)} zenith=$zenithMode"
+                        "nx=${"%.3f".format(nx)} ny=${"%.3f".format(ny)} " +
+                        "zenith=$zenithMode visualLatch=$visualZenithLatched " +
+                        "blend=${"%.3f".format(zenithCenterBlend())}"
             )
         }
+
         if (abs(nx) > 1f || abs(ny) > 1f) return null
 
         val cx = width / 2f
         val cy = height / 2f
 
-        val x = cx + nx * cx
-        val y = cy - ny * cy
+        val baseX = cx + nx * cx
+        val baseY = cy - ny * cy
 
-        return Pair(x, y)
+        // Para Z0 no hacer snap instantáneo al centro. Acercarlo suavemente
+        // cuando el pitch absoluto ya está realmente cerca del zenith.
+        if (targetPitch >= 80f) {
+            val t = zenithCenterBlend()
+            val x = baseX + (cx - baseX) * t
+            val y = baseY + (cy - baseY) * t
+            return Pair(x, y)
+        }
+
+        return Pair(baseX, baseY)
+    }
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        if (edge1 <= edge0) return if (x >= edge1) 1f else 0f
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
+    private fun zenithCenterBlend(): Float {
+        val absPitch = kotlin.math.abs(cameraAbsolutePitchForZenithLatch)
+        return smoothstep(
+            zenithCenterBlendStartDeg,
+            zenithCenterBlendEndDeg,
+            absPitch
+        )
     }
 
     private fun setupCapturePoints() {
