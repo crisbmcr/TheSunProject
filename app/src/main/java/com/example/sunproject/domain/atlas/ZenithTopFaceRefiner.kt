@@ -97,6 +97,9 @@ object ZenithTopFaceRefiner {
     private const val OBJECTIVE_LUMA_DIFF_SCALE = 400f
     private const val OBJECTIVE_RESIDUAL_TWIST_SCALE = 4f
 
+    private const val LOCAL_YAW_PRIOR_STEP_DEG = 12f
+    private const val LOCAL_YAW_PRIOR_MAX_ABS_DEG = 36f
+    private const val MAX_PHASE_RESIDUAL_YAW_DEG = 24f
     // Usamos luma normalizada [0..1] para que la penalización no opaque por completo al ECC.
     private const val DEFAULT_REJECT_MEAN_ABS_LUMA_DIFF01 = 1f
 
@@ -129,6 +132,7 @@ object ZenithTopFaceRefiner {
     )
     private data class ZenithRefinementCandidate(
         val label: String,
+        val priorOffsetDeg: Float,
         val twistDeg: Float,
         val pitchOffsetDeg: Float,
         val rollOffsetDeg: Float,
@@ -159,37 +163,35 @@ object ZenithTopFaceRefiner {
         seedAbsolutePitchDeg: Float?,
         seedAbsoluteRollDeg: Float?
     ): List<ZenithRefinementCandidate> {
-        val yawSteps = listOf(0f, 90f, 180f, 270f)
+        val yawOffsetsDeg = listOf(
+            0f,
+            -LOCAL_YAW_PRIOR_STEP_DEG,
+            LOCAL_YAW_PRIOR_STEP_DEG,
+            -2f * LOCAL_YAW_PRIOR_STEP_DEG,
+            2f * LOCAL_YAW_PRIOR_STEP_DEG,
+            -LOCAL_YAW_PRIOR_MAX_ABS_DEG,
+            LOCAL_YAW_PRIOR_MAX_ABS_DEG
+        )
 
-        val hasAbsoluteSeed =
-            seedAbsoluteYawDeg != null &&
-                    seedAbsolutePitchDeg != null &&
-                    seedAbsoluteRollDeg != null
+        fun labelFor(offsetDeg: Float): String {
+            return when {
+                offsetDeg > 0f -> "yaw_p${offsetDeg.toInt()}"
+                offsetDeg < 0f -> "yaw_m${abs(offsetDeg).toInt()}"
+                else -> "yaw_0"
+            }
+        }
 
-        return if (hasAbsoluteSeed) {
-            yawSteps.map { deltaYawDeg ->
-                ZenithRefinementCandidate(
-                    label = "abs_${deltaYawDeg.toInt()}",
-                    twistDeg = normalizeDeg(seedTwistDeg + deltaYawDeg),
-                    pitchOffsetDeg = seedPitchOffsetDeg,
-                    rollOffsetDeg = seedRollOffsetDeg,
-                    absoluteYawDeg = normalizeDeg(seedAbsoluteYawDeg!! + deltaYawDeg),
-                    absolutePitchDeg = seedAbsolutePitchDeg,
-                    absoluteRollDeg = seedAbsoluteRollDeg
-                )
-            }
-        } else {
-            yawSteps.map { deltaYawDeg ->
-                ZenithRefinementCandidate(
-                    label = "legacy_${deltaYawDeg.toInt()}",
-                    twistDeg = normalizeDeg(seedTwistDeg + deltaYawDeg),
-                    pitchOffsetDeg = seedPitchOffsetDeg,
-                    rollOffsetDeg = seedRollOffsetDeg,
-                    absoluteYawDeg = null,
-                    absolutePitchDeg = null,
-                    absoluteRollDeg = null
-                )
-            }
+        return yawOffsetsDeg.map { offsetDeg ->
+            ZenithRefinementCandidate(
+                label = labelFor(offsetDeg),
+                priorOffsetDeg = offsetDeg,
+                twistDeg = normalizeDeg(seedTwistDeg + offsetDeg),
+                pitchOffsetDeg = seedPitchOffsetDeg,
+                rollOffsetDeg = seedRollOffsetDeg,
+                absoluteYawDeg = seedAbsoluteYawDeg?.let { normalizeDeg(it + offsetDeg) },
+                absolutePitchDeg = seedAbsolutePitchDeg,
+                absoluteRollDeg = seedAbsoluteRollDeg
+            )
         }
     }
 
@@ -332,6 +334,7 @@ object ZenithTopFaceRefiner {
             frame = frame,
             seedAbsolutePitchDeg = seedAbsolutePitchDeg
         )
+        val baseSeedTwistDeg = normalizeDeg(seedTwistDeg)
         try {
             val candidates = buildZenithRefinementCandidates(
                 seedTwistDeg = seedTwistDeg,
@@ -356,20 +359,30 @@ object ZenithTopFaceRefiner {
                 )
 
                 try {
-                    val residualAnnulusTwistDeg = estimateTwistFromAnnulus(
+                    val rawAnnulusResidualDeg = estimateTwistFromAnnulus(
                         reference = atlasTop,
                         moving = zenithTop,
                         minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
                         maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
                     )
 
-                    val residualInitialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
+                    val residualAnnulusTwistDeg = clampSignedResidualYawDeg(
+                        rawAnnulusResidualDeg,
+                        MAX_PHASE_RESIDUAL_YAW_DEG
+                    )
+
+                    val rawPhaseResidualDeg = estimateTwistWithPolarPhaseCorrelation(
                         reference = atlasTop,
                         moving = zenithTop,
                         minAltitudeDeg = POLAR_PHASE_MIN_ALT_DEG,
                         maxAltitudeDeg = POLAR_PHASE_MAX_ALT_DEG,
                         coarseTwistDeg = residualAnnulusTwistDeg
-                    ) ?: residualAnnulusTwistDeg
+                    )
+
+                    val residualInitialTwistDeg = clampSignedResidualYawDeg(
+                        rawPhaseResidualDeg ?: residualAnnulusTwistDeg,
+                        MAX_PHASE_RESIDUAL_YAW_DEG
+                    )
 
                     val residualRefined = refineWithEcc(
                         reference = atlasTop,
@@ -378,7 +391,6 @@ object ZenithTopFaceRefiner {
                         eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
                         eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
                     )
-
                     val absoluteInitialTwistDeg =
                         normalizeDeg(candidate.twistDeg + residualInitialTwistDeg)
 
@@ -402,7 +414,7 @@ object ZenithTopFaceRefiner {
 
                     val residualTwistAbsDeg = shortestAngleAbsDeg(
                         candidateResult.finalTwistDeg,
-                        candidate.twistDeg
+                        baseSeedTwistDeg
                     )
 
                     val acceptedForBlend = isAcceptableFinalBlend(
@@ -430,7 +442,11 @@ object ZenithTopFaceRefiner {
                                 "idx=$index " +
                                 "label=${candidate.label} " +
                                 "seedYaw=${candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
+                                "baseSeedTwist=${"%.2f".format(baseSeedTwistDeg)} " +
+                                "priorOffset=${"%.2f".format(candidate.priorOffsetDeg)} " +
                                 "seedTwist=${"%.2f".format(candidate.twistDeg)} " +
+                                "annulusResidual=${"%.2f".format(residualAnnulusTwistDeg)} " +
+                                "phaseResidual=${"%.2f".format(residualInitialTwistDeg)} " +
                                 "initialTwist=${"%.2f".format(candidateResult.initialTwistDeg)} " +
                                 "finalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
                                 "residualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
@@ -549,7 +565,7 @@ object ZenithTopFaceRefiner {
         for (y in 0 until faceSizePx) {
             for (x in 0 until faceSizePx) {
                 val dir = topFaceDirection(x, y, center, radius)
-                val azDeg = normalizeDeg(radToDeg(atan2(dir[1], dir[0])))
+                val azDeg = normalizeDeg(radToDeg(atan2(dir[0], dir[1])))
                 val altDeg = radToDeg(atan2(dir[2], sqrt(dir[0] * dir[0] + dir[1] * dir[1])))
 
                 val atlasX = AtlasMath.azimuthToX(azDeg, atlas.config).coerceIn(0, atlas.width - 1)
@@ -1791,6 +1807,12 @@ object ZenithTopFaceRefiner {
         while (v > 180f) v -= 360f
         return v
     }
+    private fun clampSignedResidualYawDeg(
+        valueDeg: Float,
+        maxAbsDeg: Float
+    ): Float {
+        return normalizeSignedDeg(valueDeg).coerceIn(-maxAbsDeg, maxAbsDeg)
+    }
     private fun buildAnnulusSignature(
         face: TopFace,
         minAltitudeDeg: Float,
@@ -1939,9 +1961,11 @@ object ZenithTopFaceRefiner {
     private fun worldDirectionRad(yawRad: Float, pitchRad: Float): FloatArray {
         val cp = cos(pitchRad)
         val sp = sin(pitchRad)
-        val cy = cos(yawRad)
-        val sy = sin(yawRad)
-        return floatArrayOf(cp * cy, cp * sy, sp)
+
+        val xEast = cp * sin(yawRad)
+        val yNorth = cp * cos(yawRad)
+
+        return floatArrayOf(xEast, yNorth, sp)
     }
 
     private fun dot(a: FloatArray, b: FloatArray): Float =
