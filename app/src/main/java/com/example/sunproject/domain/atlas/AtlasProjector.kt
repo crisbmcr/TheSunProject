@@ -774,9 +774,7 @@ object AtlasProjector {
 
         val yawTrust = smoothstep(84f, 87.5f, rawPitchAbsDeg)
 
-        val centerYawDeg = if (useHardZenithBranch && rawPitchAbsDeg >= 87f) {
-            // En zenith duro no conviene arrastrar el yaw hacia baseYaw.
-            // La orientación útil es la tangencial/local.
+        val interpolatedYawDeg = if (useHardZenithBranch && rawPitchAbsDeg >= 87f) {
             preferredMatrixYawDeg
         } else {
             val maxYawDelta = when {
@@ -791,6 +789,18 @@ object AtlasProjector {
             )
 
             lerpAngleDeg(baseYaw, clampedMatrixYaw, yawTrust)
+        }
+
+        val hardZenithSeed = useHardZenithBranch || rawPitchAbsDeg >= 87f
+
+        val forcePreferredYaw =
+            hardZenithSeed &&
+                    abs(shortestAngleDeltaDeg(interpolatedYawDeg, preferredMatrixYawDeg)) > 2f
+
+        val centerYawDeg = if (forcePreferredYaw) {
+            preferredMatrixYawDeg
+        } else {
+            interpolatedYawDeg
         }
 
         val zeroRollBasis = buildProjectionBasisFromAngles(
@@ -821,6 +831,8 @@ object AtlasProjector {
                     "yawUsed=${"%.2f".format(centerYawDeg)} " +
                     "yawErrorToPreferred=${"%.2f".format(shortestAngleDeltaDeg(centerYawDeg, preferredMatrixYawDeg))} " +
                     "yawTrust=${"%.3f".format(yawTrust)} " +
+                    "hardZenithSeed=$hardZenithSeed " +
+                    "forcedToPreferred=$forcePreferredYaw " +
                     "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
                     "pitchAbsClamped=${"%.2f".format(pitchUsedDeg)} " +
                     "residualRoll=${"%.2f".format(residualRollDeg)} " +

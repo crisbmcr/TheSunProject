@@ -84,7 +84,16 @@ object ZenithTopFaceRefiner {
     private const val ZENITH_COLOR_CORR_MIN_ALT_DEG = 70f
     private const val ZENITH_COLOR_CORR_MAX_ALT_DEG = 80f
     private const val ZENITH_COLOR_CORR_MIN_BASE_WEIGHT = 0.05f
+    private const val MAX_FINAL_BLEND_RESIDUAL_TWIST_DEG = 75f
+    private const val MAX_FINAL_BLEND_HARD_RESIDUAL_TWIST_DEG = 60f
 
+    private const val OBJECTIVE_ECC_SCALE = 1000f
+    private const val OBJECTIVE_OVERLAP_SCALE = 0.02f
+    private const val OBJECTIVE_LUMA_DIFF_SCALE = 400f
+    private const val OBJECTIVE_RESIDUAL_TWIST_SCALE = 4f
+
+    // Usamos luma normalizada [0..1] para que la penalización no opaque por completo al ECC.
+    private const val DEFAULT_REJECT_MEAN_ABS_LUMA_DIFF01 = 1f
 
     data class TopFace(
         val rgba: Mat,
@@ -123,9 +132,16 @@ object ZenithTopFaceRefiner {
         val absoluteRollDeg: Float?
     )
 
+    private data class CandidateSeamScore(
+        val overlapCount: Int,
+        val meanAbsLumaDiff01: Float
+    )
+
     private data class CandidateEvaluation(
         val candidate: ZenithRefinementCandidate,
         val result: RefinementResult,
+        val seamScore: CandidateSeamScore,
+        val residualTwistAbsDeg: Float,
         val acceptedForBlend: Boolean,
         val objectiveScore: Float
     )
@@ -172,19 +188,109 @@ object ZenithTopFaceRefiner {
         }
     }
 
-    private fun isAcceptableFinalBlend(result: RefinementResult): Boolean {
-        return result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
-                abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG
+    private fun maxResidualTwistForBlend(
+        frame: FrameRecord,
+        seedAbsolutePitchDeg: Float?
+    ): Float {
+        val hardZenith =
+            (seedAbsolutePitchDeg ?: Float.NEGATIVE_INFINITY) >= 87f ||
+                    frame.targetPitchDeg >= 88f ||
+                    frame.ringId.equals("Z0", ignoreCase = true)
+
+        return if (hardZenith) {
+            MAX_FINAL_BLEND_HARD_RESIDUAL_TWIST_DEG
+        } else {
+            MAX_FINAL_BLEND_RESIDUAL_TWIST_DEG
+        }
     }
 
-    private fun refinementObjectiveScore(result: RefinementResult): Float {
-        return (result.eccScore.toFloat() * 1000f) -
-                (abs(result.eccRotationDeg) * 30f)
+    private fun isAcceptableFinalBlend(
+        result: RefinementResult,
+        residualTwistAbsDeg: Float,
+        maxResidualTwistDeg: Float
+    ): Boolean {
+        return result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
+                abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG &&
+                residualTwistAbsDeg <= maxResidualTwistDeg
+    }
+
+    private fun refinementObjectiveScore(
+        result: RefinementResult,
+        seamScore: CandidateSeamScore,
+        residualTwistAbsDeg: Float
+    ): Float {
+        return result.eccScore.toFloat() * OBJECTIVE_ECC_SCALE +
+                seamScore.overlapCount.toFloat() * OBJECTIVE_OVERLAP_SCALE -
+                seamScore.meanAbsLumaDiff01 * OBJECTIVE_LUMA_DIFF_SCALE -
+                residualTwistAbsDeg * OBJECTIVE_RESIDUAL_TWIST_SCALE
     }
 
     private fun releaseCandidateEvaluation(eval: CandidateEvaluation?) {
         if (eval == null) return
         releaseTopFace(eval.result.alignedTopFace)
+    }
+    private fun evaluateCandidateSeamScore(
+        aligned: TopFace,
+        atlas: SkyAtlas,
+        minAltitudeDeg: Float = maxOf(BLEND_MIN_ALT_DEG, ZENITH_COLOR_CORR_MIN_ALT_DEG),
+        maxAltitudeDeg: Float = ZENITH_COLOR_CORR_MAX_ALT_DEG
+    ): CandidateSeamScore {
+        val facePixels = rgbaMatToArgb(aligned.rgba)
+
+        val yA = AtlasMath.altitudeToY(minAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
+        val yB = AtlasMath.altitudeToY(maxAltitudeDeg, atlas.config).coerceIn(0, atlas.height - 1)
+
+        val yStart = minOf(yA, yB)
+        val yEnd = maxOf(yA, yB)
+
+        var overlapCount = 0
+        var lumaDiffSum01 = 0f
+
+        for (y in yStart..yEnd) {
+            val altDeg = AtlasMath.yToAltitude(y, atlas.config)
+            if (altDeg < minAltitudeDeg || altDeg > maxAltitudeDeg) continue
+
+            for (x in 0 until atlas.width) {
+                if (atlas.weightAt(x, y) < ZENITH_COLOR_CORR_MIN_BASE_WEIGHT) continue
+
+                val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
+
+                val sampled = sampleTopFaceWithFallback(
+                    face = aligned,
+                    facePixels = facePixels,
+                    azDeg = azDeg,
+                    altDeg = altDeg
+                ) ?: continue
+
+                val atlasColor = atlas.pixels[atlas.index(x, y)]
+
+                lumaDiffSum01 += abs(colorLuma01(atlasColor) - colorLuma01(sampled.color))
+                overlapCount++
+            }
+        }
+
+        return CandidateSeamScore(
+            overlapCount = overlapCount,
+            meanAbsLumaDiff01 = if (overlapCount > 0) {
+                lumaDiffSum01 / overlapCount.toFloat()
+            } else {
+                DEFAULT_REJECT_MEAN_ABS_LUMA_DIFF01
+            }
+        )
+    }
+
+    private fun colorLuma01(color: Int): Float {
+        return (
+                0.299f * Color.red(color) +
+                        0.587f * Color.green(color) +
+                        0.114f * Color.blue(color)
+                ) / 255f
+    }
+
+    private fun shortestAngleAbsDeg(aDeg: Float, bDeg: Float): Float {
+        var delta = normalizeDeg(aDeg - bDeg)
+        if (delta > 180f) delta -= 360f
+        return abs(delta)
     }
     fun refineAndBlendZenithIntoAtlas(
         atlas: SkyAtlas,
@@ -205,7 +311,10 @@ object ZenithTopFaceRefiner {
         val atlasTop = buildAtlasTopFace(atlas, FACE_SIZE_PX)
         var bestAccepted: CandidateEvaluation? = null
         var bestRejected: CandidateEvaluation? = null
-
+        val maxResidualTwistDeg = maxResidualTwistForBlend(
+            frame = frame,
+            seedAbsolutePitchDeg = seedAbsolutePitchDeg
+        )
         try {
             val candidates = buildZenithRefinementCandidates(
                 seedTwistDeg = seedTwistDeg,
@@ -269,8 +378,27 @@ object ZenithTopFaceRefiner {
                         alignedTopFace = residualRefined.alignedTopFace
                     )
 
-                    val acceptedForBlend = isAcceptableFinalBlend(candidateResult)
-                    val objectiveScore = refinementObjectiveScore(candidateResult)
+                    val seamScore = evaluateCandidateSeamScore(
+                        aligned = candidateResult.alignedTopFace,
+                        atlas = atlas
+                    )
+
+                    val residualTwistAbsDeg = shortestAngleAbsDeg(
+                        candidateResult.finalTwistDeg,
+                        candidate.twistDeg
+                    )
+
+                    val acceptedForBlend = isAcceptableFinalBlend(
+                        result = candidateResult,
+                        residualTwistAbsDeg = residualTwistAbsDeg,
+                        maxResidualTwistDeg = maxResidualTwistDeg
+                    )
+
+                    val objectiveScore = refinementObjectiveScore(
+                        result = candidateResult,
+                        seamScore = seamScore,
+                        residualTwistAbsDeg = residualTwistAbsDeg
+                    )
 
                     Log.d(
                         "AtlasZenithTopCandidate",
@@ -281,8 +409,12 @@ object ZenithTopFaceRefiner {
                                 "seedTwist=${"%.2f".format(candidate.twistDeg)} " +
                                 "initialTwist=${"%.2f".format(candidateResult.initialTwistDeg)} " +
                                 "finalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
+                                "residualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
+                                "maxResidualTwist=${"%.2f".format(maxResidualTwistDeg)} " +
                                 "eccRot=${"%.2f".format(candidateResult.eccRotationDeg)} " +
                                 "eccScore=${"%.5f".format(candidateResult.eccScore)} " +
+                                "overlap=${seamScore.overlapCount} " +
+                                "meanAbsLumaDiff01=${"%.5f".format(seamScore.meanAbsLumaDiff01)} " +
                                 "accepted=$acceptedForBlend " +
                                 "objective=${"%.2f".format(objectiveScore)}"
                     )
@@ -290,6 +422,8 @@ object ZenithTopFaceRefiner {
                     val evaluation = CandidateEvaluation(
                         candidate = candidate,
                         result = candidateResult,
+                        seamScore = seamScore,
+                        residualTwistAbsDeg = residualTwistAbsDeg,
                         acceptedForBlend = acceptedForBlend,
                         objectiveScore = objectiveScore
                     )
@@ -328,8 +462,11 @@ object ZenithTopFaceRefiner {
                             "bestRejectedLabel=${bestRejected?.candidate?.label ?: "none"} " +
                             "bestRejectedSeedYaw=${bestRejected?.candidate?.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
                             "bestRejectedFinalTwist=${bestRejected?.let { "%.2f".format(it.result.finalTwistDeg) } ?: "NaN"} " +
+                            "bestRejectedResidualTwist=${bestRejected?.let { "%.2f".format(it.residualTwistAbsDeg) } ?: "NaN"} " +
                             "bestRejectedEccRot=${bestRejected?.let { "%.2f".format(it.result.eccRotationDeg) } ?: "NaN"} " +
-                            "bestRejectedEccScore=${bestRejected?.let { "%.5f".format(it.result.eccScore) } ?: "NaN"}"
+                            "bestRejectedEccScore=${bestRejected?.let { "%.5f".format(it.result.eccScore) } ?: "NaN"} " +
+                            "bestRejectedOverlap=${bestRejected?.seamScore?.overlapCount ?: 0} " +
+                            "bestRejectedMeanAbsLumaDiff01=${bestRejected?.seamScore?.let { "%.5f".format(it.meanAbsLumaDiff01) } ?: "NaN"}"
                 )
                 releaseCandidateEvaluation(bestRejected)
                 return null
@@ -359,8 +496,12 @@ object ZenithTopFaceRefiner {
                         "seedYaw=${winner.candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
                         "initialTwist=${"%.2f".format(winner.result.initialTwistDeg)} " +
                         "finalTwist=${"%.2f".format(winner.result.finalTwistDeg)} " +
+                        "residualTwist=${"%.2f".format(winner.residualTwistAbsDeg)} " +
                         "eccRot=${"%.2f".format(winner.result.eccRotationDeg)} " +
-                        "eccScore=${"%.5f".format(winner.result.eccScore)}"
+                        "eccScore=${"%.5f".format(winner.result.eccScore)} " +
+                        "overlap=${winner.seamScore.overlapCount} " +
+                        "meanAbsLumaDiff01=${"%.5f".format(winner.seamScore.meanAbsLumaDiff01)} " +
+                        "objective=${"%.2f".format(winner.objectiveScore)}"
             )
 
             return winner.result
