@@ -78,6 +78,7 @@ private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
 private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
 private const val PERSISTED_MOUNT_MAX_FORWARD_TILT_DEG = 4.5f
 
+
 private const val FRAME_RGB_GAIN_MIN = 0.92f
 
 private const val FRAME_RGB_GAIN_MAX = 1.08f
@@ -771,20 +772,26 @@ object AtlasProjector {
 
         val rawYawDelta = shortestAngleDeltaDeg(baseYaw, preferredMatrixYawDeg)
 
-        val maxYawDelta = when {
-            rawPitchAbsDeg >= 88.5f -> 18f
-            rawPitchAbsDeg >= 87f -> 22f
-            rawPitchAbsDeg >= 85f -> 28f
-            else -> 30f
-        }
-
-        val clampedMatrixYaw = normalizeTwistDeg(
-            baseYaw + rawYawDelta.coerceIn(-maxYawDelta, maxYawDelta)
-        )
-
         val yawTrust = smoothstep(84f, 87.5f, rawPitchAbsDeg)
 
-        val centerYawDeg = lerpAngleDeg(baseYaw, clampedMatrixYaw, yawTrust)
+        val centerYawDeg = if (useHardZenithBranch && rawPitchAbsDeg >= 87f) {
+            // En zenith duro no conviene arrastrar el yaw hacia baseYaw.
+            // La orientación útil es la tangencial/local.
+            preferredMatrixYawDeg
+        } else {
+            val maxYawDelta = when {
+                rawPitchAbsDeg >= 88.5f -> 18f
+                rawPitchAbsDeg >= 87f -> 22f
+                rawPitchAbsDeg >= 85f -> 28f
+                else -> 30f
+            }
+
+            val clampedMatrixYaw = normalizeTwistDeg(
+                baseYaw + rawYawDelta.coerceIn(-maxYawDelta, maxYawDelta)
+            )
+
+            lerpAngleDeg(baseYaw, clampedMatrixYaw, yawTrust)
+        }
 
         val zeroRollBasis = buildProjectionBasisFromAngles(
             yawDeg = centerYawDeg,
@@ -812,6 +819,7 @@ object AtlasProjector {
                     "yawTangent=${"%.2f".format(tangentAzDeg)} " +
                     "yawPreferred=${"%.2f".format(preferredMatrixYawDeg)} " +
                     "yawUsed=${"%.2f".format(centerYawDeg)} " +
+                    "yawErrorToPreferred=${"%.2f".format(shortestAngleDeltaDeg(centerYawDeg, preferredMatrixYawDeg))} " +
                     "yawTrust=${"%.3f".format(yawTrust)} " +
                     "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
                     "pitchAbsClamped=${"%.2f".format(pitchUsedDeg)} " +

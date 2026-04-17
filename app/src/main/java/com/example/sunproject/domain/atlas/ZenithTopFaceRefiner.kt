@@ -26,10 +26,10 @@ object ZenithTopFaceRefiner {
     // ECC translation intentionally disabled for zenith refinement.
 // Keep only rotational residual refinement here.
     private const val FACE_SIZE_PX = 512
-    private const val ANNULUS_MIN_ALT_DEG = 72f
-    private const val ANNULUS_MAX_ALT_DEG = 78f
-    private const val ECC_MIN_ALT_DEG = 68f
-    private const val ECC_MAX_ALT_DEG = 88f
+    private const val ANNULUS_MIN_ALT_DEG = 68f
+    private const val ANNULUS_MAX_ALT_DEG = 76f
+    private const val ECC_MIN_ALT_DEG = 66f
+    private const val ECC_MAX_ALT_DEG = 86f
     private data class PolarPhaseStrip(
         val gray32: Mat,
         val valid32: Mat,
@@ -37,24 +37,26 @@ object ZenithTopFaceRefiner {
         val radialBins: Int
     )
 
-    private const val BLEND_MIN_ALT_DEG = 74f
-    private const val POLAR_PHASE_MIN_ALT_DEG = 74f
-    private const val POLAR_PHASE_MAX_ALT_DEG = 88f
+    private const val BLEND_MIN_ALT_DEG = 70f
+    private const val POLAR_PHASE_MIN_ALT_DEG = 70f
+    private const val POLAR_PHASE_MAX_ALT_DEG = 86f
+
     private const val POLAR_PHASE_ANGLE_BINS = 720
     private const val POLAR_PHASE_RADIAL_BINS = 96
     private const val MIN_POLAR_PHASE_RESPONSE = 0.03
     private const val MIN_POLAR_PHASE_COVERAGE = 0.12f
 
-    private const val BLEND_FEATHER_START_ALT_DEG = 80f
-    private const val BLEND_FEATHER_FULL_ALT_DEG = 88f
+    private const val BLEND_FEATHER_START_ALT_DEG = 76f
+    private const val BLEND_FEATHER_FULL_ALT_DEG = 86f
     private const val ZENITH_EDGE_FADE_START_ALT_DEG = BLEND_MIN_ALT_DEG
-    private const val ZENITH_EDGE_FADE_FULL_ALT_DEG = 84f
+    private const val ZENITH_EDGE_FADE_FULL_ALT_DEG = 82f
+
     private const val ZENITH_EDGE_MIN_ALPHA = 0.15f
 
     private const val RGB_GAIN_MIN = 0.92f
     private const val RGB_GAIN_MAX = 1.08f
 
-    private const val POLAR_CAP_FILL_MIN_ALT_DEG = 84f
+    private const val POLAR_CAP_FILL_MIN_ALT_DEG = 82f
     private const val POLAR_CAP_NEAREST_RADIUS_PX = 2
     private const val MIN_ECC_ACCEPT_SCORE = 0.12
     private const val STRONG_ECC_ACCEPT_SCORE = 0.20
@@ -79,9 +81,9 @@ object ZenithTopFaceRefiner {
 
     private const val POLAR_CAP_MIN_EXISTING_WEIGHT = 0.18f
 
-    private const val ZENITH_COLOR_CORR_MIN_ALT_DEG = 76f
-    private const val ZENITH_COLOR_CORR_MAX_ALT_DEG = 84f
-    private const val ZENITH_COLOR_CORR_MIN_BASE_WEIGHT = 0.18f
+    private const val ZENITH_COLOR_CORR_MIN_ALT_DEG = 70f
+    private const val ZENITH_COLOR_CORR_MAX_ALT_DEG = 80f
+    private const val ZENITH_COLOR_CORR_MIN_BASE_WEIGHT = 0.05f
 
 
     data class TopFace(
