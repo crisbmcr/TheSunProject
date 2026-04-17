@@ -66,7 +66,7 @@ object ZenithTopFaceRefiner {
     private const val COLOR_MATCH_NEUTRAL_AT_ALT_DEG = 84f
     private const val MIN_COLOR_CORRECTION_STRENGTH = 0.35f
     private const val COLOR_GAIN_CLAMP_EPS = 0.002f
-    private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = -90f
+    private const val ZENITH_TOPFACE_YAW_OFFSET_DEG = 0f
 
     private const val MIN_FINAL_BLEND_ECC_SCORE = 0.18
     private const val MAX_FINAL_BLEND_ABS_ROT_DEG = 2.5f
@@ -303,12 +303,11 @@ object ZenithTopFaceRefiner {
             "AtlasZenithSeed",
             "frame=${frame.frameId} " +
                     "source=${if (hasAbsoluteSeed) "absolute" else "legacy"} " +
-                    "targetAz=${"%.2f".format(frame.targetAzimuthDeg)} " +
-                    "measuredAz=${"%.2f".format(frame.measuredAzimuthDeg)} " +
-                    "rawAbsYaw=${if (hasAbsoluteSeed) "%.2f".format(rawAbsoluteYawDeg) else "NaN"} " +
-                    "topFaceYaw=${"%.2f".format(yawDeg)} " +
-                    "pitchSeed=${"%.2f".format(pitchDeg)} " +
-                    "rollSeed=${"%.2f".format(rollDeg)}"
+                    "rawAbsoluteYaw=${"%.2f".format(rawAbsoluteYawDeg)} " +
+                    "yawTopFaceUsed=${"%.2f".format(yawDeg)} " +
+                    "pitchUsed=${"%.2f".format(pitchDeg)} " +
+                    "rollUsed=${"%.2f".format(rollDeg)} " +
+                    "yawOffset=${"%.2f".format(ZENITH_TOPFACE_YAW_OFFSET_DEG)}"
         )
 
         val yawRad = degToRad(yawDeg)
