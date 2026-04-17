@@ -67,11 +67,11 @@ private const val ZENITH_MATRIX_SEED_MIN_RAW_PITCH_DEG = 84.5f
 private const val ZENITH_MATRIX_SEED_MAX_ABS_ROLL_DEG = 3.0f
 private const val ZENITH_MATRIX_SEED_MAX_FORWARD_TILT_DEG = 6.0f
 
-private const val ZENITH_REFINER_MIN_RAW_PITCH_DEG = 88.5f
+private const val ZENITH_REFINER_MIN_RAW_PITCH_DEG = 85.5f
 private const val ZENITH_REFINER_MAX_ABS_ROLL_DEG = 1.0f
 private const val ZENITH_REFINER_MAX_ABS_ECC_ROT_DEG = 1.5f
 private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
-private const val ENABLE_ZENITH_TOPFACE_REFINER = false
+private const val ENABLE_ZENITH_TOPFACE_REFINER = true
 
 private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
 
@@ -204,7 +204,19 @@ object AtlasProjector {
             sample(-v, 1f)
             sample(-1f, -v)
         }
+        val zenithCapLike =
+            isZenithFrame(frame) ||
+                    pose.hardZenith ||
+                    pose.pitchDeg >= 84f
 
+        if (zenithCapLike) {
+            return FrameFootprint(
+                minAzimuthDeg = 0f,
+                maxAzimuthDeg = 360f,
+                minAltitudeDeg = minAlt.coerceIn(0f, 90f),
+                maxAltitudeDeg = 90f
+            )
+        }
         return FrameFootprint(
             minAzimuthDeg = centerYawDeg + minYawDelta,
             maxAzimuthDeg = centerYawDeg + maxYawDelta,
@@ -748,21 +760,29 @@ object AtlasProjector {
         }
 
         val rawPitchAbsDeg = maxOf(pitchAbsDeg, basePitch)
+
         val pitchUsedDeg = rawPitchAbsDeg.coerceIn(84f, 90f)
 
-        val yawTrust = 1f - smoothstep(84f, 87.5f, rawPitchAbsDeg)
+        val preferredMatrixYawDeg = if (useHardZenithBranch || rawPitchAbsDeg >= 84f) {
+            tangentAzDeg
+        } else {
+            forwardAzDeg
+        }
 
-        val rawYawDelta = shortestAngleDeltaDeg(baseYaw, forwardAzDeg)
+        val rawYawDelta = shortestAngleDeltaDeg(baseYaw, preferredMatrixYawDeg)
+
         val maxYawDelta = when {
-            rawPitchAbsDeg >= 88.5f -> 4f
-            rawPitchAbsDeg >= 87f -> 7f
-            rawPitchAbsDeg >= 85f -> 12f
-            else -> 20f
+            rawPitchAbsDeg >= 88.5f -> 18f
+            rawPitchAbsDeg >= 87f -> 22f
+            rawPitchAbsDeg >= 85f -> 28f
+            else -> 30f
         }
 
         val clampedMatrixYaw = normalizeTwistDeg(
             baseYaw + rawYawDelta.coerceIn(-maxYawDelta, maxYawDelta)
         )
+
+        val yawTrust = smoothstep(84f, 87.5f, rawPitchAbsDeg)
 
         val centerYawDeg = lerpAngleDeg(baseYaw, clampedMatrixYaw, yawTrust)
 
@@ -790,6 +810,7 @@ object AtlasProjector {
             "frame=${frame.frameId} " +
                     "yawForward=${"%.2f".format(forwardAzDeg)} " +
                     "yawTangent=${"%.2f".format(tangentAzDeg)} " +
+                    "yawPreferred=${"%.2f".format(preferredMatrixYawDeg)} " +
                     "yawUsed=${"%.2f".format(centerYawDeg)} " +
                     "yawTrust=${"%.3f".format(yawTrust)} " +
                     "rawPitchAbs=${"%.2f".format(rawPitchAbsDeg)} " +
@@ -1162,7 +1183,15 @@ object AtlasProjector {
         }
 
         val fp = approximateFootprint(frame)
-        val yTop = AtlasMath.altitudeToY(fp.maxAltitudeDeg, atlas.config)
+
+        val zenithCapLike = zenithPose != null && projectionPitchDeg >= 84f
+
+        val yTop = if (zenithCapLike) {
+            0
+        } else {
+            AtlasMath.altitudeToY(fp.maxAltitudeDeg, atlas.config)
+        }
+
         val yBottom = AtlasMath.altitudeToY(fp.minAltitudeDeg, atlas.config)
 
         val srcW = src.width
@@ -1171,7 +1200,8 @@ object AtlasProjector {
         src.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
 
         val coversAllAzimuth =
-            zenithPose != null ||
+            zenithCapLike ||
+                    zenithPose != null ||
                     frame.targetPitchDeg >= 80f ||
                     (fp.maxAzimuthDeg - fp.minAzimuthDeg) >= 359f
 
