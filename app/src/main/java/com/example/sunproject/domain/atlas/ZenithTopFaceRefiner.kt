@@ -113,6 +113,79 @@ object ZenithTopFaceRefiner {
         val color: Int,
         val usedFallback: Boolean
     )
+    private data class ZenithRefinementCandidate(
+        val label: String,
+        val twistDeg: Float,
+        val pitchOffsetDeg: Float,
+        val rollOffsetDeg: Float,
+        val absoluteYawDeg: Float?,
+        val absolutePitchDeg: Float?,
+        val absoluteRollDeg: Float?
+    )
+
+    private data class CandidateEvaluation(
+        val candidate: ZenithRefinementCandidate,
+        val result: RefinementResult,
+        val acceptedForBlend: Boolean,
+        val objectiveScore: Float
+    )
+
+    private fun buildZenithRefinementCandidates(
+        seedTwistDeg: Float,
+        seedPitchOffsetDeg: Float,
+        seedRollOffsetDeg: Float,
+        seedAbsoluteYawDeg: Float?,
+        seedAbsolutePitchDeg: Float?,
+        seedAbsoluteRollDeg: Float?
+    ): List<ZenithRefinementCandidate> {
+        val yawSteps = listOf(0f, 90f, 180f, 270f)
+
+        val hasAbsoluteSeed =
+            seedAbsoluteYawDeg != null &&
+                    seedAbsolutePitchDeg != null &&
+                    seedAbsoluteRollDeg != null
+
+        return if (hasAbsoluteSeed) {
+            yawSteps.map { deltaYawDeg ->
+                ZenithRefinementCandidate(
+                    label = "abs_${deltaYawDeg.toInt()}",
+                    twistDeg = normalizeDeg(seedTwistDeg + deltaYawDeg),
+                    pitchOffsetDeg = seedPitchOffsetDeg,
+                    rollOffsetDeg = seedRollOffsetDeg,
+                    absoluteYawDeg = normalizeDeg(seedAbsoluteYawDeg!! + deltaYawDeg),
+                    absolutePitchDeg = seedAbsolutePitchDeg,
+                    absoluteRollDeg = seedAbsoluteRollDeg
+                )
+            }
+        } else {
+            yawSteps.map { deltaYawDeg ->
+                ZenithRefinementCandidate(
+                    label = "legacy_${deltaYawDeg.toInt()}",
+                    twistDeg = normalizeDeg(seedTwistDeg + deltaYawDeg),
+                    pitchOffsetDeg = seedPitchOffsetDeg,
+                    rollOffsetDeg = seedRollOffsetDeg,
+                    absoluteYawDeg = null,
+                    absolutePitchDeg = null,
+                    absoluteRollDeg = null
+                )
+            }
+        }
+    }
+
+    private fun isAcceptableFinalBlend(result: RefinementResult): Boolean {
+        return result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
+                abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG
+    }
+
+    private fun refinementObjectiveScore(result: RefinementResult): Float {
+        return (result.eccScore.toFloat() * 1000f) -
+                (abs(result.eccRotationDeg) * 30f)
+    }
+
+    private fun releaseCandidateEvaluation(eval: CandidateEvaluation?) {
+        if (eval == null) return
+        releaseTopFace(eval.result.alignedTopFace)
+    }
     fun refineAndBlendZenithIntoAtlas(
         atlas: SkyAtlas,
         frame: FrameRecord,
@@ -130,87 +203,169 @@ object ZenithTopFaceRefiner {
         if (frameWeight <= 0f) return null
 
         val atlasTop = buildAtlasTopFace(atlas, FACE_SIZE_PX)
-        val zenithTop = buildZenithTopFace(
-            frame = frame,
-            srcBitmap = srcBitmap,
-            baseTwistDeg = seedTwistDeg,
-            basePitchOffsetDeg = seedPitchOffsetDeg,
-            baseRollOffsetDeg = seedRollOffsetDeg,
-            absoluteYawDegOverride = seedAbsoluteYawDeg,
-            absolutePitchDegOverride = seedAbsolutePitchDeg,
-            absoluteRollDegOverride = seedAbsoluteRollDeg,
-            faceSizePx = FACE_SIZE_PX
-        )
+        var bestAccepted: CandidateEvaluation? = null
+        var bestRejected: CandidateEvaluation? = null
 
         try {
-            val residualAnnulusTwistDeg = estimateTwistFromAnnulus(
-                reference = atlasTop,
-                moving = zenithTop,
-                minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
-                maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
+            val candidates = buildZenithRefinementCandidates(
+                seedTwistDeg = seedTwistDeg,
+                seedPitchOffsetDeg = seedPitchOffsetDeg,
+                seedRollOffsetDeg = seedRollOffsetDeg,
+                seedAbsoluteYawDeg = seedAbsoluteYawDeg,
+                seedAbsolutePitchDeg = seedAbsolutePitchDeg,
+                seedAbsoluteRollDeg = seedAbsoluteRollDeg
             )
 
-            val residualInitialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
-                reference = atlasTop,
-                moving = zenithTop,
-                minAltitudeDeg = POLAR_PHASE_MIN_ALT_DEG,
-                maxAltitudeDeg = POLAR_PHASE_MAX_ALT_DEG,
-                coarseTwistDeg = residualAnnulusTwistDeg
-            ) ?: residualAnnulusTwistDeg
+            for ((index, candidate) in candidates.withIndex()) {
+                val zenithTop = buildZenithTopFace(
+                    frame = frame,
+                    srcBitmap = srcBitmap,
+                    baseTwistDeg = candidate.twistDeg,
+                    basePitchOffsetDeg = candidate.pitchOffsetDeg,
+                    baseRollOffsetDeg = candidate.rollOffsetDeg,
+                    absoluteYawDegOverride = candidate.absoluteYawDeg,
+                    absolutePitchDegOverride = candidate.absolutePitchDeg,
+                    absoluteRollDegOverride = candidate.absoluteRollDeg,
+                    faceSizePx = FACE_SIZE_PX
+                )
 
-            val residualRefined = refineWithEcc(
-                reference = atlasTop,
-                moving = zenithTop,
-                initialTwistDeg = residualInitialTwistDeg,
-                eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
-                eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
-            )
+                try {
+                    val residualAnnulusTwistDeg = estimateTwistFromAnnulus(
+                        reference = atlasTop,
+                        moving = zenithTop,
+                        minAltitudeDeg = ANNULUS_MIN_ALT_DEG,
+                        maxAltitudeDeg = ANNULUS_MAX_ALT_DEG
+                    )
 
-            val acceptFinalBlend =
-                residualRefined.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
-                        abs(residualRefined.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG
+                    val residualInitialTwistDeg = estimateTwistWithPolarPhaseCorrelation(
+                        reference = atlasTop,
+                        moving = zenithTop,
+                        minAltitudeDeg = POLAR_PHASE_MIN_ALT_DEG,
+                        maxAltitudeDeg = POLAR_PHASE_MAX_ALT_DEG,
+                        coarseTwistDeg = residualAnnulusTwistDeg
+                    ) ?: residualAnnulusTwistDeg
 
-            if (!acceptFinalBlend) {
+                    val residualRefined = refineWithEcc(
+                        reference = atlasTop,
+                        moving = zenithTop,
+                        initialTwistDeg = residualInitialTwistDeg,
+                        eccMinAltitudeDeg = ECC_MIN_ALT_DEG,
+                        eccMaxAltitudeDeg = ECC_MAX_ALT_DEG
+                    )
+
+                    val absoluteInitialTwistDeg =
+                        normalizeDeg(candidate.twistDeg + residualInitialTwistDeg)
+
+                    val absoluteFinalTwistDeg =
+                        normalizeDeg(candidate.twistDeg + residualRefined.finalTwistDeg)
+
+                    val candidateResult = RefinementResult(
+                        initialTwistDeg = absoluteInitialTwistDeg,
+                        finalTwistDeg = absoluteFinalTwistDeg,
+                        eccRotationDeg = residualRefined.eccRotationDeg,
+                        eccTxPx = residualRefined.eccTxPx,
+                        eccTyPx = residualRefined.eccTyPx,
+                        eccScore = residualRefined.eccScore,
+                        alignedTopFace = residualRefined.alignedTopFace
+                    )
+
+                    val acceptedForBlend = isAcceptableFinalBlend(candidateResult)
+                    val objectiveScore = refinementObjectiveScore(candidateResult)
+
+                    Log.d(
+                        "AtlasZenithTopCandidate",
+                        "frame=${frame.frameId} " +
+                                "idx=$index " +
+                                "label=${candidate.label} " +
+                                "seedYaw=${candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
+                                "seedTwist=${"%.2f".format(candidate.twistDeg)} " +
+                                "initialTwist=${"%.2f".format(candidateResult.initialTwistDeg)} " +
+                                "finalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
+                                "eccRot=${"%.2f".format(candidateResult.eccRotationDeg)} " +
+                                "eccScore=${"%.5f".format(candidateResult.eccScore)} " +
+                                "accepted=$acceptedForBlend " +
+                                "objective=${"%.2f".format(objectiveScore)}"
+                    )
+
+                    val evaluation = CandidateEvaluation(
+                        candidate = candidate,
+                        result = candidateResult,
+                        acceptedForBlend = acceptedForBlend,
+                        objectiveScore = objectiveScore
+                    )
+
+                    if (acceptedForBlend) {
+                        val replaceBest =
+                            bestAccepted == null || evaluation.objectiveScore > bestAccepted!!.objectiveScore
+
+                        if (replaceBest) {
+                            releaseCandidateEvaluation(bestAccepted)
+                            bestAccepted = evaluation
+                        } else {
+                            releaseTopFace(candidateResult.alignedTopFace)
+                        }
+                    } else {
+                        val replaceBestRejected =
+                            bestRejected == null || evaluation.objectiveScore > bestRejected!!.objectiveScore
+
+                        if (replaceBestRejected) {
+                            releaseCandidateEvaluation(bestRejected)
+                            bestRejected = evaluation
+                        } else {
+                            releaseTopFace(candidateResult.alignedTopFace)
+                        }
+                    }
+                } finally {
+                    releaseTopFace(zenithTop)
+                }
+            }
+
+            val winner = bestAccepted
+            if (winner == null) {
                 Log.w(
                     "AtlasZenithTopRefine",
-                    "rejectBlend frame=${frame.frameId} " +
-                            "initialTwist=${"%.2f".format(residualInitialTwistDeg)} " +
-                            "eccRot=${"%.2f".format(residualRefined.eccRotationDeg)} " +
-                            "eccScore=${"%.5f".format(residualRefined.eccScore)}"
+                    "rejectAll frame=${frame.frameId} " +
+                            "bestRejectedLabel=${bestRejected?.candidate?.label ?: "none"} " +
+                            "bestRejectedSeedYaw=${bestRejected?.candidate?.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
+                            "bestRejectedFinalTwist=${bestRejected?.let { "%.2f".format(it.result.finalTwistDeg) } ?: "NaN"} " +
+                            "bestRejectedEccRot=${bestRejected?.let { "%.2f".format(it.result.eccRotationDeg) } ?: "NaN"} " +
+                            "bestRejectedEccScore=${bestRejected?.let { "%.5f".format(it.result.eccScore) } ?: "NaN"}"
                 )
+                releaseCandidateEvaluation(bestRejected)
                 return null
             }
 
+            releaseCandidateEvaluation(bestRejected)
+
             val colorCorrection = blendTopFaceIntoAtlas(
-                aligned = residualRefined.alignedTopFace,
+                aligned = winner.result.alignedTopFace,
                 atlas = atlas,
                 frameWeight = frameWeight,
                 minAltitudeDeg = BLEND_MIN_ALT_DEG
             )
 
             fillUncoveredPolarCapFromTopFace(
-                aligned = residualRefined.alignedTopFace,
+                aligned = winner.result.alignedTopFace,
                 atlas = atlas,
                 frameWeight = frameWeight,
                 minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG,
                 colorCorrection = colorCorrection
             )
 
-            val absoluteInitialTwistDeg = normalizeDeg(seedTwistDeg + residualInitialTwistDeg)
-            val absoluteFinalTwistDeg = normalizeDeg(seedTwistDeg + residualRefined.finalTwistDeg)
-
-            return RefinementResult(
-                initialTwistDeg = absoluteInitialTwistDeg,
-                finalTwistDeg = absoluteFinalTwistDeg,
-                eccRotationDeg = residualRefined.eccRotationDeg,
-                eccTxPx = residualRefined.eccTxPx,
-                eccTyPx = residualRefined.eccTyPx,
-                eccScore = residualRefined.eccScore,
-                alignedTopFace = residualRefined.alignedTopFace
+            Log.d(
+                "AtlasZenithTopRefine",
+                "frame=${frame.frameId} " +
+                        "winner=${winner.candidate.label} " +
+                        "seedYaw=${winner.candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
+                        "initialTwist=${"%.2f".format(winner.result.initialTwistDeg)} " +
+                        "finalTwist=${"%.2f".format(winner.result.finalTwistDeg)} " +
+                        "eccRot=${"%.2f".format(winner.result.eccRotationDeg)} " +
+                        "eccScore=${"%.5f".format(winner.result.eccScore)}"
             )
+
+            return winner.result
         } finally {
             releaseTopFace(atlasTop)
-            releaseTopFace(zenithTop)
         }
     }
 
