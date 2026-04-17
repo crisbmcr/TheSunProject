@@ -6,6 +6,7 @@ import com.example.sunproject.data.model.FrameRecord
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -73,15 +74,24 @@ private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
 private const val ENABLE_ZENITH_TOPFACE_REFINER = false
 
 private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
+
 private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
 private const val PERSISTED_MOUNT_MAX_FORWARD_TILT_DEG = 4.5f
 
 private const val FRAME_RGB_GAIN_MIN = 0.92f
+
 private const val FRAME_RGB_GAIN_MAX = 1.08f
+
 private const val FRAME_GAIN_ESTIMATE_X_STEP = 6
+
 private const val FRAME_GAIN_ESTIMATE_Y_STEP = 3
+
 private const val FRAME_GAIN_ESTIMATE_MIN_SAMPLES = 400
-private const val ZENITH_ERP_MAX_WEIGHT = 0.55f
+
+private const val ZENITH_ERP_MAX_WEIGHT = 0.40f
+private const val ZENITH_ERP_FADE_START_ALT_DEG = 74f
+private const val ZENITH_ERP_FADE_FULL_ALT_DEG = 82f
+private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 
 private data class RgbGain(
     val r: Float,
@@ -131,17 +141,22 @@ object AtlasProjector {
         val hfov = (frame.hfovDeg ?: 65f).coerceIn(1f, 179f)
         val vfov = (frame.vfovDeg ?: 50f).coerceIn(1f, 179f)
 
-        val centerYawDeg = normalizeTwistDeg(baseYawDeg(frame))
-        val centerPitchDeg = basePitchDeg(frame).coerceIn(0f, 90f)
-        val zenithLike = frame.targetPitchDeg >= 80f || centerPitchDeg >= 80f
-        val rollDeg = if (zenithLike && centerPitchDeg >= 84f) 0f else baseRollDeg(frame)
+        val pose = resolveZenithProjectionPose(
+            frame = frame,
+            absoluteYawDegOverride = frame.absAzimuthDeg,
+            absolutePitchDegOverride = frame.absPitchDeg,
+            absoluteRollDegOverride = frame.absRollDeg
+        )
+
+        val centerYawDeg = pose.yawDeg
+        val centerPitchDeg = pose.pitchDeg
 
         val basis = buildProjectionBasisFromAngles(
-            yawDeg = centerYawDeg,
-            pitchDeg = centerPitchDeg,
-            rollDeg = rollDeg,
-            zenithLike = zenithLike,
-            forceHardZenith = zenithLike && centerPitchDeg >= 84f
+            yawDeg = pose.yawDeg,
+            pitchDeg = pose.pitchDeg,
+            rollDeg = pose.rollDeg,
+            zenithLike = isZenithFrame(frame) || frame.targetPitchDeg >= 80f || pose.pitchDeg >= 80f,
+            forceHardZenith = pose.hardZenith
         )
 
         val tanHalfH = tan(Math.toRadians(hfov / 2.0)).toFloat()
@@ -184,11 +199,10 @@ object AtlasProjector {
         for (i in 0..steps) {
             val t = i / steps.toFloat()
             val v = -1f + 2f * t
-
-            sample(v, -1f)   // borde superior
-            sample(1f, v)    // borde derecho
-            sample(-v, 1f)   // borde inferior
-            sample(-1f, -v)  // borde izquierdo
+            sample(v, -1f)
+            sample(1f, v)
+            sample(-v, 1f)
+            sample(-1f, -v)
         }
 
         return FrameFootprint(
@@ -244,6 +258,36 @@ object AtlasProjector {
 
     private fun baseRollDeg(frame: FrameRecord): Float {
         return frame.absRollDeg ?: frame.measuredRollDeg
+    }
+
+    private data class ZenithProjectionPose(
+        val yawDeg: Float,
+        val pitchDeg: Float,
+        val rollDeg: Float,
+        val hardZenith: Boolean
+    )
+
+    private fun resolveZenithProjectionPose(
+        frame: FrameRecord,
+        absoluteYawDegOverride: Float?,
+        absolutePitchDegOverride: Float?,
+        absoluteRollDegOverride: Float?
+    ): ZenithProjectionPose {
+        val pitchDeg = (absolutePitchDegOverride ?: basePitchDeg(frame)).coerceIn(0f, 90f)
+        val zenithLike = isZenithFrame(frame) || frame.targetPitchDeg >= 80f || pitchDeg >= 80f
+        val yawDeg = normalizeTwistDeg(absoluteYawDegOverride ?: baseYawDeg(frame))
+        val rollDeg = if (zenithLike && pitchDeg >= 84f) {
+            0f
+        } else {
+            absoluteRollDegOverride ?: baseRollDeg(frame)
+        }
+
+        return ZenithProjectionPose(
+            yawDeg = yawDeg,
+            pitchDeg = pitchDeg,
+            rollDeg = rollDeg,
+            hardZenith = zenithLike && pitchDeg >= 84f
+        )
     }
     private const val MOUNT_REF_MAX_YAW_ERR_DEG = 10f
     private const val MOUNT_REF_MAX_PITCH_ERR_DEG = 6f
@@ -1025,66 +1069,63 @@ object AtlasProjector {
         val tanHalfH = tan(Math.toRadians(hfov / 2.0)).toFloat()
         val tanHalfV = tan(Math.toRadians(vfov / 2.0)).toFloat()
 
-        val zenithLike = frame.targetPitchDeg >= 80f || frame.measuredPitchDeg >= 80f
-
-        val hasAbsoluteZenithOverride =
-            zenithLike &&
-                    zenithAbsoluteYawDegOverride != null &&
-                    zenithAbsolutePitchDegOverride != null &&
-                    zenithAbsoluteRollDegOverride != null
-
         val effectiveZenithTwistDeg = zenithTwistDegOverride ?: ZENITH_TWIST_FALLBACK_DEG
         val effectiveZenithPitchOffsetDeg =
             zenithPitchOffsetDegOverride ?: ZENITH_PITCH_OFFSET_FALLBACK_DEG
         val effectiveZenithRollOffsetDeg =
             zenithRollOffsetDegOverride ?: ZENITH_ROLL_OFFSET_FALLBACK_DEG
 
-        val zenithBaseYawDeg = baseYawDeg(frame)
-        val zenithBasePitchDeg = basePitchDeg(frame)
-        val zenithBaseRollDeg = frame.measuredRollDeg.coerceIn(
-            ZENITH_ROLL_OFFSET_MIN_DEG,
-            ZENITH_ROLL_OFFSET_MAX_DEG
+        val zenithPose = if (isZenithFrame(frame)) {
+            resolveZenithProjectionPose(
+                frame = frame,
+                absoluteYawDegOverride = zenithAbsoluteYawDegOverride,
+                absolutePitchDegOverride = zenithAbsolutePitchDegOverride,
+                absoluteRollDegOverride = zenithAbsoluteRollDegOverride
+            )
+        } else {
+            null
+        }
+
+        val hasAbsoluteZenithOverride =
+            zenithPose != null &&
+                    zenithAbsoluteYawDegOverride != null &&
+                    zenithAbsolutePitchDegOverride != null &&
+                    zenithAbsoluteRollDegOverride != null
+
+        val projectionAzimuthDeg = if (zenithPose != null) {
+            zenithPose.yawDeg
+        } else {
+            normalizeTwistDeg(baseYawDeg(frame))
+        }
+
+        val projectionPitchDeg = if (zenithPose != null) {
+            zenithPose.pitchDeg
+        } else {
+            basePitchDeg(frame).coerceIn(0f, 90f)
+        }
+
+        val projectionRollDeg = if (zenithPose != null) {
+            zenithPose.rollDeg
+        } else {
+            baseRollDeg(frame)
+        }
+
+        val zenithLike =
+            zenithPose != null ||
+                    frame.targetPitchDeg >= 80f ||
+                    projectionPitchDeg >= 80f
+
+        val basis = buildProjectionBasisFromAngles(
+            yawDeg = projectionAzimuthDeg,
+            pitchDeg = projectionPitchDeg,
+            rollDeg = projectionRollDeg,
+            zenithLike = zenithLike,
+            forceHardZenith = zenithPose?.hardZenith == true
         )
 
-        val projectionAzimuthDeg = if (zenithLike) {
-            if (hasAbsoluteZenithOverride) {
-                normalizeTwistDeg(zenithAbsoluteYawDegOverride!!)
-            } else {
-                normalizeTwistDeg(zenithBaseYawDeg + effectiveZenithTwistDeg)
-            }
-        } else {
-            frame.measuredAzimuthDeg
-        }
-
-        val projectionPitchDeg = if (zenithLike) {
-            if (hasAbsoluteZenithOverride) {
-                zenithAbsolutePitchDegOverride!!.coerceIn(84f, 90f)
-            } else {
-                (zenithBasePitchDeg + effectiveZenithPitchOffsetDeg).coerceIn(84f, 90f)
-            }
-        } else {
-            frame.measuredPitchDeg
-        }
-
-        val projectionRollDeg = if (zenithLike) {
-            if (hasAbsoluteZenithOverride) {
-                0f
-            } else {
-                (zenithBaseRollDeg + effectiveZenithRollOffsetDeg).coerceIn(
-                    ZENITH_ROLL_OFFSET_MIN_DEG,
-                    ZENITH_ROLL_OFFSET_MAX_DEG
-                )
-            }
-        } else {
-            frame.measuredRollDeg
-        }
-
-        val yawRad = Math.toRadians(
-            AtlasMath.normalizeAzimuthDeg(projectionAzimuthDeg).toDouble()
-        ).toFloat()
-
-        val pitchRad = Math.toRadians(projectionPitchDeg.toDouble()).toFloat()
-        val rollRad = Math.toRadians((-projectionRollDeg).toDouble()).toFloat()
+        val forward = basis.forward
+        val right = basis.right
+        val up = basis.up
 
         if (emitLogs) {
             Log.d(
@@ -1106,53 +1147,6 @@ object AtlasProjector {
                         "legacyRollOffset=${"%.2f".format(effectiveZenithRollOffsetDeg)}"
             )
         }
-
-        val forward = worldDirectionRad(yawRad, pitchRad)
-
-        val right0: FloatArray
-        val up0: FloatArray
-
-        val useHardZenithBasis = shouldUseHardZenithBasis(
-            frame = frame,
-            pitchDeg = projectionPitchDeg,
-            zenithLike = zenithLike
-        )
-
-        if (useHardZenithBasis) {
-            right0 = normalize(
-                floatArrayOf(
-                    cos(yawRad),
-                    sin(yawRad),
-                    0f
-                )
-            )
-
-            up0 = normalize(
-                floatArrayOf(
-                    -sin(yawRad),
-                    cos(yawRad),
-                    0f
-                )
-            )
-        } else {
-            var r = cross(forward, floatArrayOf(0f, 0f, 1f))
-            if (length(r) < 1e-4f) {
-                r = floatArrayOf(1f, 0f, 0f)
-            }
-            r = normalize(r)
-
-            var u = cross(r, forward)
-            u = normalize(u)
-
-            right0 = r
-            up0 = u
-        }
-
-        val cosR = cos(rollRad)
-        val sinR = sin(rollRad)
-
-        val right = normalize(add(scale(right0, cosR), scale(up0, sinR)))
-        val up = normalize(add(scale(up0, cosR), scale(right0, -sinR)))
 
         if (emitLogs) {
             Log.d(
@@ -1177,8 +1171,8 @@ object AtlasProjector {
         src.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
 
         val coversAllAzimuth =
-            frame.targetPitchDeg >= 80f ||
-                    frame.measuredPitchDeg >= 80f ||
+            zenithPose != null ||
+                    frame.targetPitchDeg >= 80f ||
                     (fp.maxAzimuthDeg - fp.minAzimuthDeg) >= 359f
 
         val xSpans = if (coversAllAzimuth) {
@@ -1190,6 +1184,7 @@ object AtlasProjector {
                 atlas.config
             )
         }
+
         val frameRgbGain = estimateFrameRgbGain(
             atlas = atlas,
             frame = frame,
@@ -1215,6 +1210,7 @@ object AtlasProjector {
                         "gainB=${"%.3f".format(frameRgbGain.b)}"
             )
         }
+
         if (emitLogs) {
             Log.d(
                 "AtlasFootprint",
@@ -1273,7 +1269,31 @@ object AtlasProjector {
                         (wx * wx) * (wy * wy)
                     )
 
-                    val finalWeight = frameWeight * localWeight
+                    var rawWeight = frameWeight * localWeight
+
+                    if (zenithPose != null) {
+                        rawWeight = min(rawWeight, ZENITH_ERP_MAX_WEIGHT)
+                    }
+
+                    val zenithAltitudeAlpha = if (zenithPose != null) {
+                        smoothstep(
+                            ZENITH_ERP_FADE_START_ALT_DEG,
+                            ZENITH_ERP_FADE_FULL_ALT_DEG,
+                            altDeg
+                        )
+                    } else {
+                        1f
+                    }
+
+                    val baseSuppression = if (zenithPose != null && atlas.hasCoverageAt(x, y)) {
+                        1f / (1f + atlas.weightAt(x, y) * ZENITH_ERP_BASE_WEIGHT_DAMP)
+                    } else {
+                        1f
+                    }
+
+                    val finalWeight = rawWeight * zenithAltitudeAlpha * baseSuppression
+                    if (finalWeight <= 0f) continue
+
                     atlas.blendPixel(x, y, color, finalWeight)
                 }
             }

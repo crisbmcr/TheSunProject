@@ -30,15 +30,6 @@ object ZenithTopFaceRefiner {
     private const val ANNULUS_MAX_ALT_DEG = 78f
     private const val ECC_MIN_ALT_DEG = 68f
     private const val ECC_MAX_ALT_DEG = 88f
-    private const val BLEND_MIN_ALT_DEG = 68f
-
-    private const val POLAR_PHASE_MIN_ALT_DEG = 70f
-    private const val POLAR_PHASE_MAX_ALT_DEG = 88f
-    private const val POLAR_PHASE_ANGLE_BINS = 720
-    private const val POLAR_PHASE_RADIAL_BINS = 96
-    private const val MIN_POLAR_PHASE_RESPONSE = 0.03
-    private const val MIN_POLAR_PHASE_COVERAGE = 0.12f
-
     private data class PolarPhaseStrip(
         val gray32: Mat,
         val valid32: Mat,
@@ -46,16 +37,25 @@ object ZenithTopFaceRefiner {
         val radialBins: Int
     )
 
-    private const val BLEND_FEATHER_START_ALT_DEG = 82f
-    private const val BLEND_FEATHER_FULL_ALT_DEG = 89f
-    private const val ZENITH_EDGE_FADE_START_ALT_DEG = BLEND_MIN_ALT_DEG   // 68f
-    private const val ZENITH_EDGE_FADE_FULL_ALT_DEG = 78f
-    private const val ZENITH_EDGE_MIN_ALPHA = 0.35f
+    private const val BLEND_MIN_ALT_DEG = 74f
+    private const val POLAR_PHASE_MIN_ALT_DEG = 74f
+    private const val POLAR_PHASE_MAX_ALT_DEG = 88f
+    private const val POLAR_PHASE_ANGLE_BINS = 720
+    private const val POLAR_PHASE_RADIAL_BINS = 96
+    private const val MIN_POLAR_PHASE_RESPONSE = 0.03
+    private const val MIN_POLAR_PHASE_COVERAGE = 0.12f
+
+    private const val BLEND_FEATHER_START_ALT_DEG = 80f
+    private const val BLEND_FEATHER_FULL_ALT_DEG = 88f
+    private const val ZENITH_EDGE_FADE_START_ALT_DEG = BLEND_MIN_ALT_DEG
+    private const val ZENITH_EDGE_FADE_FULL_ALT_DEG = 84f
+    private const val ZENITH_EDGE_MIN_ALPHA = 0.15f
+
     private const val RGB_GAIN_MIN = 0.92f
     private const val RGB_GAIN_MAX = 1.08f
 
-    private const val POLAR_CAP_FILL_MIN_ALT_DEG = 86f
-    private const val POLAR_CAP_NEAREST_RADIUS_PX = 4
+    private const val POLAR_CAP_FILL_MIN_ALT_DEG = 84f
+    private const val POLAR_CAP_NEAREST_RADIUS_PX = 2
     private const val MIN_ECC_ACCEPT_SCORE = 0.12
     private const val STRONG_ECC_ACCEPT_SCORE = 0.20
     private const val MAX_ECC_ROT_IF_WEAK_SCORE_DEG = 3.0f
@@ -73,6 +73,15 @@ object ZenithTopFaceRefiner {
     private const val POLAR_CAP_MIN_COLOR_STRENGTH = 0.08f
     private const val POLAR_CAP_FILL_WEIGHT_AT_EDGE = 0.70f
     private const val POLAR_CAP_FILL_WEIGHT_AT_POLE = 0.45f
+
+    private const val ZENITH_BLEND_BASE_WEIGHT_REF = 1.25f
+    private const val ZENITH_BLEND_MAX_BASE_SUPPRESSION = 0.55f
+
+    private const val POLAR_CAP_MIN_EXISTING_WEIGHT = 0.18f
+
+    private const val ZENITH_COLOR_CORR_MIN_ALT_DEG = 76f
+    private const val ZENITH_COLOR_CORR_MAX_ALT_DEG = 84f
+    private const val ZENITH_COLOR_CORR_MIN_BASE_WEIGHT = 0.18f
 
 
     data class TopFace(
@@ -640,6 +649,7 @@ object ZenithTopFaceRefiner {
                 if (sampled.usedFallback) fallbackSamples++ else directSamples++
 
                 val hasBaseCoverage = atlas.hasCoverageAt(x, y)
+                val baseWeight = atlas.weightAt(x, y)
 
                 val edgeT = ((altDeg - ZENITH_EDGE_FADE_START_ALT_DEG) /
                         (ZENITH_EDGE_FADE_FULL_ALT_DEG - ZENITH_EDGE_FADE_START_ALT_DEG))
@@ -657,7 +667,15 @@ object ZenithTopFaceRefiner {
                     1f
                 }
 
-                val finalWeight = frameWeight * zenithEdgeAlpha * overlapAlpha
+                val baseT = (baseWeight / ZENITH_BLEND_BASE_WEIGHT_REF).coerceIn(0f, 1f)
+                val baseSuppression = if (hasBaseCoverage) {
+                    1f - ZENITH_BLEND_MAX_BASE_SUPPRESSION * baseT
+                } else {
+                    1f
+                }
+
+                val finalWeight = frameWeight * zenithEdgeAlpha * overlapAlpha * baseSuppression
+
                 if (finalWeight <= 0f) continue
 
                 val applySeamColorCorrection = hasBaseCoverage
@@ -744,10 +762,11 @@ object ZenithTopFaceRefiner {
 
         for (y in 0..yBottom) {
             val altDeg = AtlasMath.yToAltitude(y, atlas.config)
-            if (altDeg < minAltitudeDeg) continue
+            if (altDeg < maxOf(minAltitudeDeg, ZENITH_COLOR_CORR_MIN_ALT_DEG)) continue
+            if (altDeg > ZENITH_COLOR_CORR_MAX_ALT_DEG) continue
 
             for (x in 0 until atlas.width) {
-                if (!atlas.hasCoverageAt(x, y)) continue
+                if (atlas.weightAt(x, y) < ZENITH_COLOR_CORR_MIN_BASE_WEIGHT) continue
 
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
 
@@ -826,7 +845,7 @@ object ZenithTopFaceRefiner {
                         (POLAR_CAP_FILL_WEIGHT_AT_POLE - POLAR_CAP_FILL_WEIGHT_AT_EDGE) * smoothT
 
             for (x in 0 until atlas.width) {
-                if (atlas.hasCoverageAt(x, y)) continue
+                if (atlas.weightAt(x, y) >= POLAR_CAP_MIN_EXISTING_WEIGHT) continue
 
                 candidateCount++
 
