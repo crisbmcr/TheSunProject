@@ -71,6 +71,11 @@ object ZenithTopFaceRefiner {
     private const val MIN_FINAL_BLEND_ECC_SCORE = 0.18
     private const val MAX_FINAL_BLEND_ABS_ROT_DEG = 2.5f
 
+    private const val MAX_FINAL_BLEND_SOFT_ABS_ROT_DEG = 6.5f
+    private const val MAX_FINAL_BLEND_SOFT_RESIDUAL_TWIST_DEG = 12f
+    private const val MAX_FINAL_BLEND_SOFT_MAX_LUMA_DIFF01 = 0.12f
+    private const val MIN_FINAL_BLEND_SOFT_ECC_SCORE = 0.26
+
     private const val POLAR_CAP_COLOR_STRENGTH_SCALE = 0.35f
     private const val POLAR_CAP_MIN_COLOR_STRENGTH = 0.08f
     private const val POLAR_CAP_FILL_WEIGHT_AT_EDGE = 0.70f
@@ -206,12 +211,25 @@ object ZenithTopFaceRefiner {
 
     private fun isAcceptableFinalBlend(
         result: RefinementResult,
+        seamScore: CandidateSeamScore,
         residualTwistAbsDeg: Float,
         maxResidualTwistDeg: Float
     ): Boolean {
-        return result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
-                abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG &&
-                residualTwistAbsDeg <= maxResidualTwistDeg
+        val strictAccept =
+            result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
+                    abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG &&
+                    residualTwistAbsDeg <= maxResidualTwistDeg
+
+        val seamRescueAccept =
+            result.eccScore >= MIN_FINAL_BLEND_SOFT_ECC_SCORE &&
+                    abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_SOFT_ABS_ROT_DEG &&
+                    residualTwistAbsDeg <= minOf(
+                maxResidualTwistDeg,
+                MAX_FINAL_BLEND_SOFT_RESIDUAL_TWIST_DEG
+            ) &&
+                    seamScore.meanAbsLumaDiff01 <= MAX_FINAL_BLEND_SOFT_MAX_LUMA_DIFF01
+
+        return strictAccept || seamRescueAccept
     }
 
     private fun refinementObjectiveScore(
@@ -219,8 +237,7 @@ object ZenithTopFaceRefiner {
         seamScore: CandidateSeamScore,
         residualTwistAbsDeg: Float
     ): Float {
-        return result.eccScore.toFloat() * OBJECTIVE_ECC_SCALE +
-                seamScore.overlapCount.toFloat() * OBJECTIVE_OVERLAP_SCALE -
+        return result.eccScore.toFloat() * OBJECTIVE_ECC_SCALE -
                 seamScore.meanAbsLumaDiff01 * OBJECTIVE_LUMA_DIFF_SCALE -
                 residualTwistAbsDeg * OBJECTIVE_RESIDUAL_TWIST_SCALE
     }
@@ -390,6 +407,7 @@ object ZenithTopFaceRefiner {
 
                     val acceptedForBlend = isAcceptableFinalBlend(
                         result = candidateResult,
+                        seamScore = seamScore,
                         residualTwistAbsDeg = residualTwistAbsDeg,
                         maxResidualTwistDeg = maxResidualTwistDeg
                     )
@@ -398,6 +416,12 @@ object ZenithTopFaceRefiner {
                         result = candidateResult,
                         seamScore = seamScore,
                         residualTwistAbsDeg = residualTwistAbsDeg
+                    )
+                    val acceptMode = acceptanceMode(
+                        result = candidateResult,
+                        seamScore = seamScore,
+                        residualTwistAbsDeg = residualTwistAbsDeg,
+                        maxResidualTwistDeg = maxResidualTwistDeg
                     )
 
                     Log.d(
@@ -416,6 +440,7 @@ object ZenithTopFaceRefiner {
                                 "overlap=${seamScore.overlapCount} " +
                                 "meanAbsLumaDiff01=${"%.5f".format(seamScore.meanAbsLumaDiff01)} " +
                                 "accepted=$acceptedForBlend " +
+                                "acceptMode=$acceptMode " +
                                 "objective=${"%.2f".format(objectiveScore)}"
                     )
 
@@ -1398,6 +1423,31 @@ object ZenithTopFaceRefiner {
         val g = (Color.green(color) * gGain).roundToInt().coerceIn(0, 255)
         val b = (Color.blue(color) * bGain).roundToInt().coerceIn(0, 255)
         return Color.argb(a, r, g, b)
+    }
+
+    private fun acceptanceMode(
+        result: RefinementResult,
+        seamScore: CandidateSeamScore,
+        residualTwistAbsDeg: Float,
+        maxResidualTwistDeg: Float
+    ): String {
+        val strictAccept =
+            result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
+                    abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG &&
+                    residualTwistAbsDeg <= maxResidualTwistDeg
+
+        if (strictAccept) return "strict"
+
+        val seamRescueAccept =
+            result.eccScore >= MIN_FINAL_BLEND_SOFT_ECC_SCORE &&
+                    abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_SOFT_ABS_ROT_DEG &&
+                    residualTwistAbsDeg <= minOf(
+                maxResidualTwistDeg,
+                MAX_FINAL_BLEND_SOFT_RESIDUAL_TWIST_DEG
+            ) &&
+                    seamScore.meanAbsLumaDiff01 <= MAX_FINAL_BLEND_SOFT_MAX_LUMA_DIFF01
+
+        return if (seamRescueAccept) "seam_rescue" else "rejected"
     }
     private fun computeColorCorrectionStrength(
         correction: ColorCorrection
