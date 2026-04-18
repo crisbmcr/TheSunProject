@@ -100,6 +100,19 @@ object ZenithTopFaceRefiner {
     private const val MAX_DIRECT_ACCEPT_ABS_YAW_DELTA_DEG = 24f
     private const val MAX_DIRECT_ACCEPT_RESIDUAL_TWIST_DEG = 24f
 
+    // broad_edge: acepta candidatos con |yawDelta| > 24 (hasta el tope del coarse
+    // search, ±45) cuando la evidencia estructural es fuerte. Umbrales endurecidos
+    // respecto a direct_seam: si el seed IMU estaba lejos, exigimos mas senal para
+    // creerle al refiner.
+    private const val MIN_BROAD_EDGE_ABS_YAW_DELTA_DEG = 24f
+    private const val MAX_BROAD_EDGE_ABS_YAW_DELTA_DEG = 45f
+    private const val MIN_BROAD_EDGE_ANNULUS_CORR = 0.80f
+    private const val MIN_BROAD_EDGE_PEAK_MARGIN = 0.08f
+    private const val MAX_BROAD_EDGE_MEAN_ABS_LUMA_DIFF01 = 0.22f
+    private const val MIN_BROAD_EDGE_ECC_SCORE = 0.22
+    private const val MAX_BROAD_EDGE_ABS_ECC_ROT_DEG = 4.5f
+    private const val MAX_BROAD_EDGE_RESIDUAL_TWIST_DEG = 48f
+
     private const val OBJECTIVE_ANNULUS_CORR_SCALE = 1000f
     private const val OBJECTIVE_DIRECT_LUMA_DIFF_SCALE = 350f
     private const val OBJECTIVE_YAW_PRIOR_SCALE = 3f
@@ -191,6 +204,12 @@ object ZenithTopFaceRefiner {
         seedTwistDeg: Float,
         seedAbsoluteYawDeg: Float?
     ): List<DirectYawCandidate> {
+        // Coarse uniforme cada 6° en [-45, +45]. Sin saltos en los bordes (antes
+        // el paso se abria a 6° entre 36 y 45), asi el ganador real no se aproxima
+        // con un offset grueso que el refiner local (±6° de phase + ±6° de ECC)
+        // no llega a cerrar. Esto importa especialmente para el modo broad_edge:
+        // si el coarse aterriza limpio, eccRot baja y el candidato pasa el filtro
+        // sin tocar umbrales.
         val deltas = listOf(
             0f,
             -DIRECT_YAW_SEARCH_STEP_DEG, DIRECT_YAW_SEARCH_STEP_DEG,
@@ -199,6 +218,7 @@ object ZenithTopFaceRefiner {
             -24f, 24f,
             -30f, 30f,
             -36f, 36f,
+            -42f, 42f,
             -DIRECT_YAW_SEARCH_MAX_ABS_DEG, DIRECT_YAW_SEARCH_MAX_ABS_DEG
         )
 
@@ -293,6 +313,8 @@ object ZenithTopFaceRefiner {
         peakCorrMargin: Float,
         maxResidualTwistDeg: Float
     ): String {
+        // Modo 1: strict. El refiner cerro una solucion "chica" casi sobre el seed
+        // y el ECC esta muy contento. Camino normal cuando el seed IMU es bueno.
         val strictAccept =
             result.eccScore >= MIN_FINAL_BLEND_ECC_SCORE &&
                     abs(result.eccRotationDeg) <= MAX_FINAL_BLEND_ABS_ROT_DEG &&
@@ -300,6 +322,9 @@ object ZenithTopFaceRefiner {
 
         if (strictAccept) return "strict"
 
+        // Modo 2: direct_seam. El yaw esta dentro de ±24° del seed y hay correlacion
+        // en la banda de seam. Rescata casos donde el ECC no convergio pero el
+        // annulus muestra senal clara.
         val directSeamAccept =
             seamScore.annulusCorr >= MIN_DIRECT_ANNULUS_CORR &&
                     peakCorrMargin >= MIN_DIRECT_ANNULUS_CORR_MARGIN &&
@@ -311,7 +336,28 @@ object ZenithTopFaceRefiner {
             ) &&
                     abs(result.eccRotationDeg) <= LOCAL_ECC_REFINE_MAX_ABS_DEG
 
-        return if (directSeamAccept) "direct_seam" else "rejected"
+        if (directSeamAccept) return "direct_seam"
+
+        // Modo 3: broad_edge. El coarse encontro un ganador lejos del seed
+        // (|yawDelta| > 24°, hasta ±45°). Lo aceptamos solo si TODAS las metricas
+        // de evidencia son fuertes: annulus alto, margen sobre el runner-up claro,
+        // luma consistente, ECC score alto y eccRot pequeno (el refiner no esta
+        // forzando la solucion al tope). Si el coarse cayo en el borde por yaw
+        // genuino del frame, todos estos umbrales pasan comodos.
+        val broadEdgeAccept =
+            abs(yawDeltaDeg) > MIN_BROAD_EDGE_ABS_YAW_DELTA_DEG &&
+                    abs(yawDeltaDeg) <= MAX_BROAD_EDGE_ABS_YAW_DELTA_DEG &&
+                    seamScore.annulusCorr >= MIN_BROAD_EDGE_ANNULUS_CORR &&
+                    peakCorrMargin >= MIN_BROAD_EDGE_PEAK_MARGIN &&
+                    seamScore.meanAbsLumaDiff01 <= MAX_BROAD_EDGE_MEAN_ABS_LUMA_DIFF01 &&
+                    result.eccScore >= MIN_BROAD_EDGE_ECC_SCORE &&
+                    abs(result.eccRotationDeg) <= MAX_BROAD_EDGE_ABS_ECC_ROT_DEG &&
+                    residualTwistAbsDeg <= minOf(
+                maxResidualTwistDeg,
+                MAX_BROAD_EDGE_RESIDUAL_TWIST_DEG
+            )
+
+        return if (broadEdgeAccept) "broad_edge" else "rejected"
     }
 
     private fun isAcceptableFinalBlend(
