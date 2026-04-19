@@ -2284,4 +2284,34 @@ object ZenithTopFaceRefiner {
 
     private fun add(a: FloatArray, b: FloatArray): FloatArray =
         floatArrayOf(a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+    // ==================================================================
+    // Public blend entrypoint for other refiners in the same package.
+    // Wraps the private blendTopFaceIntoAtlas + fillUncoveredPolarCapFromTopFace
+    // pair so that alternative refiners (e.g. ZenithFeatureRefiner) can reuse
+    // the established blending + polar cap fill logic instead of duplicating it.
+    //
+    // Ownership: this function does NOT release `aligned`. The caller keeps
+    // ownership and is responsible for calling releaseTopFace(aligned) afterward.
+    // ==================================================================
+    internal fun blendAlignedTopFaceAndFillCap(
+        aligned: TopFace,
+        atlas: SkyAtlas,
+        frameWeight: Float
+    ) {
+        val colorCorrection = blendTopFaceIntoAtlas(
+            aligned = aligned,
+            atlas = atlas,
+            frameWeight = frameWeight,
+            minAltitudeDeg = BLEND_MIN_ALT_DEG
+        )
+
+        fillUncoveredPolarCapFromTopFace(
+            aligned = aligned,
+            atlas = atlas,
+            frameWeight = frameWeight,
+            minAltitudeDeg = POLAR_CAP_FILL_MIN_ALT_DEG,
+            colorCorrection = colorCorrection
+        )
+    }
 }

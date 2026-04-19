@@ -73,6 +73,12 @@ private const val ZENITH_REFINER_MAX_ABS_ECC_ROT_DEG = 1.5f
 private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
 private const val ENABLE_ZENITH_TOPFACE_REFINER = true
 
+// Which zenith refiner to use when ENABLE_ZENITH_TOPFACE_REFINER is true.
+// - "feature" → ORB + RANSAC 1-DoF (new, feature-based, immune to IMU seed bias)
+// - "legacy"  → photometric annulus correlation (old, kept for A/B comparison)
+// Change to "legacy" to revert behaviour without editing call sites.
+private const val ZENITH_REFINER_IMPL = "feature"
+
 private const val PERSISTED_MOUNT_MIN_SAMPLE_COUNT = 12
 
 private const val PERSISTED_MOUNT_MIN_QUALITY_SCORE = 0.996f
@@ -1020,18 +1026,34 @@ object AtlasProjector {
                             emitLogs = true
                         )
                     } else {
-                        val refined = ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
-                            atlas = atlas,
-                            frame = frame,
-                            srcBitmap = src,
-                            frameWeight = frameWeight,
-                            seedTwistDeg = zenithPose.legacyTwistDeg,
-                            seedPitchOffsetDeg = zenithPose.legacyPitchOffsetDeg,
-                            seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg,
-                            seedAbsoluteYawDeg = zenithPose.absoluteYawDeg,
-                            seedAbsolutePitchDeg = zenithPose.absolutePitchDeg,
-                            seedAbsoluteRollDeg = zenithPose.absoluteRollDeg
-                        )
+                        val refined = if (ZENITH_REFINER_IMPL == "feature") {
+                            ZenithFeatureRefiner.refineAndBlendZenithIntoAtlas(
+                                atlas = atlas,
+                                frame = frame,
+                                srcBitmap = src,
+                                frameWeight = frameWeight,
+                                seedTwistDeg = zenithPose.legacyTwistDeg,
+                                seedPitchOffsetDeg = zenithPose.legacyPitchOffsetDeg,
+                                seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg,
+                                seedAbsoluteYawDeg = zenithPose.absoluteYawDeg,
+                                seedAbsolutePitchDeg = zenithPose.absolutePitchDeg,
+                                seedAbsoluteRollDeg = zenithPose.absoluteRollDeg,
+                                verbose = true
+                            )
+                        } else {
+                            ZenithTopFaceRefiner.refineAndBlendZenithIntoAtlas(
+                                atlas = atlas,
+                                frame = frame,
+                                srcBitmap = src,
+                                frameWeight = frameWeight,
+                                seedTwistDeg = zenithPose.legacyTwistDeg,
+                                seedPitchOffsetDeg = zenithPose.legacyPitchOffsetDeg,
+                                seedRollOffsetDeg = zenithPose.legacyRollOffsetDeg,
+                                seedAbsoluteYawDeg = zenithPose.absoluteYawDeg,
+                                seedAbsolutePitchDeg = zenithPose.absolutePitchDeg,
+                                seedAbsoluteRollDeg = zenithPose.absoluteRollDeg
+                            )
+                        }
 
                         if (refined == null) {
                             Log.w(
