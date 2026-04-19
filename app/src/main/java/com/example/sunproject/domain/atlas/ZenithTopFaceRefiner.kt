@@ -100,10 +100,40 @@ object ZenithTopFaceRefiner {
     private const val MAX_DIRECT_ACCEPT_ABS_YAW_DELTA_DEG = 24f
     private const val MAX_DIRECT_ACCEPT_RESIDUAL_TWIST_DEG = 24f
 
-    // broad_edge: acepta candidatos con |yawDelta| > 24 (hasta el tope del coarse
-    // search, ±45) cuando la evidencia estructural es fuerte. Umbrales endurecidos
-    // respecto a direct_seam: si el seed IMU estaba lejos, exigimos mas senal para
-    // creerle al refiner.
+    // ==================================================================
+    // GLOBAL ANNULUS CORRELATION — strategy in use.
+    // Replaces the old discrete 17-candidate coarse search ±45° with a
+    // single correlation over 360° of the seam band. Resolution ~0.5°.
+    // ==================================================================
+    private const val GLOBAL_ANNULUS_MIN_ALT_DEG = 70f
+    private const val GLOBAL_ANNULUS_MAX_ALT_DEG = 82f
+    private const val GLOBAL_ANNULUS_BINS = 720
+
+    // Minimum absolute correlation of the winner for acceptance. Below this
+    // we can't trust the estimate: atlas probably too empty in the seam band,
+    // or the zenith has no structure in that band.
+    private const val MIN_GLOBAL_ANNULUS_CORR = 0.55f
+
+    // Winner must sit at least this much above the median-shift correlation.
+    // Measures peak sharpness: big margin = clear peak, tiny = flat landscape.
+    private const val MIN_GLOBAL_PEAK_MARGIN_OVER_MEDIAN = 0.12f
+
+    // Sanity gate for large shifts: if the global search moved the yaw by more
+    // than this, require an even higher correlation to accept. Catches cases
+    // where a spurious correlation in a near-symmetric band could fool us.
+    private const val GLOBAL_LARGE_SHIFT_THRESHOLD_DEG = 60f
+    private const val GLOBAL_LARGE_SHIFT_MIN_CORR = 0.70f
+
+    // Sign convention for applying the global shift to seedYaw.
+    // If after testing the zenith cap rotates in the OPPOSITE direction of
+    // what would fix it, flip this to -1f.
+    private const val GLOBAL_SHIFT_SIGN = 1f
+
+    // ==================================================================
+    // DEAD CODE (pending cleanup in a follow-up patch).
+    // Kept to avoid forcing a large deletion in the same commit as the
+    // architectural change. These constants are no longer referenced.
+    // ==================================================================
     private const val MIN_BROAD_EDGE_ABS_YAW_DELTA_DEG = 24f
     private const val MAX_BROAD_EDGE_ABS_YAW_DELTA_DEG = 45f
     private const val MIN_BROAD_EDGE_ANNULUS_CORR = 0.80f
@@ -494,102 +524,87 @@ object ZenithTopFaceRefiner {
         )
 
         try {
-            val candidates = buildDirectYawCandidates(
-                seedTwistDeg = baseSeedTwistDeg,
-                seedAbsoluteYawDeg = seedAbsoluteYawDeg
-            )
-
-            var bestEval: DirectYawCandidateEvaluation? = null
-            var secondBestEval: DirectYawCandidateEvaluation? = null
-
-            for ((index, candidate) in candidates.withIndex()) {
-                val zenithTop = buildZenithTopFace(
-                    frame = frame,
-                    srcBitmap = srcBitmap,
-                    baseTwistDeg = candidate.twistDeg,
-                    basePitchOffsetDeg = seedPitchOffsetDeg,
-                    baseRollOffsetDeg = seedRollOffsetDeg,
-                    absoluteYawDegOverride = candidate.absoluteYawDeg,
-                    absolutePitchDegOverride = seedAbsolutePitchDeg,
-                    absoluteRollDegOverride = seedAbsoluteRollDeg,
-                    faceSizePx = FACE_SIZE_PX
-                )
-
-                try {
-                    val seamScore = evaluateCandidateSeamScore(
-                        aligned = zenithTop,
-                        atlas = atlas,
-                        atlasTop = atlasTop,
-                        minAltitudeDeg = DIRECT_SEAM_MIN_ALT_DEG,
-                        maxAltitudeDeg = DIRECT_SEAM_MAX_ALT_DEG
-                    )
-
-                    val objectiveScore = directYawObjectiveScore(
-                        seamScore = seamScore,
-                        yawDeltaDeg = candidate.yawDeltaDeg
-                    )
-
-                    Log.d(
-                        "AtlasZenithYawSearch",
-                        "frame=${frame.frameId} " +
-                                "idx=$index " +
-                                "label=${candidate.label} " +
-                                "seedYaw=${candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
-                                "baseSeedTwist=${"%.2f".format(baseSeedTwistDeg)} " +
-                                "yawDelta=${"%.2f".format(candidate.yawDeltaDeg)} " +
-                                "seedTwist=${"%.2f".format(candidate.twistDeg)} " +
-                                "annulusCorr=${"%.5f".format(seamScore.annulusCorr)} " +
-                                "overlap=${seamScore.overlapCount} " +
-                                "meanAbsLumaDiff01=${"%.5f".format(seamScore.meanAbsLumaDiff01)} " +
-                                "objective=${"%.2f".format(objectiveScore)}"
-                    )
-
-                    val eval = DirectYawCandidateEvaluation(
-                        candidate = candidate,
-                        seamScore = seamScore,
-                        objectiveScore = objectiveScore
-                    )
-
-                    if (bestEval == null || eval.objectiveScore > bestEval!!.objectiveScore) {
-                        secondBestEval = bestEval
-                        bestEval = eval
-                    } else if (secondBestEval == null || eval.objectiveScore > secondBestEval!!.objectiveScore) {
-                        secondBestEval = eval
-                    }
-                } finally {
-                    releaseTopFace(zenithTop)
-                }
-            }
-
-            val coarseWinner = bestEval
-            if (coarseWinner == null) {
-                Log.w(
-                    "AtlasZenithTopRefine",
-                    "rejectAll frame=${frame.frameId} reason=no_coarse_winner"
-                )
-                return null
-            }
-
-            val peakCorrMargin =
-                coarseWinner.seamScore.annulusCorr -
-                        (secondBestEval?.seamScore?.annulusCorr ?: -1f)
-
-            val winnerTop = buildZenithTopFace(
+            // ===============================================================
+            // STEP 1 — Build the "seed" topFace with the IMU pose as-is.
+            // This topFace is only used to measure the global annulus shift;
+            // it is NOT the one we blend into the atlas.
+            // ===============================================================
+            val seedTop = buildZenithTopFace(
                 frame = frame,
                 srcBitmap = srcBitmap,
-                baseTwistDeg = coarseWinner.candidate.twistDeg,
+                baseTwistDeg = baseSeedTwistDeg,
                 basePitchOffsetDeg = seedPitchOffsetDeg,
                 baseRollOffsetDeg = seedRollOffsetDeg,
-                absoluteYawDegOverride = coarseWinner.candidate.absoluteYawDeg,
+                absoluteYawDegOverride = seedAbsoluteYawDeg,
+                absolutePitchDegOverride = seedAbsolutePitchDeg,
+                absoluteRollDegOverride = seedAbsoluteRollDeg,
+                faceSizePx = FACE_SIZE_PX
+            )
+
+            // ===============================================================
+            // STEP 2 — Global annulus correlation (360°, resolution ~0.5°).
+            // Replaces the old 17-candidate coarse search ±45°.
+            // ===============================================================
+            val globalResult = try {
+                annulusGlobalArgmax(
+                    reference = atlasTop,
+                    moving = seedTop,
+                    minAltitudeDeg = GLOBAL_ANNULUS_MIN_ALT_DEG,
+                    maxAltitudeDeg = GLOBAL_ANNULUS_MAX_ALT_DEG,
+                    angleBins = GLOBAL_ANNULUS_BINS
+                )
+            } finally {
+                releaseTopFace(seedTop)
+            }
+
+            val rawShiftDeg = globalResult.bestShiftDeg
+            // Convert [0, 360) to signed (-180, 180]. Pick the shorter rotation.
+            val signedShiftDeg = normalizeSignedDeg(rawShiftDeg) * GLOBAL_SHIFT_SIGN
+            val peakMarginOverMedian = globalResult.bestCorr - globalResult.corrMedian
+            val peakMarginOverSeed = globalResult.bestCorr - globalResult.corrAtZero
+
+            Log.d(
+                "AtlasZenithGlobalSearch",
+                "frame=${frame.frameId} " +
+                        "seedYaw=${seedAbsoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
+                        "baseSeedTwist=${"%.2f".format(baseSeedTwistDeg)} " +
+                        "rawShift=${"%.2f".format(rawShiftDeg)} " +
+                        "signedShift=${"%.2f".format(signedShiftDeg)} " +
+                        "globalCorr=${"%.5f".format(globalResult.bestCorr)} " +
+                        "corrAtZero=${"%.5f".format(globalResult.corrAtZero)} " +
+                        "corrMedian=${"%.5f".format(globalResult.corrMedian)} " +
+                        "marginVsMedian=${"%.5f".format(peakMarginOverMedian)} " +
+                        "marginVsSeed=${"%.5f".format(peakMarginOverSeed)}"
+            )
+
+            // ===============================================================
+            // STEP 3 — Build the corrected topFace using the shifted yaw.
+            // This one IS blended into the atlas.
+            // ===============================================================
+            val correctedYawDeg = seedAbsoluteYawDeg?.let { normalizeDeg(it + signedShiftDeg) }
+            val correctedBaseTwistDeg = normalizeDeg(baseSeedTwistDeg + signedShiftDeg)
+
+            val correctedTop = buildZenithTopFace(
+                frame = frame,
+                srcBitmap = srcBitmap,
+                baseTwistDeg = correctedBaseTwistDeg,
+                basePitchOffsetDeg = seedPitchOffsetDeg,
+                baseRollOffsetDeg = seedRollOffsetDeg,
+                absoluteYawDegOverride = correctedYawDeg,
                 absolutePitchDegOverride = seedAbsolutePitchDeg,
                 absoluteRollDegOverride = seedAbsoluteRollDeg,
                 faceSizePx = FACE_SIZE_PX
             )
 
             try {
+                // ===========================================================
+                // STEP 4 — Local residual refinement (phase + ECC).
+                // The global search should have gotten us within 1°. These are
+                // sub-degree corrections. ECC can fail and that's OK now.
+                // ===========================================================
                 val rawPhaseResidualDeg = estimateTwistWithPolarPhaseCorrelation(
                     reference = atlasTop,
-                    moving = winnerTop,
+                    moving = correctedTop,
                     minAltitudeDeg = DIRECT_SEAM_MIN_ALT_DEG,
                     maxAltitudeDeg = DIRECT_SEAM_MAX_ALT_DEG,
                     coarseTwistDeg = 0f
@@ -602,22 +617,17 @@ object ZenithTopFaceRefiner {
 
                 val residualRefined = refineWithEcc(
                     reference = atlasTop,
-                    moving = winnerTop,
+                    moving = correctedTop,
                     initialTwistDeg = phaseResidualDeg,
                     eccMinAltitudeDeg = DIRECT_SEAM_MIN_ALT_DEG,
                     eccMaxAltitudeDeg = DIRECT_SEAM_MAX_ALT_DEG
                 )
 
                 val absoluteInitialTwistDeg = normalizeDeg(
-                    baseSeedTwistDeg +
-                            coarseWinner.candidate.yawDeltaDeg +
-                            phaseResidualDeg
+                    baseSeedTwistDeg + signedShiftDeg + phaseResidualDeg
                 )
-
                 val absoluteFinalTwistDeg = normalizeDeg(
-                    baseSeedTwistDeg +
-                            coarseWinner.candidate.yawDeltaDeg +
-                            residualRefined.finalTwistDeg
+                    baseSeedTwistDeg + signedShiftDeg + residualRefined.finalTwistDeg
                 )
 
                 val candidateResult = RefinementResult(
@@ -643,33 +653,35 @@ object ZenithTopFaceRefiner {
                     baseSeedTwistDeg
                 )
 
-                val acceptMode = acceptanceMode(
-                    result = candidateResult,
-                    seamScore = finalSeamScore,
+                // ===========================================================
+                // STEP 5 — Acceptance based on the global correlation quality.
+                // No longer requires ECC convergence.
+                // ===========================================================
+                val acceptMode = globalAcceptanceMode(
+                    finalSeamScore = finalSeamScore,
+                    globalBestCorr = globalResult.bestCorr,
+                    globalPeakMarginOverMedian = peakMarginOverMedian,
+                    signedGlobalShiftDeg = signedShiftDeg,
                     residualTwistAbsDeg = residualTwistAbsDeg,
-                    yawDeltaDeg = coarseWinner.candidate.yawDeltaDeg,
-                    peakCorrMargin = peakCorrMargin,
                     maxResidualTwistDeg = maxResidualTwistDeg
                 )
-
                 val acceptedForBlend = acceptMode != "rejected"
 
                 Log.d(
                     "AtlasZenithTopCandidate",
                     "frame=${frame.frameId} " +
-                            "label=${coarseWinner.candidate.label} " +
-                            "seedYaw=${coarseWinner.candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
-                            "baseSeedTwist=${"%.2f".format(baseSeedTwistDeg)} " +
-                            "yawDelta=${"%.2f".format(coarseWinner.candidate.yawDeltaDeg)} " +
+                            "globalShift=${"%.2f".format(signedShiftDeg)} " +
+                            "globalCorr=${"%.5f".format(globalResult.bestCorr)} " +
+                            "marginVsMedian=${"%.5f".format(peakMarginOverMedian)} " +
+                            "marginVsSeed=${"%.5f".format(peakMarginOverSeed)} " +
                             "phaseResidual=${"%.2f".format(phaseResidualDeg)} " +
-                            "peakCorrMargin=${"%.5f".format(peakCorrMargin)} " +
                             "initialTwist=${"%.2f".format(candidateResult.initialTwistDeg)} " +
                             "finalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
                             "residualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
                             "maxResidualTwist=${"%.2f".format(maxResidualTwistDeg)} " +
                             "eccRot=${"%.2f".format(candidateResult.eccRotationDeg)} " +
                             "eccScore=${"%.5f".format(candidateResult.eccScore)} " +
-                            "annulusCorr=${"%.5f".format(finalSeamScore.annulusCorr)} " +
+                            "finalAnnulusCorr=${"%.5f".format(finalSeamScore.annulusCorr)} " +
                             "overlap=${finalSeamScore.overlapCount} " +
                             "meanAbsLumaDiff01=${"%.5f".format(finalSeamScore.meanAbsLumaDiff01)} " +
                             "accepted=$acceptedForBlend " +
@@ -680,16 +692,11 @@ object ZenithTopFaceRefiner {
                     Log.w(
                         "AtlasZenithTopRefine",
                         "rejectAll frame=${frame.frameId} " +
-                                "bestLabel=${coarseWinner.candidate.label} " +
-                                "bestSeedYaw=${coarseWinner.candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
-                                "bestYawDelta=${"%.2f".format(coarseWinner.candidate.yawDeltaDeg)} " +
-                                "bestAnnulusCorr=${"%.5f".format(finalSeamScore.annulusCorr)} " +
-                                "bestPeakCorrMargin=${"%.5f".format(peakCorrMargin)} " +
-                                "bestFinalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
-                                "bestResidualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
-                                "bestEccRot=${"%.2f".format(candidateResult.eccRotationDeg)} " +
-                                "bestEccScore=${"%.5f".format(candidateResult.eccScore)} " +
-                                "bestMeanAbsLumaDiff01=${"%.5f".format(finalSeamScore.meanAbsLumaDiff01)}"
+                                "globalShift=${"%.2f".format(signedShiftDeg)} " +
+                                "globalCorr=${"%.5f".format(globalResult.bestCorr)} " +
+                                "marginVsMedian=${"%.5f".format(peakMarginOverMedian)} " +
+                                "residualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
+                                "acceptMode=$acceptMode"
                     )
                     releaseTopFace(candidateResult.alignedTopFace)
                     return null
@@ -713,24 +720,23 @@ object ZenithTopFaceRefiner {
                 Log.d(
                     "AtlasZenithTopRefine",
                     "frame=${frame.frameId} " +
-                            "winner=${coarseWinner.candidate.label} " +
-                            "seedYaw=${coarseWinner.candidate.absoluteYawDeg?.let { "%.2f".format(it) } ?: "NaN"} " +
-                            "yawDelta=${"%.2f".format(coarseWinner.candidate.yawDeltaDeg)} " +
+                            "globalShift=${"%.2f".format(signedShiftDeg)} " +
+                            "globalCorr=${"%.5f".format(globalResult.bestCorr)} " +
+                            "marginVsMedian=${"%.5f".format(peakMarginOverMedian)} " +
                             "phaseResidual=${"%.2f".format(phaseResidualDeg)} " +
-                            "peakCorrMargin=${"%.5f".format(peakCorrMargin)} " +
                             "initialTwist=${"%.2f".format(candidateResult.initialTwistDeg)} " +
                             "finalTwist=${"%.2f".format(candidateResult.finalTwistDeg)} " +
                             "residualTwist=${"%.2f".format(residualTwistAbsDeg)} " +
                             "eccRot=${"%.2f".format(candidateResult.eccRotationDeg)} " +
                             "eccScore=${"%.5f".format(candidateResult.eccScore)} " +
-                            "annulusCorr=${"%.5f".format(finalSeamScore.annulusCorr)} " +
+                            "finalAnnulusCorr=${"%.5f".format(finalSeamScore.annulusCorr)} " +
                             "meanAbsLumaDiff01=${"%.5f".format(finalSeamScore.meanAbsLumaDiff01)} " +
                             "acceptMode=$acceptMode"
                 )
 
                 return candidateResult
             } finally {
-                releaseTopFace(winnerTop)
+                releaseTopFace(correctedTop)
             }
         } finally {
             releaseTopFace(atlasTop)
@@ -918,7 +924,72 @@ object ZenithTopFaceRefiner {
 
         return topFaceFromArgbAndMask(argb, mask, faceSizePx)
     }
+    // Result of the global 360° annulus argmax.
+    // bestShiftDeg is in [0, 360). Convert to signed [-180, 180] at the caller
+    // via normalizeSignedDeg if needed.
+    private data class AnnulusGlobalResult(
+        val bestShiftDeg: Float,
+        val bestCorr: Float,
+        val corrAtZero: Float,   // correlation at shift=0 (= stay at IMU seed)
+        val corrMedian: Float    // median over all shifts (= random-chance baseline)
+    )
 
+    // Global argmax of the annulus correlation over 360°.
+    // Unlike estimateTwistFromAnnulus (which returns only the best shift),
+    // this also returns the correlation at shift=0 and the median across all
+    // shifts, so the caller can reason about "how much better than seed" and
+    // "how sharp is the peak".
+    //
+    // Cost: O(angleBins^2). With angleBins=720 that's ~0.5M float mult/adds,
+    // which runs in a few milliseconds on a modern phone.
+    private fun annulusGlobalArgmax(
+        reference: TopFace,
+        moving: TopFace,
+        minAltitudeDeg: Float,
+        maxAltitudeDeg: Float,
+        angleBins: Int
+    ): AnnulusGlobalResult {
+        val refSig = buildAnnulusSignature(reference, minAltitudeDeg, maxAltitudeDeg, angleBins)
+        val movSig = buildAnnulusSignature(moving, minAltitudeDeg, maxAltitudeDeg, angleBins)
+
+        var denA = 0.0
+        var denB = 0.0
+        for (i in 0 until angleBins) {
+            denA += refSig[i] * refSig[i]
+            denB += movSig[i] * movSig[i]
+        }
+        val denProd = sqrt(denA * denB).coerceAtLeast(1e-9)
+
+        val allCorr = FloatArray(angleBins)
+        var bestShift = 0
+        var bestScore = Float.NEGATIVE_INFINITY
+
+        for (shift in 0 until angleBins) {
+            var num = 0.0
+            for (i in 0 until angleBins) {
+                num += refSig[i] * movSig[(i + shift) % angleBins]
+            }
+            val score = (num / denProd).toFloat()
+            allCorr[shift] = score
+
+            if (score > bestScore) {
+                bestScore = score
+                bestShift = shift
+            }
+        }
+
+        val bestShiftDeg = bestShift.toFloat() * (360f / angleBins.toFloat())
+
+        val sortedCorr = allCorr.sortedArray()
+        val corrMedian = sortedCorr[angleBins / 2]
+
+        return AnnulusGlobalResult(
+            bestShiftDeg = bestShiftDeg,
+            bestCorr = bestScore,
+            corrAtZero = allCorr[0],
+            corrMedian = corrMedian
+        )
+    }
     fun estimateTwistFromAnnulus(
         reference: TopFace,
         moving: TopFace,
@@ -1650,6 +1721,49 @@ object ZenithTopFaceRefiner {
                     seamScore.meanAbsLumaDiff01 <= MAX_FINAL_BLEND_SOFT_MAX_LUMA_DIFF01
 
         return if (seamRescueAccept) "seam_rescue" else "rejected"
+    }
+
+    // New acceptance policy for the global-annulus strategy.
+    // Independent of the old acceptanceMode (which stays in the file as dead
+    // code for now). Decouples acceptance from ECC convergence: the global
+    // annulus correlation itself is strong enough evidence when the peak is
+    // clear, and ECC in near-polar repetitive textures is known to be fragile.
+    //
+    // Return values:
+    //   "global"       — normal acceptance (|shift| <= threshold)
+    //   "global_large" — accepted but the shift was big; stricter corr required
+    //   "rejected"     — failed one of the gates
+    private fun globalAcceptanceMode(
+        finalSeamScore: CandidateSeamScore,
+        globalBestCorr: Float,
+        globalPeakMarginOverMedian: Float,
+        signedGlobalShiftDeg: Float,
+        residualTwistAbsDeg: Float,
+        maxResidualTwistDeg: Float
+    ): String {
+        // Gate 1: residual after local refine must not exceed the blend-max
+        // (this catches pathological cases where phase+ECC blew up).
+        if (residualTwistAbsDeg > maxResidualTwistDeg) return "rejected"
+
+        // Gate 2: winner correlation must be above absolute minimum.
+        if (globalBestCorr < MIN_GLOBAL_ANNULUS_CORR) return "rejected"
+
+        // Gate 3: the peak must stand out clearly above the median shift.
+        if (globalPeakMarginOverMedian < MIN_GLOBAL_PEAK_MARGIN_OVER_MEDIAN) return "rejected"
+
+        // Gate 4: for large shifts, require extra-strong correlation.
+        if (abs(signedGlobalShiftDeg) > GLOBAL_LARGE_SHIFT_THRESHOLD_DEG) {
+            if (globalBestCorr < GLOBAL_LARGE_SHIFT_MIN_CORR) return "rejected"
+            return "global_large"
+        }
+
+        // Note: finalSeamScore is passed in for potential future use (e.g.
+        // a sanity check on post-refine meanAbsLumaDiff01), but NOT used as
+        // a filter today. The global correlation is the authority.
+        @Suppress("UNUSED_PARAMETER")
+        val _ignored = finalSeamScore
+
+        return "global"
     }
     private fun computeColorCorrectionStrength(
         correction: ColorCorrection
