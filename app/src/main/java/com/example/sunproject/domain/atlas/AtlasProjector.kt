@@ -71,7 +71,7 @@ private const val ZENITH_REFINER_MIN_RAW_PITCH_DEG = 85.5f
 private const val ZENITH_REFINER_MAX_ABS_ROLL_DEG = 1.0f
 private const val ZENITH_REFINER_MAX_ABS_ECC_ROT_DEG = 1.5f
 private const val ZENITH_REFINER_MIN_ECC_SCORE = 0.25
-private const val ENABLE_ZENITH_TOPFACE_REFINER = true
+private const val ENABLE_ZENITH_TOPFACE_REFINER = false
 
 // Which zenith refiner to use when ENABLE_ZENITH_TOPFACE_REFINER is true.
 // - "feature" → ORB + RANSAC 1-DoF (new, feature-based, immune to IMU seed bias)

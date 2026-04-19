@@ -368,10 +368,41 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         if (sensor?.type == Sensor.TYPE_MAGNETIC_FIELD) {
             magneticAccuracy = accuracy
+
+            // Verbose interpretation for diagnostic. The azimuth reported
+            // by TYPE_ROTATION_VECTOR depends on magnetometer calibration.
+            // UNRELIABLE/LOW → azimuth can be off by 20-90° from true North.
+            // That error is SILENT: there is no runtime failure, just a
+            // biased atlas that looks "rotated" between sessions.
+            //
+            // Recommended user action if LOW/UNRELIABLE: move the phone
+            // in a figure-8 pattern in the air for ~5 seconds BEFORE
+            // starting the session.
+            val accuracyLabel = when (accuracy) {
+                SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "HIGH"
+                SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "MEDIUM"
+                SensorManager.SENSOR_STATUS_ACCURACY_LOW -> "LOW"
+                SensorManager.SENSOR_STATUS_UNRELIABLE -> "UNRELIABLE"
+                else -> "UNKNOWN($accuracy)"
+            }
+            val headingReliable = accuracy >= SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM
+
             Log.d(
                 "SunSensors",
-                "magAccuracy=$accuracy fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT"
+                "magAccuracy=$accuracy label=$accuracyLabel " +
+                        "headingReliable=$headingReliable " +
+                        "fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT"
             )
+
+            if (!headingReliable) {
+                Log.w(
+                    "SunCompassGuard",
+                    "COMPASS_UNRELIABLE: accuracy=$accuracyLabel. Absolute yaw is " +
+                            "untrustworthy right now. Atlas built in this state " +
+                            "will be rotated relative to other sessions. Move the " +
+                            "phone in a figure-8 pattern to recalibrate."
+                )
+            }
         }
     }
 
@@ -703,8 +734,30 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val meta = File(dir, "metadata.csv")
         if (!meta.exists()) meta.writeText("filename,timestamp_ms,azimuth,pitch,roll,lat,lon,alt\n")
+
+        // Snapshot of compass state at session start. This is the azimuth
+        // reference that the entire atlas will be built against. If this
+        // is UNRELIABLE/LOW, the whole session's atlas will be rotated
+        // relative to other sessions — even if every frame within this
+        // session is internally consistent.
+        val magAccLabel = when (magneticAccuracy) {
+            SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "HIGH"
+            SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "MEDIUM"
+            SensorManager.SENSOR_STATUS_ACCURACY_LOW -> "LOW"
+            SensorManager.SENSOR_STATUS_UNRELIABLE -> "UNRELIABLE"
+            else -> "UNKNOWN($magneticAccuracy)"
+        }
+        Log.i(
+            "SunCompassGuard",
+            "SESSION_START sessionId=${dir.name} " +
+                    "magAccuracy=$magneticAccuracy label=$magAccLabel " +
+                    "fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT " +
+                    "initialYawAbs=${"%.2f".format(absoluteYawDeg)}"
+        )
+
         return dir
     }
+
 
 
     private fun appendMetadata(fileName: String, pose: CapturedPose) {
@@ -780,6 +833,23 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             "PanoramaCAP",
             "Capturing -> ${file.name} (az=$safeAz p=$safePi) " +
                     "pose=${"%.2f".format(frozenPose.azimuthDeg)}/${"%.2f".format(frozenPose.pitchDeg)}/${"%.2f".format(frozenPose.rollDeg)}"
+        )
+
+        // Per-frame compass snapshot. The absoluteYawDeg of this frame is
+        // ONLY as trustworthy as the magnetometer accuracy at capture time.
+        val magAccLabel = when (magneticAccuracy) {
+            SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "HIGH"
+            SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "MEDIUM"
+            SensorManager.SENSOR_STATUS_ACCURACY_LOW -> "LOW"
+            SensorManager.SENSOR_STATUS_UNRELIABLE -> "UNRELIABLE"
+            else -> "UNKNOWN($magneticAccuracy)"
+        }
+        Log.i(
+            "SunCompassGuard",
+            "CAPTURE frame=${file.nameWithoutExtension} " +
+                    "magAccuracy=$magneticAccuracy label=$magAccLabel " +
+                    "fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT " +
+                    "absYaw=${frozenPose.absAzimuthDeg?.let { "%.2f".format(it) } ?: "null"}"
         )
 
         val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
