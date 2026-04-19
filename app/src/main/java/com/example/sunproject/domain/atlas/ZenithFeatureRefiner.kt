@@ -314,73 +314,216 @@ object ZenithFeatureRefiner {
         val size = atlasTop.faceSizePx
         val center = (size - 1) * 0.5f
 
-        // ------------------------------------------------------------
-        // PRE-ROTATION STRATEGY
-        // ------------------------------------------------------------
-        // The atlasTop is built with azimuth=0 pointing to world North.
-        // The zenithTop is built with the IMU seed yaw applied, so a
-        // physical structure at world azimuth X lands at topFace pixel
-        // corresponding to (X - seedYaw) in the zenith image.
+        // ============================================================
+        // DIAGNOSTIC DUMP A — convention of atlasTop
         //
-        // If we run ORB directly on (atlasTop, zenithTop), the two
-        // images differ by a rotation of `seedYaw` degrees around the
-        // center. ORB is in theory rotation-invariant via keypoint
-        // orientation, but near the pole with limited texture this is
-        // flaky — hence the 4-11 good matches we saw in the logs.
+        // Compute the pixel where each of (0°, 90°, 180°, 270°) azimuth
+        // should land according to the SAME math buildAtlasTopFace uses.
         //
-        // Fix: rotate atlasGray8 by -seedYaw so that after rotation it
-        // uses the SAME nominal convention as zenithGray8 (North of
-        // the atlas ends up at the same topface-pixel as North of the
-        // zenith). Now ORB only has to resolve the residual ~30-40°.
+        // buildAtlasTopFace uses azimuth = atan2(dir[0], dir[1]) where
+        // dir = (px, py, 1) = ((x-cx)/r, (y-cy)/r, 1). So for an azimuth
+        // A at altitude 75° (inside the seam ROI):
+        //   zenith_angle = 90° - 75° = 15°
+        //   radius_in_pixels = tan(15°) * maxRadius
+        //   px_dir = sin(A), py_dir = cos(A)
+        //   x_pixel = cx + radius_px * sin(A)
+        //   y_pixel = cy + radius_px * cos(A)
         //
-        // The RANSAC delta is then expressed in the "rotated frame",
-        // and the actual world-frame deltaYaw is delta_rotated itself
-        // (because pre-rotating atlas by -seedYaw is mathematically
-        // equivalent to subtracting seedYaw from the pixel→azimuth
-        // mapping on atlas side). We log everything explicitly.
-        // ------------------------------------------------------------
+        // Log these so we know WHERE North/East/South/West actually fall
+        // on atlasTop. If North (az=0) falls at (cx, cy + r), then North
+        // is DOWN in image coordinates (because Y grows downward).
+        // ============================================================
+        run {
+            val maxRadius = center
+            val altSample = 75f
+            val zenithAngleDeg = 90f - altSample
+            val radiusPx = kotlin.math.tan(Math.toRadians(zenithAngleDeg.toDouble())).toFloat() * maxRadius
 
+            fun pixelForAz(azDeg: Float): Pair<Float, Float> {
+                val a = Math.toRadians(azDeg.toDouble()).toFloat()
+                val xp = center + radiusPx * kotlin.math.sin(a)
+                val yp = center + radiusPx * kotlin.math.cos(a)
+                return xp to yp
+            }
+
+            val (n_x, n_y) = pixelForAz(0f)
+            val (e_x, e_y) = pixelForAz(90f)
+            val (s_x, s_y) = pixelForAz(180f)
+            val (w_x, w_y) = pixelForAz(270f)
+
+            Log.d(
+                "AtlasZenithDumpA",
+                "frame=$frameId size=$size center=${"%.1f".format(center)} " +
+                        "N(az=0)=(${"%.1f".format(n_x)},${"%.1f".format(n_y)}) " +
+                        "E(az=90)=(${"%.1f".format(e_x)},${"%.1f".format(e_y)}) " +
+                        "S(az=180)=(${"%.1f".format(s_x)},${"%.1f".format(s_y)}) " +
+                        "W(az=270)=(${"%.1f".format(w_x)},${"%.1f".format(w_y)})"
+            )
+
+            // Also log what OUR topFacePixelToAzimuthDeg gives for a few
+            // reference pixels. If the round trip is consistent, these
+            // should match the azimuths above.
+            val backN = topFacePixelToAzimuthDeg(n_x, n_y, center)
+            val backE = topFacePixelToAzimuthDeg(e_x, e_y, center)
+            val backS = topFacePixelToAzimuthDeg(s_x, s_y, center)
+            val backW = topFacePixelToAzimuthDeg(w_x, w_y, center)
+
+            Log.d(
+                "AtlasZenithDumpA",
+                "frame=$frameId roundTrip " +
+                        "N=${"%.2f".format(backN)} " +
+                        "E=${"%.2f".format(backE)} " +
+                        "S=${"%.2f".format(backS)} " +
+                        "W=${"%.2f".format(backW)}"
+            )
+        }
+
+        // ============================================================
+        // Build ROI masks and grayscale images (used for all 3 variants).
+        // ============================================================
         val atlasRoiMask = buildAnnulusRoiMask(atlasTop)
         val zenithRoiMask = buildAnnulusRoiMask(zenithTop)
 
         val atlasGray8 = Mat()
         val zenithGray8 = Mat()
-        val atlasGray8Rot = Mat()
-        val atlasRoiMaskRot = Mat()
 
         try {
             atlasTop.gray32.convertTo(atlasGray8, CvType.CV_8U, 255.0)
             zenithTop.gray32.convertTo(zenithGray8, CvType.CV_8U, 255.0)
 
-            // Rotate atlas image and its ROI mask by -seedYaw around the center.
-            // getRotationMatrix2D uses CCW positive; azimuth in our world is CW
-            // positive from North, so rotating by -seedYaw here is consistent
-            // with bringing atlas's North to coincide with zenith's North.
-            val rotM = org.opencv.imgproc.Imgproc.getRotationMatrix2D(
-                org.opencv.core.Point(center.toDouble(), center.toDouble()),
-                (-seedAbsoluteYawDeg).toDouble(),
-                1.0
+            // ========================================================
+            // Run the alignment 3 times with different pre-rotation:
+            //   variant A: rotation = 0         (no pre-rotation)
+            //   variant B: rotation = -seedYaw  (current implementation)
+            //   variant C: rotation = +seedYaw  (opposite sign)
+            // The verbose logs show which one (if any) produces a clear
+            // geometric consensus in RANSAC.
+            // ========================================================
+
+            val variantA = runOneVariant(
+                atlasGray8 = atlasGray8,
+                atlasRoiMask = atlasRoiMask,
+                zenithGray8 = zenithGray8,
+                zenithRoiMask = zenithRoiMask,
+                preRotateDeg = 0.0,
+                center = center,
+                size = size,
+                variantLabel = "A_noRotate",
+                frameId = frameId
             )
-            try {
-                org.opencv.imgproc.Imgproc.warpAffine(
-                    atlasGray8, atlasGray8Rot, rotM,
-                    org.opencv.core.Size(size.toDouble(), size.toDouble()),
-                    org.opencv.imgproc.Imgproc.INTER_LINEAR,
-                    org.opencv.core.Core.BORDER_CONSTANT,
-                    org.opencv.core.Scalar(0.0)
+
+            val variantB = runOneVariant(
+                atlasGray8 = atlasGray8,
+                atlasRoiMask = atlasRoiMask,
+                zenithGray8 = zenithGray8,
+                zenithRoiMask = zenithRoiMask,
+                preRotateDeg = (-seedAbsoluteYawDeg).toDouble(),
+                center = center,
+                size = size,
+                variantLabel = "B_minusSeed",
+                frameId = frameId
+            )
+
+            val variantC = runOneVariant(
+                atlasGray8 = atlasGray8,
+                atlasRoiMask = atlasRoiMask,
+                zenithGray8 = zenithGray8,
+                zenithRoiMask = zenithRoiMask,
+                preRotateDeg = (+seedAbsoluteYawDeg).toDouble(),
+                center = center,
+                size = size,
+                variantLabel = "C_plusSeed",
+                frameId = frameId
+            )
+
+            // Summary: which variant "wins" by inlier count.
+            Log.d(
+                "AtlasZenithDumpSummary",
+                "frame=$frameId seedYaw=${"%.2f".format(seedAbsoluteYawDeg)} " +
+                        "A_noRotate=(matches=${variantA.numMatches}, inliers=${variantA.numInliers}, delta=${"%.2f".format(variantA.deltaYawDeg)}, p50=${"%.2f".format(variantA.p50)}) " +
+                        "B_minusSeed=(matches=${variantB.numMatches}, inliers=${variantB.numInliers}, delta=${"%.2f".format(variantB.deltaYawDeg)}, p50=${"%.2f".format(variantB.p50)}) " +
+                        "C_plusSeed=(matches=${variantC.numMatches}, inliers=${variantC.numInliers}, delta=${"%.2f".format(variantC.deltaYawDeg)}, p50=${"%.2f".format(variantC.p50)})"
+            )
+
+            // Pick the winner by inlier count, but always reject from the
+            // caller's perspective. This diagnostic build does not blend.
+            // We return rejected so the frame falls back to ERP, and nothing
+            // in the atlas gets written by a possibly-wrong delta.
+            //
+            // Once we decide the correct sign from the logs, we'll remove
+            // the other variants and enable blending.
+            return reject(
+                reason = "diagnostic_mode_no_blend",
+                seedAbsoluteYawDeg = seedAbsoluteYawDeg,
+                numMatches = maxOf(variantA.numMatches, variantB.numMatches, variantC.numMatches)
+            )
+        } finally {
+            atlasRoiMask.release()
+            zenithRoiMask.release()
+            atlasGray8.release()
+            zenithGray8.release()
+        }
+    }
+
+    /**
+     * Data class for a single variant's result. Used only in the diagnostic
+     * dump; delete when we pick the correct variant.
+     */
+    private data class VariantResult(
+        val numMatches: Int,
+        val numInliers: Int,
+        val deltaYawDeg: Float,
+        val p50: Float
+    )
+
+    /**
+     * Runs ORB + BFMatcher + RANSAC once with a given pre-rotation, logs the
+     * results, and returns a short summary. Does NOT blend into atlas.
+     */
+    private fun runOneVariant(
+        atlasGray8: Mat,
+        atlasRoiMask: Mat,
+        zenithGray8: Mat,
+        zenithRoiMask: Mat,
+        preRotateDeg: Double,
+        center: Float,
+        size: Int,
+        variantLabel: String,
+        frameId: String
+    ): VariantResult {
+        val atlasGray8Rot = Mat()
+        val atlasRoiMaskRot = Mat()
+
+        try {
+            if (kotlin.math.abs(preRotateDeg) < 1e-6) {
+                atlasGray8.copyTo(atlasGray8Rot)
+                atlasRoiMask.copyTo(atlasRoiMaskRot)
+            } else {
+                val rotM = org.opencv.imgproc.Imgproc.getRotationMatrix2D(
+                    org.opencv.core.Point(center.toDouble(), center.toDouble()),
+                    preRotateDeg,
+                    1.0
                 )
-                org.opencv.imgproc.Imgproc.warpAffine(
-                    atlasRoiMask, atlasRoiMaskRot, rotM,
-                    org.opencv.core.Size(size.toDouble(), size.toDouble()),
-                    org.opencv.imgproc.Imgproc.INTER_NEAREST,
-                    org.opencv.core.Core.BORDER_CONSTANT,
-                    org.opencv.core.Scalar(0.0)
-                )
-            } finally {
-                rotM.release()
+                try {
+                    org.opencv.imgproc.Imgproc.warpAffine(
+                        atlasGray8, atlasGray8Rot, rotM,
+                        org.opencv.core.Size(size.toDouble(), size.toDouble()),
+                        org.opencv.imgproc.Imgproc.INTER_LINEAR,
+                        org.opencv.core.Core.BORDER_CONSTANT,
+                        org.opencv.core.Scalar(0.0)
+                    )
+                    org.opencv.imgproc.Imgproc.warpAffine(
+                        atlasRoiMask, atlasRoiMaskRot, rotM,
+                        org.opencv.core.Size(size.toDouble(), size.toDouble()),
+                        org.opencv.imgproc.Imgproc.INTER_NEAREST,
+                        org.opencv.core.Core.BORDER_CONSTANT,
+                        org.opencv.core.Scalar(0.0)
+                    )
+                } finally {
+                    rotM.release()
+                }
             }
 
-            // ORB detect + compute on the rotated atlas and the zenith.
             val orb = ORB.create(
                 ORB_NUM_FEATURES,
                 ORB_SCALE_FACTOR,
@@ -405,88 +548,39 @@ object ZenithFeatureRefiner {
                 val nAtlas = kpAtlas.rows()
                 val nZenith = kpZenith.rows()
 
-                if (verbose) {
-                    Log.d(
-                        "AtlasZenithFeatureDetect",
-                        "frame=$frameId atlasKp=$nAtlas zenithKp=$nZenith " +
-                                "preRotateDeg=${"%.2f".format(-seedAbsoluteYawDeg)}"
-                    )
-                }
-
-                if (nAtlas < MIN_INLIERS_RELAXED || nZenith < MIN_INLIERS_RELAXED ||
-                    descAtlas.empty() || descZenith.empty()
+                if (descAtlas.empty() || descZenith.empty() ||
+                    nAtlas < 6 || nZenith < 6
                 ) {
-                    return reject(
-                        reason = "too_few_keypoints",
-                        seedAbsoluteYawDeg = seedAbsoluteYawDeg,
-                        numMatches = 0
+                    Log.d(
+                        "AtlasZenithDumpVariant",
+                        "frame=$frameId variant=$variantLabel preRot=${"%.2f".format(preRotateDeg)} " +
+                                "atlasKp=$nAtlas zenithKp=$nZenith result=notEnoughKp"
                     )
+                    return VariantResult(0, 0, 0f, 0f)
                 }
 
-                // Match with Lowe ratio test.
                 val matcher = BFMatcher.create(Core_NORM_HAMMING, false)
                 val knn = ArrayList<MatOfDMatch>()
                 matcher.knnMatch(descZenith, descAtlas, knn, 2)
 
                 val goodMatches = ArrayList<DMatch>()
-                val rejectedByLowe = ArrayList<Float>()
                 for (pair in knn) {
                     val arr = pair.toArray()
                     if (arr.size < 2) continue
                     val m = arr[0]
                     val n = arr[1]
-                    val ratio = if (n.distance > 0f) m.distance / n.distance else 0f
-                    if (m.distance < LOWE_RATIO * n.distance) {
-                        goodMatches.add(m)
-                    } else {
-                        rejectedByLowe.add(ratio)
-                    }
-                }
-
-                if (verbose) {
-                    val meanGoodDist =
-                        if (goodMatches.isEmpty()) Float.NaN
-                        else goodMatches.map { it.distance }.average().toFloat()
-                    val meanRejectRatio =
-                        if (rejectedByLowe.isEmpty()) Float.NaN
-                        else rejectedByLowe.average().toFloat()
-                    Log.d(
-                        "AtlasZenithFeatureMatch",
-                        "frame=$frameId knn=${knn.size} " +
-                                "goodMatches=${goodMatches.size} " +
-                                "rejectedLowe=${rejectedByLowe.size} " +
-                                "meanGoodHamming=${"%.1f".format(meanGoodDist)} " +
-                                "meanRejectedLoweRatio=${"%.3f".format(meanRejectRatio)}"
-                    )
+                    if (m.distance < LOWE_RATIO * n.distance) goodMatches.add(m)
                 }
 
                 if (goodMatches.size < MIN_MATCHES_FOR_RANSAC) {
-                    return reject(
-                        reason = "too_few_matches",
-                        seedAbsoluteYawDeg = seedAbsoluteYawDeg,
-                        numMatches = goodMatches.size
+                    Log.d(
+                        "AtlasZenithDumpVariant",
+                        "frame=$frameId variant=$variantLabel preRot=${"%.2f".format(preRotateDeg)} " +
+                                "atlasKp=$nAtlas zenithKp=$nZenith " +
+                                "goodMatches=${goodMatches.size} result=notEnoughMatches"
                     )
+                    return VariantResult(goodMatches.size, 0, 0f, 0f)
                 }
-
-                // Convert each match to residual delta azimuth.
-                //
-                // Because we pre-rotated the atlas by -seedYaw, the atlas
-                // keypoint at pixel (x,y) now represents the world azimuth
-                //   azAtlasWorld = topFacePixelToAzimuthDeg(x,y) + seedYaw
-                // but in the rotated frame what RANSAC sees is just
-                //   azAtlasRot = topFacePixelToAzimuthDeg(x,y)
-                // The zenith keypoint at pixel (x,y) represents
-                //   azZenithCam = topFacePixelToAzimuthDeg(x,y)   (camera frame)
-                // whose world azimuth is azZenithCam + seedYaw.
-                //
-                // So in the ROTATED frame:
-                //   delta_rotated = azAtlasRot - azZenithCam
-                //                 = (azAtlasWorld - seedYaw) - (azZenithCamWorld - seedYaw)
-                //                 = azAtlasWorld - azZenithCamWorld
-                //                 = deltaYaw_world
-                //
-                // i.e., delta_rotated IS the world-frame deltaYaw. No extra
-                // correction needed. We just compute it directly.
 
                 val kpAtlasArr = kpAtlas.toArray()
                 val kpZenithArr = kpZenith.toArray()
@@ -503,92 +597,47 @@ object ZenithFeatureRefiner {
                         kpQuery.pt.y.toFloat(),
                         center
                     )
-                    val azAtlasRotated = topFacePixelToAzimuthDeg(
+                    val azAtlasRot = topFacePixelToAzimuthDeg(
                         kpTrain.pt.x.toFloat(),
                         kpTrain.pt.y.toFloat(),
                         center
                     )
+                    if (azZenith.isNaN() || azAtlasRot.isNaN()) continue
 
-                    if (azZenith.isNaN() || azAtlasRotated.isNaN()) continue
-
-                    val delta = normalizeSignedDeg(azAtlasRotated - azZenith)
-                    deltaAzDegList[usedMatches++] = delta
+                    deltaAzDegList[usedMatches++] =
+                        normalizeSignedDeg(azAtlasRot - azZenith)
                 }
 
                 if (usedMatches < MIN_MATCHES_FOR_RANSAC) {
-                    return reject(
-                        reason = "too_few_after_geom_conversion",
-                        seedAbsoluteYawDeg = seedAbsoluteYawDeg,
-                        numMatches = usedMatches
+                    Log.d(
+                        "AtlasZenithDumpVariant",
+                        "frame=$frameId variant=$variantLabel preRot=${"%.2f".format(preRotateDeg)} " +
+                                "goodMatches=${goodMatches.size} usedAfterGeom=$usedMatches result=notEnoughAfterGeom"
                     )
+                    return VariantResult(usedMatches, 0, 0f, 0f)
                 }
 
-                // RANSAC 1-DoF.
+                val sorted = deltaAzDegList.sliceArray(0 until usedMatches).sortedArray()
+                val p10 = sorted[usedMatches / 10]
+                val p50 = sorted[usedMatches / 2]
+                val p90 = sorted[usedMatches * 9 / 10]
+
                 val ransac = ransacDeltaYaw(deltaAzDegList, usedMatches)
 
-                if (verbose) {
-                    // Log histogram of delta azimuth for debugging.
-                    val sorted = deltaAzDegList.sliceArray(0 until usedMatches).sortedArray()
-                    val p10 = sorted[usedMatches / 10]
-                    val p50 = sorted[usedMatches / 2]
-                    val p90 = sorted[usedMatches * 9 / 10]
-                    Log.d(
-                        "AtlasZenithFeatureRansac",
-                        "frame=$frameId matches=$usedMatches " +
-                                "deltaAzP10=${"%.2f".format(p10)} " +
-                                "deltaAzP50=${"%.2f".format(p50)} " +
-                                "deltaAzP90=${"%.2f".format(p90)} " +
-                                "ransacBestInliers=${ransac.numInliers} " +
-                                "ransacDeltaYaw=${"%.3f".format(ransac.deltaYawDeg)}"
-                    )
-                }
-
-                if (ransac.numInliers < MIN_INLIERS_RELAXED) {
-                    return reject(
-                        reason = "ransac_too_few_inliers",
-                        seedAbsoluteYawDeg = seedAbsoluteYawDeg,
-                        numMatches = usedMatches,
-                        ransacInliers = ransac.numInliers
-                    )
-                }
-
-                // Refine via circular mean of inliers.
-                val finalDeltaYawDeg = circularMeanDeg(
-                    deltaAzDegList,
-                    ransac.inlierMask,
-                    usedMatches
+                Log.d(
+                    "AtlasZenithDumpVariant",
+                    "frame=$frameId variant=$variantLabel preRot=${"%.2f".format(preRotateDeg)} " +
+                            "atlasKp=$nAtlas zenithKp=$nZenith " +
+                            "goodMatches=${goodMatches.size} used=$usedMatches " +
+                            "p10=${"%.2f".format(p10)} p50=${"%.2f".format(p50)} p90=${"%.2f".format(p90)} " +
+                            "ransacInliers=${ransac.numInliers} ransacDelta=${"%.3f".format(ransac.deltaYawDeg)}"
                 )
 
-                val residuals = FloatArray(ransac.numInliers)
-                var residualIdx = 0
-                for (i in 0 until usedMatches) {
-                    if (ransac.inlierMask[i]) {
-                        residuals[residualIdx++] =
-                            abs(normalizeSignedDeg(deltaAzDegList[i] - finalDeltaYawDeg))
-                    }
-                }
-                residuals.sort()
-                val residualMedian = residuals[ransac.numInliers / 2]
-                val residualP90 =
-                    residuals[(ransac.numInliers * 9 / 10).coerceAtMost(ransac.numInliers - 1)]
-
-                val acceptMode = when {
-                    ransac.numInliers >= MIN_INLIERS_STRICT &&
-                            residualMedian <= MAX_RESIDUAL_MEDIAN_DEG_STRICT -> "strict"
-                    ransac.numInliers >= MIN_INLIERS_RELAXED &&
-                            residualMedian <= MAX_RESIDUAL_MEDIAN_DEG_RELAXED -> "relaxed"
-                    else -> "rejected"
-                }
-
-                return FeatureRefineResult(
-                    deltaYawDeg = finalDeltaYawDeg,
-                    finalYawDeg = normalizeDeg(seedAbsoluteYawDeg + finalDeltaYawDeg),
+                return VariantResult(
                     numMatches = usedMatches,
                     numInliers = ransac.numInliers,
-                    residualMedianDeg = residualMedian,
-                    residualP90Deg = residualP90,
-                    accepted = acceptMode != "rejected",
-                    acceptMode = acceptMode
+                    deltaYawDeg = ransac.deltaYawDeg,
+                    p50 = p50
                 )
             } finally {
                 kpAtlas.release()
@@ -597,10 +646,6 @@ object ZenithFeatureRefiner {
                 descZenith.release()
             }
         } finally {
-            atlasRoiMask.release()
-            zenithRoiMask.release()
-            atlasGray8.release()
-            zenithGray8.release()
             atlasGray8Rot.release()
             atlasRoiMaskRot.release()
         }
