@@ -74,6 +74,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val lastAbsRotationMatrix = FloatArray(9)
     private var hasLastAbsRotationMatrix = false
 
+    // Ring buffer of the last N absolute-yaw samples. Used to compute a
+    // time-averaged pose for the Z0 frame, which reduces jitter in the
+    // most error-sensitive capture of the session.
+    private val zenithPoseBufferSize = 20
+    private val zenithYawBuffer = FloatArray(zenithPoseBufferSize)
+    private val zenithPitchBuffer = FloatArray(zenithPoseBufferSize)
+    private val zenithRollBuffer = FloatArray(zenithPoseBufferSize)
+    private var zenithPoseBufferIndex = 0
+    private var zenithPoseBufferFilled = false
+
     //private val alpha = 0.08f
     //private var isFirstReading = true
     private data class Vec3(var x: Float, var y: Float, var z: Float)
@@ -128,14 +138,19 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val pitchTolDeg = 2.5f
     private val rollTolDeg = 3f
 
-    private val zenithPitchTolDeg = 1.4f
-    private val zenithRollTolDeg = 2.2f
+    // Zenith tolerances — tightened 2026-04. The Z0 frame is the hardest
+    // to place correctly because it sits at the pole of the equirectangular
+    // projection where small pose errors become large angular errors on
+    // the surrounding sky. Values were relaxed historically to get any Z0
+    // at all; we now prefer fewer but geometrically better Z0 captures.
+    private val zenithPitchTolDeg = 1.0f           // was 1.4 — tighter
+    private val zenithRollTolDeg = 1.0f            // was 2.2 — much tighter (roll impacts azimuth near pole)
 
     private val holdMs = 800L
-    private val zenithHoldMs = 1300L
-    private val zenithSettleMs = 450L
-    private val zenithAbsPitchDriftTolDeg = 0.8f
-    private val zenithAbsRollDriftTolDeg = 1.2f
+    private val zenithHoldMs = 2500L               // was 1300 — longer settle for gyro to stabilize
+    private val zenithSettleMs = 900L              // was 450 — double settle window
+    private val zenithAbsPitchDriftTolDeg = 0.5f   // was 0.8 — tighter drift tolerance
+    private val zenithAbsRollDriftTolDeg = 0.7f    // was 1.2 — tighter drift tolerance
 
     private val cooldownMs = 1200L
     private var alignmentStartMs = 0L
@@ -352,6 +367,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         magneticFieldSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
+
+        // Android does not guarantee onAccuracyChanged fires right after
+        // register. If the magnetometer was already in UNRELIABLE from a
+        // previous app run (cached in sensor stack), we never get a
+        // notification and our magneticAccuracy stays at its initial
+        // default value. Log the "last known state" on resume so we at
+        // least see the current status explicitly.
+        Log.i(
+            "SunCompassGuard",
+            "ON_RESUME currentMagAccuracy=$magneticAccuracy " +
+                    "fieldNorm=${"%.1f".format(magneticFieldNormUt)}uT"
+        )
     }
 
     override fun onPause() {
@@ -438,6 +465,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 absoluteYawDeg = lastAzimuth
                 absolutePitchDeg = lastPitch
                 absoluteRollDeg = lastRoll
+
+                // Push into the zenith ring buffer. This runs at sensor
+                // rate (~200 Hz with SENSOR_DELAY_GAME). We read the last
+                // N samples when capturing a Z0 to get a time-averaged
+                // pose.
+                zenithYawBuffer[zenithPoseBufferIndex] = lastAzimuth
+                zenithPitchBuffer[zenithPoseBufferIndex] = lastPitch
+                zenithRollBuffer[zenithPoseBufferIndex] = lastRoll
+                zenithPoseBufferIndex = (zenithPoseBufferIndex + 1) % zenithPoseBufferSize
+                if (zenithPoseBufferIndex == 0) zenithPoseBufferFilled = true
 
                 if (!displayOffsetInitialized && gameRotationVectorSensor == null) {
                     displayAzimuth = lastAzimuth
@@ -712,9 +749,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val loc = lastLocation
 
-        if (sessionYawAnchorDeg == null) sessionYawAnchorDeg = displayAzimuth
-        if (sessionPitchAnchorDeg == null) sessionPitchAnchorDeg = displayPitchDeg
-        if (sessionRollAnchorDeg == null) sessionRollAnchorDeg = displayRollDeg
+        // Session anchors are no longer set here. They will be set in
+        // appendFrameRecord when the first frame of the session is
+        // captured, using that frame's absolute yaw (not the pre-capture
+        // display value). See the session-relative anchor logic in
+        // appendFrameRecord for details.
+        //
+        // Leaving these as null means SessionRecord will be saved with
+        // null anchors initially. The anchors are persisted in JSON when
+        // the first frame is saved — see persistSessionAnchors().
 
         val session = SessionRecord(
             sessionId = dir.name,
@@ -796,6 +839,38 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val fileName = "img_%02d_az%03d_p%+03d_%s.jpg".format(index, safeAz, safePi, reason)
         val file = File(dir, fileName)
 
+        // For Z0 captures, use a time-averaged pose from the sensor ring
+        // buffer instead of the instantaneous sample. This reduces jitter
+        // on the most error-sensitive capture of the session.
+        val isZenithCapture = target.pitch >= 80f
+        val averagedZenith = if (isZenithCapture) computeAveragedZenithPose() else null
+
+        val absYawForFrame = when {
+            averagedZenith != null -> averagedZenith.first
+            hasLastAbsRotationMatrix -> absoluteYawDeg
+            else -> null
+        }
+        val absPitchForFrame = when {
+            averagedZenith != null -> averagedZenith.second
+            hasLastAbsRotationMatrix -> absolutePitchDeg
+            else -> null
+        }
+        val absRollForFrame = when {
+            averagedZenith != null -> averagedZenith.third
+            hasLastAbsRotationMatrix -> absoluteRollDeg
+            else -> null
+        }
+
+        if (isZenithCapture) {
+            Log.i(
+                "SunZenithCapture",
+                "Z0 capture using ${if (averagedZenith != null) "AVERAGED" else "instantaneous"} pose " +
+                        "absYaw=${absYawForFrame?.let { "%.2f".format(it) } ?: "null"} " +
+                        "absPitch=${absPitchForFrame?.let { "%.2f".format(it) } ?: "null"} " +
+                        "absRoll=${absRollForFrame?.let { "%.2f".format(it) } ?: "null"}"
+            )
+        }
+
         val frozenPose = CapturedPose(
 
             azimuthDeg = displayAzimuth,
@@ -804,9 +879,9 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
             rollDeg = displayRollDeg,
 
-            absAzimuthDeg = if (hasLastAbsRotationMatrix) absoluteYawDeg else null,
-            absPitchDeg = if (hasLastAbsRotationMatrix) absolutePitchDeg else null,
-            absRollDeg = if (hasLastAbsRotationMatrix) absoluteRollDeg else null,
+            absAzimuthDeg = absYawForFrame,
+            absPitchDeg = absPitchForFrame,
+            absRollDeg = absRollForFrame,
 
             rotationM00 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[0] else null,
 
@@ -1242,7 +1317,60 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     "hfov=${currentHfovDeg} vfov=${currentVfovDeg}"
         )
 
+        // On the first frame of the session, anchor the session's azimuth
+        // reference to this frame's absolute yaw. This makes the atlas
+        // self-consistent regardless of compass calibration: subsequent
+        // frames are projected as (absYaw - anchorYaw) + target.azimuth
+        // of this first frame, so the "North" of the atlas is always
+        // where the first frame was pointing.
+        //
+        // Why this works: within a single session the gyroscope keeps
+        // relative azimuth differences stable (sub-degree) even when
+        // magneticAccuracy is UNRELIABLE. Only the absolute reference to
+        // world-North is unreliable, and that's exactly what we opt out
+        // of by using a per-session anchor.
+        if (sessionYawAnchorDeg == null && pose.absAzimuthDeg != null) {
+            sessionYawAnchorDeg = pose.absAzimuthDeg
+            sessionPitchAnchorDeg = pose.absPitchDeg
+            sessionRollAnchorDeg = pose.absRollDeg
+
+            Log.i(
+                "SunSessionAnchor",
+                "ANCHOR_SET sessionId=${currentSessionId} " +
+                        "firstFrame=${frame.frameId} " +
+                        "anchorYaw=${"%.2f".format(sessionYawAnchorDeg!!)} " +
+                        "anchorPitch=${"%.2f".format(sessionPitchAnchorDeg ?: Float.NaN)} " +
+                        "anchorRoll=${"%.2f".format(sessionRollAnchorDeg ?: Float.NaN)} " +
+                        "firstTargetAz=${target.azimuth} firstTargetPitch=${target.pitch}"
+            )
+
+            // Re-persist session.json with the new anchors.
+            persistSessionAnchors()
+        }
+
         sessionStore.appendFrame(frame, paths)
+    }
+
+    private fun persistSessionAnchors() {
+        val dir = sessionDir ?: return
+        val paths = sessionPaths ?: return
+        val loc = lastLocation
+
+        val session = SessionRecord(
+            sessionId = currentSessionId ?: dir.name,
+            startedAtUtcMs = System.currentTimeMillis(),
+            latitudeDeg = loc?.latitude,
+            longitudeDeg = loc?.longitude,
+            altitudeM = loc?.altitude,
+            declinationDeg = null,
+            cameraId = currentCameraId ?: "widest_back_camera",
+            sensorMode = "rotation_vector",
+            sessionYawAnchorDeg = sessionYawAnchorDeg,
+            sessionPitchAnchorDeg = sessionPitchAnchorDeg,
+            sessionRollAnchorDeg = sessionRollAnchorDeg,
+            notes = null
+        )
+        sessionStore.saveSession(session, paths)
     }
 
     private fun ringIdForTarget(target: GuideView.CapturePoint): String = when {
@@ -1584,6 +1712,51 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         var out = value % 360f
         if (out < 0f) out += 360f
         return out
+    }
+
+    /**
+     * Returns a time-averaged absolute pose computed from the last N
+     * sensor samples stored in the zenith buffer. Uses circular mean for
+     * yaw (handles 359°→0° wrap correctly). Only used for Z0 captures,
+     * where the pose needs to be especially stable.
+     *
+     * Returns null if the buffer is empty or pitch is not zenith-like
+     * (safety fallback so this is never applied to H0/H45).
+     */
+    private fun computeAveragedZenithPose(): Triple<Float, Float, Float>? {
+        val count = if (zenithPoseBufferFilled) zenithPoseBufferSize else zenithPoseBufferIndex
+        if (count < 5) return null  // not enough samples yet
+
+        // Circular mean for yaw
+        var sumSin = 0.0
+        var sumCos = 0.0
+        var sumPitch = 0.0
+        var sumRoll = 0.0
+
+        for (i in 0 until count) {
+            val yawRad = Math.toRadians(zenithYawBuffer[i].toDouble())
+            sumSin += kotlin.math.sin(yawRad)
+            sumCos += kotlin.math.cos(yawRad)
+            sumPitch += zenithPitchBuffer[i]
+            sumRoll += zenithRollBuffer[i]
+        }
+
+        val avgYaw = normalize360(
+            Math.toDegrees(kotlin.math.atan2(sumSin, sumCos)).toFloat()
+        )
+        val avgPitch = (sumPitch / count).toFloat()
+        val avgRoll = (sumRoll / count).toFloat()
+
+        Log.d(
+            "SunZenithAvg",
+            "samplesUsed=$count " +
+                    "avgYaw=${"%.2f".format(avgYaw)} " +
+                    "avgPitch=${"%.2f".format(avgPitch)} " +
+                    "avgRoll=${"%.2f".format(avgRoll)} " +
+                    "currentYaw=${"%.2f".format(absoluteYawDeg)}"
+        )
+
+        return Triple(avgYaw, avgPitch, avgRoll)
     }
     private fun applyDeclination(azimuthDeg: Float): Float {
         var out = azimuthDeg

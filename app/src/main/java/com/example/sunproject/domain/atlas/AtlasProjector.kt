@@ -863,7 +863,59 @@ object AtlasProjector {
         )
     }
     fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
-        val ordered = frames.sortedBy { it.shotIndex }
+        val orderedRaw = frames.sortedBy { it.shotIndex }
+
+        // Apply session-relative yaw anchor.
+        //
+        // Design: the first captured frame of the session defines the
+        // azimuth reference. We compute sessionYawOffset so that
+        //   absAzimuth(firstFrame) - sessionYawOffset = targetAz(firstFrame)
+        // and then apply the same offset to every frame. This collapses
+        // inter-session magnetometer drift: each session becomes
+        // self-consistent (its "north" is whatever the first frame's
+        // target azimuth was), regardless of compass calibration state.
+        //
+        // Within a single session, gyroscope integration keeps relative
+        // azimuth stable to <1°, so the atlas geometry is clean even
+        // when magneticAccuracy is UNRELIABLE.
+        //
+        // Inter-session alignment (matching north across captures) is
+        // NOT addressed here; it would require a physical marker or
+        // calibrated compass, out of scope for this change.
+        val firstFrame = orderedRaw.firstOrNull { it.absAzimuthDeg != null }
+        val sessionYawOffset: Float = if (firstFrame?.absAzimuthDeg != null) {
+            shortestAngleDeltaDeg(firstFrame.targetAzimuthDeg, firstFrame.absAzimuthDeg)
+        } else {
+            0f
+        }
+
+        Log.i(
+            "AtlasSessionAnchor",
+            "firstFrame=${firstFrame?.frameId ?: "null"} " +
+                    "firstTargetAz=${firstFrame?.targetAzimuthDeg?.let { "%.2f".format(it) } ?: "null"} " +
+                    "firstAbsAz=${firstFrame?.absAzimuthDeg?.let { "%.2f".format(it) } ?: "null"} " +
+                    "sessionYawOffset=${"%.2f".format(sessionYawOffset)} " +
+                    "(applied as absAzAdjusted = absAz + offset)"
+        )
+
+        // Build a new frame list with adjusted absolute azimuths. We do NOT
+        // modify the rotation matrices here; the matrix-based seed for Z0
+        // refiner is anchored to the same device-to-world mapping that
+        // produced absAzimuth, so rewriting absAzimuth alone is correct
+        // at the projection level. The Z0 refiner is already disabled, so
+        // the matrix path is currently unused; see
+        // deriveZenithPoseSeedFromMatrixTangent.
+        val ordered = if (sessionYawOffset != 0f) {
+            orderedRaw.map { frame ->
+                if (frame.absAzimuthDeg == null) frame else frame.copy(
+                    absAzimuthDeg = normalizeTwistDeg(frame.absAzimuthDeg + sessionYawOffset),
+                    measuredAzimuthDeg = normalizeTwistDeg(frame.measuredAzimuthDeg + sessionYawOffset)
+                )
+            }
+        } else {
+            orderedRaw
+        }
+
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
         val zenithFrames = ordered.filter { isZenithFrame(it) }
 
