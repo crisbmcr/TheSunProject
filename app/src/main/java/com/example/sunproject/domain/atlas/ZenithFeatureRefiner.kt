@@ -106,18 +106,26 @@ object ZenithFeatureRefiner {
     private const val ORB_EDGE_THRESHOLD = 15
     private const val ORB_FAST_THRESHOLD = 12
 
-    // Lowe's ratio test — standard in the literature.
-    private const val LOWE_RATIO = 0.75f
+    // Lowe's ratio test — relaxed from 0.75 to 0.80. Repetitive indoor
+    // ceiling/sky textures create many "close-second" matches that a 0.75
+    // ratio kills aggressively. 0.80 keeps more candidates; RANSAC then
+    // separates inliers from outliers by geometric consistency.
+    private const val LOWE_RATIO = 0.80f
 
     // RANSAC parameters.
-    private const val RANSAC_ITERATIONS = 120
-    private const val RANSAC_INLIER_THRESHOLD_DEG = 1.5f
+    private const val RANSAC_ITERATIONS = 200
+    private const val RANSAC_INLIER_THRESHOLD_DEG = 2.0f
 
-    // Acceptance thresholds.
-    private const val MIN_INLIERS_STRICT = 20
-    private const val MIN_INLIERS_RELAXED = 10
-    private const val MAX_RESIDUAL_MEDIAN_DEG_RELAXED = 0.8f
-    private const val MAX_RESIDUAL_MEDIAN_DEG_STRICT = 1.5f
+    // Acceptance thresholds — lowered minimum inliers because in practice
+    // a Z0 frame with sparse ceiling features may only yield ~15 reliable
+    // matches post-RANSAC, and that is still geometrically very strong.
+    private const val MIN_INLIERS_STRICT = 15
+    private const val MIN_INLIERS_RELAXED = 8
+    private const val MAX_RESIDUAL_MEDIAN_DEG_RELAXED = 1.2f
+    private const val MAX_RESIDUAL_MEDIAN_DEG_STRICT = 2.0f
+
+    // Minimum matches required to even attempt RANSAC.
+    private const val MIN_MATCHES_FOR_RANSAC = 6
 
     // Seed sanity guard. If RANSAC proposes |deltaYaw| > this value,
     // we still accept it if inliers are numerous, but log loudly so
@@ -303,17 +311,76 @@ object ZenithFeatureRefiner {
         frameId: String,
         verbose: Boolean
     ): FeatureRefineResult {
-        // Step 3: build ROI masks (annulus + validMask).
+        val size = atlasTop.faceSizePx
+        val center = (size - 1) * 0.5f
+
+        // ------------------------------------------------------------
+        // PRE-ROTATION STRATEGY
+        // ------------------------------------------------------------
+        // The atlasTop is built with azimuth=0 pointing to world North.
+        // The zenithTop is built with the IMU seed yaw applied, so a
+        // physical structure at world azimuth X lands at topFace pixel
+        // corresponding to (X - seedYaw) in the zenith image.
+        //
+        // If we run ORB directly on (atlasTop, zenithTop), the two
+        // images differ by a rotation of `seedYaw` degrees around the
+        // center. ORB is in theory rotation-invariant via keypoint
+        // orientation, but near the pole with limited texture this is
+        // flaky — hence the 4-11 good matches we saw in the logs.
+        //
+        // Fix: rotate atlasGray8 by -seedYaw so that after rotation it
+        // uses the SAME nominal convention as zenithGray8 (North of
+        // the atlas ends up at the same topface-pixel as North of the
+        // zenith). Now ORB only has to resolve the residual ~30-40°.
+        //
+        // The RANSAC delta is then expressed in the "rotated frame",
+        // and the actual world-frame deltaYaw is delta_rotated itself
+        // (because pre-rotating atlas by -seedYaw is mathematically
+        // equivalent to subtracting seedYaw from the pixel→azimuth
+        // mapping on atlas side). We log everything explicitly.
+        // ------------------------------------------------------------
+
         val atlasRoiMask = buildAnnulusRoiMask(atlasTop)
         val zenithRoiMask = buildAnnulusRoiMask(zenithTop)
 
         val atlasGray8 = Mat()
         val zenithGray8 = Mat()
+        val atlasGray8Rot = Mat()
+        val atlasRoiMaskRot = Mat()
+
         try {
             atlasTop.gray32.convertTo(atlasGray8, CvType.CV_8U, 255.0)
             zenithTop.gray32.convertTo(zenithGray8, CvType.CV_8U, 255.0)
 
-            // Step 4: ORB detect + compute.
+            // Rotate atlas image and its ROI mask by -seedYaw around the center.
+            // getRotationMatrix2D uses CCW positive; azimuth in our world is CW
+            // positive from North, so rotating by -seedYaw here is consistent
+            // with bringing atlas's North to coincide with zenith's North.
+            val rotM = org.opencv.imgproc.Imgproc.getRotationMatrix2D(
+                org.opencv.core.Point(center.toDouble(), center.toDouble()),
+                (-seedAbsoluteYawDeg).toDouble(),
+                1.0
+            )
+            try {
+                org.opencv.imgproc.Imgproc.warpAffine(
+                    atlasGray8, atlasGray8Rot, rotM,
+                    org.opencv.core.Size(size.toDouble(), size.toDouble()),
+                    org.opencv.imgproc.Imgproc.INTER_LINEAR,
+                    org.opencv.core.Core.BORDER_CONSTANT,
+                    org.opencv.core.Scalar(0.0)
+                )
+                org.opencv.imgproc.Imgproc.warpAffine(
+                    atlasRoiMask, atlasRoiMaskRot, rotM,
+                    org.opencv.core.Size(size.toDouble(), size.toDouble()),
+                    org.opencv.imgproc.Imgproc.INTER_NEAREST,
+                    org.opencv.core.Core.BORDER_CONSTANT,
+                    org.opencv.core.Scalar(0.0)
+                )
+            } finally {
+                rotM.release()
+            }
+
+            // ORB detect + compute on the rotated atlas and the zenith.
             val orb = ORB.create(
                 ORB_NUM_FEATURES,
                 ORB_SCALE_FACTOR,
@@ -332,7 +399,7 @@ object ZenithFeatureRefiner {
             val descZenith = Mat()
 
             try {
-                orb.detectAndCompute(atlasGray8, atlasRoiMask, kpAtlas, descAtlas)
+                orb.detectAndCompute(atlasGray8Rot, atlasRoiMaskRot, kpAtlas, descAtlas)
                 orb.detectAndCompute(zenithGray8, zenithRoiMask, kpZenith, descZenith)
 
                 val nAtlas = kpAtlas.rows()
@@ -341,7 +408,8 @@ object ZenithFeatureRefiner {
                 if (verbose) {
                     Log.d(
                         "AtlasZenithFeatureDetect",
-                        "frame=$frameId atlasKp=$nAtlas zenithKp=$nZenith"
+                        "frame=$frameId atlasKp=$nAtlas zenithKp=$nZenith " +
+                                "preRotateDeg=${"%.2f".format(-seedAbsoluteYawDeg)}"
                     )
                 }
 
@@ -355,30 +423,44 @@ object ZenithFeatureRefiner {
                     )
                 }
 
-                // Step 5: match with Lowe ratio test.
+                // Match with Lowe ratio test.
                 val matcher = BFMatcher.create(Core_NORM_HAMMING, false)
                 val knn = ArrayList<MatOfDMatch>()
                 matcher.knnMatch(descZenith, descAtlas, knn, 2)
 
                 val goodMatches = ArrayList<DMatch>()
+                val rejectedByLowe = ArrayList<Float>()
                 for (pair in knn) {
                     val arr = pair.toArray()
                     if (arr.size < 2) continue
                     val m = arr[0]
                     val n = arr[1]
+                    val ratio = if (n.distance > 0f) m.distance / n.distance else 0f
                     if (m.distance < LOWE_RATIO * n.distance) {
                         goodMatches.add(m)
+                    } else {
+                        rejectedByLowe.add(ratio)
                     }
                 }
 
                 if (verbose) {
+                    val meanGoodDist =
+                        if (goodMatches.isEmpty()) Float.NaN
+                        else goodMatches.map { it.distance }.average().toFloat()
+                    val meanRejectRatio =
+                        if (rejectedByLowe.isEmpty()) Float.NaN
+                        else rejectedByLowe.average().toFloat()
                     Log.d(
                         "AtlasZenithFeatureMatch",
-                        "frame=$frameId knn=${knn.size} goodMatches=${goodMatches.size}"
+                        "frame=$frameId knn=${knn.size} " +
+                                "goodMatches=${goodMatches.size} " +
+                                "rejectedLowe=${rejectedByLowe.size} " +
+                                "meanGoodHamming=${"%.1f".format(meanGoodDist)} " +
+                                "meanRejectedLoweRatio=${"%.3f".format(meanRejectRatio)}"
                     )
                 }
 
-                if (goodMatches.size < MIN_INLIERS_RELAXED) {
+                if (goodMatches.size < MIN_MATCHES_FOR_RANSAC) {
                     return reject(
                         reason = "too_few_matches",
                         seedAbsoluteYawDeg = seedAbsoluteYawDeg,
@@ -386,33 +468,54 @@ object ZenithFeatureRefiner {
                     )
                 }
 
-                // Step 6: convert each match to (deltaAz_i).
+                // Convert each match to residual delta azimuth.
+                //
+                // Because we pre-rotated the atlas by -seedYaw, the atlas
+                // keypoint at pixel (x,y) now represents the world azimuth
+                //   azAtlasWorld = topFacePixelToAzimuthDeg(x,y) + seedYaw
+                // but in the rotated frame what RANSAC sees is just
+                //   azAtlasRot = topFacePixelToAzimuthDeg(x,y)
+                // The zenith keypoint at pixel (x,y) represents
+                //   azZenithCam = topFacePixelToAzimuthDeg(x,y)   (camera frame)
+                // whose world azimuth is azZenithCam + seedYaw.
+                //
+                // So in the ROTATED frame:
+                //   delta_rotated = azAtlasRot - azZenithCam
+                //                 = (azAtlasWorld - seedYaw) - (azZenithCamWorld - seedYaw)
+                //                 = azAtlasWorld - azZenithCamWorld
+                //                 = deltaYaw_world
+                //
+                // i.e., delta_rotated IS the world-frame deltaYaw. No extra
+                // correction needed. We just compute it directly.
+
                 val kpAtlasArr = kpAtlas.toArray()
                 val kpZenithArr = kpZenith.toArray()
-                val center = (FACE_SIZE_PX - 1) * 0.5f
 
                 val deltaAzDegList = FloatArray(goodMatches.size)
-                val matchQueryIdx = IntArray(goodMatches.size)
-                val matchTrainIdx = IntArray(goodMatches.size)
                 var usedMatches = 0
 
                 for (match in goodMatches) {
-                    val kpQuery: KeyPoint = kpZenithArr[match.queryIdx]
-                    val kpTrain: KeyPoint = kpAtlasArr[match.trainIdx]
+                    val kpQuery = kpZenithArr[match.queryIdx]
+                    val kpTrain = kpAtlasArr[match.trainIdx]
 
-                    val azZenith = topFacePixelToAzimuthDeg(kpQuery.pt.x.toFloat(), kpQuery.pt.y.toFloat(), center)
-                    val azAtlas = topFacePixelToAzimuthDeg(kpTrain.pt.x.toFloat(), kpTrain.pt.y.toFloat(), center)
+                    val azZenith = topFacePixelToAzimuthDeg(
+                        kpQuery.pt.x.toFloat(),
+                        kpQuery.pt.y.toFloat(),
+                        center
+                    )
+                    val azAtlasRotated = topFacePixelToAzimuthDeg(
+                        kpTrain.pt.x.toFloat(),
+                        kpTrain.pt.y.toFloat(),
+                        center
+                    )
 
-                    if (azZenith.isNaN() || azAtlas.isNaN()) continue
+                    if (azZenith.isNaN() || azAtlasRotated.isNaN()) continue
 
-                    val delta = normalizeSignedDeg(azAtlas - azZenith)
-                    deltaAzDegList[usedMatches] = delta
-                    matchQueryIdx[usedMatches] = match.queryIdx
-                    matchTrainIdx[usedMatches] = match.trainIdx
-                    usedMatches++
+                    val delta = normalizeSignedDeg(azAtlasRotated - azZenith)
+                    deltaAzDegList[usedMatches++] = delta
                 }
 
-                if (usedMatches < MIN_INLIERS_RELAXED) {
+                if (usedMatches < MIN_MATCHES_FOR_RANSAC) {
                     return reject(
                         reason = "too_few_after_geom_conversion",
                         seedAbsoluteYawDeg = seedAbsoluteYawDeg,
@@ -420,13 +523,21 @@ object ZenithFeatureRefiner {
                     )
                 }
 
-                // Steps 7-8: RANSAC 1-DoF.
+                // RANSAC 1-DoF.
                 val ransac = ransacDeltaYaw(deltaAzDegList, usedMatches)
 
                 if (verbose) {
+                    // Log histogram of delta azimuth for debugging.
+                    val sorted = deltaAzDegList.sliceArray(0 until usedMatches).sortedArray()
+                    val p10 = sorted[usedMatches / 10]
+                    val p50 = sorted[usedMatches / 2]
+                    val p90 = sorted[usedMatches * 9 / 10]
                     Log.d(
                         "AtlasZenithFeatureRansac",
                         "frame=$frameId matches=$usedMatches " +
+                                "deltaAzP10=${"%.2f".format(p10)} " +
+                                "deltaAzP50=${"%.2f".format(p50)} " +
+                                "deltaAzP90=${"%.2f".format(p90)} " +
                                 "ransacBestInliers=${ransac.numInliers} " +
                                 "ransacDeltaYaw=${"%.3f".format(ransac.deltaYawDeg)}"
                     )
@@ -441,14 +552,13 @@ object ZenithFeatureRefiner {
                     )
                 }
 
-                // Step 9: refine via circular mean of inlier deltaAz.
+                // Refine via circular mean of inliers.
                 val finalDeltaYawDeg = circularMeanDeg(
                     deltaAzDegList,
                     ransac.inlierMask,
                     usedMatches
                 )
 
-                // Step 11: residual diagnostic.
                 val residuals = FloatArray(ransac.numInliers)
                 var residualIdx = 0
                 for (i in 0 until usedMatches) {
@@ -459,7 +569,8 @@ object ZenithFeatureRefiner {
                 }
                 residuals.sort()
                 val residualMedian = residuals[ransac.numInliers / 2]
-                val residualP90 = residuals[(ransac.numInliers * 9 / 10).coerceAtMost(ransac.numInliers - 1)]
+                val residualP90 =
+                    residuals[(ransac.numInliers * 9 / 10).coerceAtMost(ransac.numInliers - 1)]
 
                 val acceptMode = when {
                     ransac.numInliers >= MIN_INLIERS_STRICT &&
@@ -490,6 +601,8 @@ object ZenithFeatureRefiner {
             zenithRoiMask.release()
             atlasGray8.release()
             zenithGray8.release()
+            atlasGray8Rot.release()
+            atlasRoiMaskRot.release()
         }
     }
 
