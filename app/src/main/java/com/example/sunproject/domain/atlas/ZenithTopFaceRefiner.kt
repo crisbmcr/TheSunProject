@@ -127,7 +127,7 @@ object ZenithTopFaceRefiner {
     // Sign convention for applying the global shift to seedYaw.
     // If after testing the zenith cap rotates in the OPPOSITE direction of
     // what would fix it, flip this to -1f.
-    private const val GLOBAL_SHIFT_SIGN = 1f
+    private const val GLOBAL_SHIFT_SIGN = -1f
 
     // ==================================================================
     // DEAD CODE (pending cleanup in a follow-up patch).
