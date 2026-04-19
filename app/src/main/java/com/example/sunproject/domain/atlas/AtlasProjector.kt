@@ -884,7 +884,14 @@ object AtlasProjector {
         // calibrated compass, out of scope for this change.
         val firstFrame = orderedRaw.firstOrNull { it.absAzimuthDeg != null }
         val sessionYawOffset: Float = if (firstFrame?.absAzimuthDeg != null) {
-            shortestAngleDeltaDeg(firstFrame.targetAzimuthDeg, firstFrame.absAzimuthDeg)
+            // Offset goes FROM the actual absolute azimuth TO the nominal
+            // target azimuth, so that after adding it to each frame's
+            // absAzimuth we get "where this frame would point if the
+            // session had started exactly at its target".
+            //
+            // shortestAngleDeltaDeg(from, to) returns (to - from)
+            // wrapped to [-180, 180], which is what we want here.
+            shortestAngleDeltaDeg(firstFrame.absAzimuthDeg, firstFrame.targetAzimuthDeg)
         } else {
             0f
         }
