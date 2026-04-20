@@ -972,63 +972,15 @@ object AtlasProjector {
             orderedRaw
         }
 
-        // ============================================================
-        // Z0 yaw stabilizer.
-        //
-        // Near the zenith (pitch ≈ 90°), the yaw and roll axes are
-        // mathematically coupled (gimbal lock). The Android sensor
-        // fusion picks an arbitrary representation among the infinite
-        // valid ones — e.g. yaw=28° roll=92° vs yaw=118° roll=2° — for
-        // the same physical pose. Averaging those values (as we do in
-        // computeAveragedZenithPose) gives a number that has no physical
-        // meaning and typically lands ~90° off.
-        //
-        // Our observed avgRoll values for Z0 (123°, 110°, 35°, 92°)
-        // confirm this: they're not "roll noise", they're the gimbal
-        // lock artifact where the IMU redistributed the yaw rotation
-        // into the roll channel.
-        //
-        // Fix: override the Z0's absAzimuthDeg with the absAzimuthDeg
-        // of the last non-zenith frame captured immediately before.
-        // Those frames are at pitch=45° or pitch=0°, far from gimbal
-        // lock, so their yaw reading is stable and trustworthy.
-        // Absolute pitch is taken from the Z0 sensor (which IS stable
-        // even at the pole — pitch=90 is unambiguous). Roll is already
-        // forced to 0 in the hardZenith projection path downstream.
-        // ============================================================
-        val ordered = run {
-            val lastNonZenithAbsYaw: Float? = orderedWithOffset
-                .lastOrNull { !isZenithFrame(it) && it.absAzimuthDeg != null }
-                ?.absAzimuthDeg
-
-            if (lastNonZenithAbsYaw == null) {
-                Log.i(
-                    "AtlasZ0YawStabilizer",
-                    "NO_REFERENCE_AVAILABLE: no non-Z0 frame with absAzimuthDeg. " +
-                            "Keeping Z0 yaw from sensor average (may be unreliable)."
-                )
-                orderedWithOffset
-            } else {
-                orderedWithOffset.map { frame ->
-                    if (!isZenithFrame(frame) || frame.absAzimuthDeg == null) {
-                        frame
-                    } else {
-                        val originalYaw = frame.absAzimuthDeg
-                        Log.i(
-                            "AtlasZ0YawStabilizer",
-                            "Z0_YAW_REPLACED frame=${frame.frameId} " +
-                                    "originalAbsYaw=${"%.2f".format(originalYaw)}° " +
-                                    "replacedWithAbsYaw=${"%.2f".format(lastNonZenithAbsYaw)}° " +
-                                    "(from last non-Z0 frame, stable outside gimbal lock)"
-                        )
-                        frame.copy(absAzimuthDeg = lastNonZenithAbsYaw)
-                    }
-                }
-            }
-        }
-
-        val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
-        val zenithFrames = ordered.filter { isZenithFrame(it) }
+        // Note: the previous Z0 yaw stabilizer (which copied absAzimuthDeg
+        // from the last non-Z0 frame) was removed because it assumed the
+        // user does not rotate the phone between H45 and Z0 — which in
+        // practice they do. The Z0's absAzimuthDeg is now captured at
+        // shutter time via a pre-zenith yaw snapshot in CaptureActivity
+        // (taken while pitch<65°, before the Euler singularity), so it
+        // already arrives correct and no downstream rewriting is needed.
+        val nonZenithFrames = orderedWithOffset.filterNot { isZenithFrame(it) }
+        val zenithFrames = orderedWithOffset.filter { isZenithFrame(it) }
 
         val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
         val persistedMountBasis = loadPersistedMountCalibration()

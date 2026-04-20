@@ -84,6 +84,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var zenithPoseBufferIndex = 0
     private var zenithPoseBufferFilled = false
 
+    // Last absolute yaw captured while the phone was far from the Euler
+    // singularity (pitch < 65°). Near pitch=90° the AXIS_X/AXIS_Z remap
+    // used to compute absoluteYawDeg is gimbal-locked: yaw gets
+    // arbitrarily redistributed into the roll channel, so averaging
+    // those samples over a 650ms window still gives a physically
+    // meaningless number. This snapshot preserves a good yaw from just
+    // before the singularity, typically 1-3s before the Z0 shutter.
+    private var lastStablePreZenithAbsYawDeg: Float? = null
+    private var lastStablePreZenithUpdateMs: Long = 0L
+
     //private val alpha = 0.08f
     //private var isFirstReading = true
     private data class Vec3(var x: Float, var y: Float, var z: Float)
@@ -476,6 +486,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 zenithPoseBufferIndex = (zenithPoseBufferIndex + 1) % zenithPoseBufferSize
                 if (zenithPoseBufferIndex == 0) zenithPoseBufferFilled = true
 
+                // Keep a rolling "last good yaw" while still well below the
+                // Euler singularity. 65° is comfortably away from pitch=90°
+                // where the AXIS_X/AXIS_Z remap starts distributing yaw
+                // rotation into the roll channel. This value will be used
+                // at Z0 capture time in place of the averaged Euler yaw.
+                if (absolutePitchDeg < 65f) {
+                    lastStablePreZenithAbsYawDeg = absoluteYawDeg
+                    lastStablePreZenithUpdateMs = SystemClock.elapsedRealtime()
+                }
+
                 if (!displayOffsetInitialized && gameRotationVectorSensor == null) {
                     displayAzimuth = lastAzimuth
                     displayPitchDeg = lastPitch
@@ -845,7 +865,27 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val isZenithCapture = target.pitch >= 80f
         val averagedZenith = if (isZenithCapture) computeAveragedZenithPose() else null
 
+        // For Z0, yaw requires special treatment. The averaged yaw from
+        // computeAveragedZenithPose is corrupted by gimbal lock at
+        // pitch≈88°: the IMU's Euler decomposition redistributes yaw
+        // rotation into the roll channel, so the 20-sample circular
+        // mean is physically meaningless (last 4 sessions: 18.6°,
+        // 337.7°, 19.3°, 112.3° — no correlation with the actual
+        // physical orientation of the phone at shutter). The snapshot
+        // taken while pitch<65° is far from the singularity and
+        // geometrically valid; we trust it even though it predates the
+        // shutter by 1-3s, because the user is tilting upward rather
+        // than yaw-rotating during that window.
+        val preZenithAgeMs = SystemClock.elapsedRealtime() - lastStablePreZenithUpdateMs
+        val snapshotYaw = lastStablePreZenithAbsYawDeg
+        val hasUsableSnapshotYaw =
+            isZenithCapture &&
+                    snapshotYaw != null &&
+                    lastStablePreZenithUpdateMs > 0L &&
+                    preZenithAgeMs < 30_000L
+
         val absYawForFrame = when {
+            hasUsableSnapshotYaw -> snapshotYaw
             averagedZenith != null -> averagedZenith.first
             hasLastAbsRotationMatrix -> absoluteYawDeg
             else -> null
@@ -862,10 +902,20 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         if (isZenithCapture) {
+            val yawSource = when {
+                hasUsableSnapshotYaw -> "PRE_ZENITH_SNAPSHOT"
+                averagedZenith != null -> "AVERAGED_EULER_FALLBACK"
+                hasLastAbsRotationMatrix -> "INSTANT_EULER_FALLBACK"
+                else -> "NONE"
+            }
             Log.i(
                 "SunZenithCapture",
-                "Z0 capture using ${if (averagedZenith != null) "AVERAGED" else "instantaneous"} pose " +
-                        "absYaw=${absYawForFrame?.let { "%.2f".format(it) } ?: "null"} " +
+                "Z0 capture yawSource=$yawSource " +
+                        "yawUsed=${absYawForFrame?.let { "%.2f".format(it) } ?: "null"} " +
+                        "snapshotYaw=${snapshotYaw?.let { "%.2f".format(it) } ?: "null"} " +
+                        "snapshotAgeMs=$preZenithAgeMs " +
+                        "averagedEulerYaw=${averagedZenith?.first?.let { "%.2f".format(it) } ?: "null"} " +
+                        "instantEulerYaw=${"%.2f".format(absoluteYawDeg)} " +
                         "absPitch=${absPitchForFrame?.let { "%.2f".format(it) } ?: "null"} " +
                         "absRoll=${absRollForFrame?.let { "%.2f".format(it) } ?: "null"}"
             )
