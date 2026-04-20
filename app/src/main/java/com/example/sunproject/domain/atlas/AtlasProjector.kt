@@ -912,11 +912,28 @@ object AtlasProjector {
         // at the projection level. The Z0 refiner is already disabled, so
         // the matrix path is currently unused; see
         // deriveZenithPoseSeedFromMatrixTangent.
+        // Apply the session yaw offset ONLY to absAzimuthDeg. Do NOT
+        // touch measuredAzimuthDeg.
+        //
+        // Rationale: absAzimuthDeg is the geometric truth used by the
+        // projector to place the frame in the atlas. We rewrite it so
+        // the session is self-consistent regardless of compass drift.
+        //
+        // measuredAzimuthDeg is a separate axis: it's the capture-time
+        // reading of where the user aimed the phone, used by
+        // qualityWeightForFrame to verify the user hit the target
+        // (azErr = |target - measured|). Applying the session offset to
+        // measuredAzimuthDeg artificially inflates azErr by ~|offset|
+        // degrees on every frame, which makes qualityWeightForFrame
+        // reject every H0/H45 (offset usually exceeds the 4° tolerance).
+        // Z0 survives because its quality check ignores azErr.
+        //
+        // This was the bug that made H0/H45 disappear after the anchor
+        // was introduced.
         val ordered = if (sessionYawOffset != 0f) {
             orderedRaw.map { frame ->
                 if (frame.absAzimuthDeg == null) frame else frame.copy(
-                    absAzimuthDeg = normalizeTwistDeg(frame.absAzimuthDeg + sessionYawOffset),
-                    measuredAzimuthDeg = normalizeTwistDeg(frame.measuredAzimuthDeg + sessionYawOffset)
+                    absAzimuthDeg = normalizeTwistDeg(frame.absAzimuthDeg + sessionYawOffset)
                 )
             }
         } else {
