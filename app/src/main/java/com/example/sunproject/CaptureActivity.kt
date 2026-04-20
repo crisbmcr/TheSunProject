@@ -491,8 +491,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 // where the AXIS_X/AXIS_Z remap starts distributing yaw
                 // rotation into the roll channel. This value will be used
                 // at Z0 capture time in place of the averaged Euler yaw.
+                //
+                // We record displayAzimuth (derived from GAME_ROTATION_VECTOR,
+                // gyro-only, anchored at session start) rather than
+                // absoluteYawDeg. The atlas projector uses measuredAzimuthDeg
+                // (= displayAzimuth) as the geometric truth for H0/H45
+                // frames because it does not suffer mid-session magnetometer
+                // recalibrations. The Z0 must live in the same reference
+                // frame to stay aligned with the H45 ring below it.
                 if (absolutePitchDeg < 65f) {
-                    lastStablePreZenithAbsYawDeg = absoluteYawDeg
+                    lastStablePreZenithAbsYawDeg = displayAzimuth
                     lastStablePreZenithUpdateMs = SystemClock.elapsedRealtime()
                 }
 

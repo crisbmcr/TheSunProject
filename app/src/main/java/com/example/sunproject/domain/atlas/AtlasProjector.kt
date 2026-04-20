@@ -268,9 +268,26 @@ object AtlasProjector {
         )
     }
     private fun baseYawDeg(frame: FrameRecord): Float {
-        return frame.absAzimuthDeg ?: frame.measuredAzimuthDeg
+        // Use measuredAzimuthDeg (GAME_ROTATION_VECTOR, gyro-only + session
+        // anchor at start) instead of absAzimuthDeg (ROTATION_VECTOR, gyro
+        // fused with magnetometer). The magnetometer can silently
+        // recalibrate mid-session and shift the absolute azimuth by 20°+
+        // between consecutive frames, which tears the H45 ring away from
+        // the H0 ring in the atlas.
+        //
+        // Empirically (4 sessions measured): measuredAzimuthDeg stayed
+        // within 1.6° of the target for every non-Z0 frame. absAzimuthDeg
+        // drifted up to 24° within a single session in the same data.
+        //
+        // For Z0 frames this path is not used — their yaw was already
+        // injected as absAzimuthDeg at capture time via the pre-zenith
+        // snapshot logic in CaptureActivity.
+        return if (frame.ringId.equals("Z0", ignoreCase = true)) {
+            frame.absAzimuthDeg ?: frame.measuredAzimuthDeg
+        } else {
+            frame.measuredAzimuthDeg
+        }
     }
-
     private fun basePitchDeg(frame: FrameRecord): Float {
         return frame.absPitchDeg ?: frame.measuredPitchDeg
     }
@@ -863,124 +880,22 @@ object AtlasProjector {
         )
     }
     fun projectFramesToAtlas(frames: List<FrameRecord>, atlas: SkyAtlas) {
-        val orderedRaw = frames.sortedBy { it.shotIndex }
+        val ordered = frames.sortedBy { it.shotIndex }
 
-        // Apply session-relative yaw anchor.
+        // Note: the session yaw anchor was removed. It existed to
+        // compensate for magnetometer drift in absAzimuthDeg — but
+        // baseYawDeg now reads measuredAzimuthDeg (gyro-only) for
+        // non-Z0 frames, which is already drift-free within a session
+        // (measured drift over 4 real sessions: max 1.6° from target).
+        // With no drift to correct, the anchor only introduced extra
+        // bias when the first frame had a small alignment error.
         //
-        // Design: the first captured frame of the session defines the
-        // azimuth reference. We compute sessionYawOffset so that
-        //   absAzimuth(firstFrame) - sessionYawOffset = targetAz(firstFrame)
-        // and then apply the same offset to every frame. This collapses
-        // inter-session magnetometer drift: each session becomes
-        // self-consistent (its "north" is whatever the first frame's
-        // target azimuth was), regardless of compass calibration state.
-        //
-        // Within a single session, gyroscope integration keeps relative
-        // azimuth stable to <1°, so the atlas geometry is clean even
-        // when magneticAccuracy is UNRELIABLE.
-        //
-        // Inter-session alignment (matching north across captures) is
-        // NOT addressed here; it would require a physical marker or
-        // calibrated compass, out of scope for this change.
-        val firstFrame = orderedRaw.firstOrNull { it.absAzimuthDeg != null }
-        val rawSessionYawOffset: Float = if (firstFrame?.absAzimuthDeg != null) {
-            // Offset goes FROM the actual absolute azimuth TO the nominal
-            // target azimuth, so that after adding it to each frame's
-            // absAzimuth we get "where this frame would point if the
-            // session had started exactly at its target".
-            //
-            // shortestAngleDeltaDeg(from, to) returns (to - from)
-            // wrapped to [-180, 180], which is what we want here.
-            shortestAngleDeltaDeg(firstFrame.absAzimuthDeg, firstFrame.targetAzimuthDeg)
-        } else {
-            0f
-        }
-
-        // Validation: if the first frame's absAzimuth is wildly off from
-        // its target (e.g., user started capture with phone pointing in
-        // a completely wrong direction, or the guide system latched a
-        // stale target), the offset will be huge and propagating it to
-        // all frames will shift the entire session into nonsense.
-        //
-        // In that case we fall back to offset=0 (no anchor applied) and
-        // log a clear warning. The session will project using raw IMU
-        // absYaw, which means the atlas won't be target-aligned but will
-        // at least preserve internal relative geometry between frames.
-        //
-        // Threshold chosen as 45°: real capture misalignment is
-        // normally < 10°; anything beyond that is almost certainly a
-        // bad-first-frame situation, not drift.
-        val maxReasonableOffsetDeg = 45f
-        val sessionYawOffset: Float = if (abs(rawSessionYawOffset) > maxReasonableOffsetDeg) {
-            Log.w(
-                "AtlasSessionAnchor",
-                "ANCHOR_REJECTED sessionYawOffset=${"%.2f".format(rawSessionYawOffset)}° " +
-                        "exceeds max=${"%.0f".format(maxReasonableOffsetDeg)}°. " +
-                        "First frame absAz=${firstFrame?.absAzimuthDeg?.let { "%.2f".format(it) }}° " +
-                        "targetAz=${firstFrame?.targetAzimuthDeg?.let { "%.2f".format(it) }}°. " +
-                        "Falling back to offset=0 (raw IMU). Atlas will use compass " +
-                        "reference, not target-aligned. This usually indicates the first " +
-                        "frame was captured while phone was pointing in a different " +
-                        "direction than expected."
-            )
-            0f
-        } else {
-            rawSessionYawOffset
-        }
-
-        Log.i(
-            "AtlasSessionAnchor",
-            "firstFrame=${firstFrame?.frameId ?: "null"} " +
-                    "firstTargetAz=${firstFrame?.targetAzimuthDeg?.let { "%.2f".format(it) } ?: "null"} " +
-                    "firstAbsAz=${firstFrame?.absAzimuthDeg?.let { "%.2f".format(it) } ?: "null"} " +
-                    "sessionYawOffset=${"%.2f".format(sessionYawOffset)} " +
-                    "(applied as absAzAdjusted = absAz + offset)"
-        )
-
-        // Build a new frame list with adjusted absolute azimuths. We do NOT
-        // modify the rotation matrices here; the matrix-based seed for Z0
-        // refiner is anchored to the same device-to-world mapping that
-        // produced absAzimuth, so rewriting absAzimuth alone is correct
-        // at the projection level. The Z0 refiner is already disabled, so
-        // the matrix path is currently unused; see
-        // deriveZenithPoseSeedFromMatrixTangent.
-        // Apply the session yaw offset ONLY to absAzimuthDeg. Do NOT
-        // touch measuredAzimuthDeg.
-        //
-        // Rationale: absAzimuthDeg is the geometric truth used by the
-        // projector to place the frame in the atlas. We rewrite it so
-        // the session is self-consistent regardless of compass drift.
-        //
-        // measuredAzimuthDeg is a separate axis: it's the capture-time
-        // reading of where the user aimed the phone, used by
-        // qualityWeightForFrame to verify the user hit the target
-        // (azErr = |target - measured|). Applying the session offset to
-        // measuredAzimuthDeg artificially inflates azErr by ~|offset|
-        // degrees on every frame, which makes qualityWeightForFrame
-        // reject every H0/H45 (offset usually exceeds the 4° tolerance).
-        // Z0 survives because its quality check ignores azErr.
-        //
-        // This was the bug that made H0/H45 disappear after the anchor
-        // was introduced.
-        val orderedWithOffset = if (sessionYawOffset != 0f) {
-            orderedRaw.map { frame ->
-                if (frame.absAzimuthDeg == null) frame else frame.copy(
-                    absAzimuthDeg = normalizeTwistDeg(frame.absAzimuthDeg + sessionYawOffset)
-                )
-            }
-        } else {
-            orderedRaw
-        }
-
-        // Note: the previous Z0 yaw stabilizer (which copied absAzimuthDeg
-        // from the last non-Z0 frame) was removed because it assumed the
-        // user does not rotate the phone between H45 and Z0 — which in
-        // practice they do. The Z0's absAzimuthDeg is now captured at
-        // shutter time via a pre-zenith yaw snapshot in CaptureActivity
-        // (taken while pitch<65°, before the Euler singularity), so it
-        // already arrives correct and no downstream rewriting is needed.
-        val nonZenithFrames = orderedWithOffset.filterNot { isZenithFrame(it) }
-        val zenithFrames = orderedWithOffset.filter { isZenithFrame(it) }
+        // Z0 frames still read absAzimuthDeg, but their value was
+        // captured via the pre-zenith snapshot in CaptureActivity,
+        // which reads the gyro-fused yaw while pitch<65° (well below
+        // the Euler singularity) and persists it as absAzimuthDeg.
+        val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
+        val zenithFrames = ordered.filter { isZenithFrame(it) }
 
         val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
         val persistedMountBasis = loadPersistedMountCalibration()
