@@ -883,7 +883,7 @@ object AtlasProjector {
         // NOT addressed here; it would require a physical marker or
         // calibrated compass, out of scope for this change.
         val firstFrame = orderedRaw.firstOrNull { it.absAzimuthDeg != null }
-        val sessionYawOffset: Float = if (firstFrame?.absAzimuthDeg != null) {
+        val rawSessionYawOffset: Float = if (firstFrame?.absAzimuthDeg != null) {
             // Offset goes FROM the actual absolute azimuth TO the nominal
             // target azimuth, so that after adding it to each frame's
             // absAzimuth we get "where this frame would point if the
@@ -894,6 +894,38 @@ object AtlasProjector {
             shortestAngleDeltaDeg(firstFrame.absAzimuthDeg, firstFrame.targetAzimuthDeg)
         } else {
             0f
+        }
+
+        // Validation: if the first frame's absAzimuth is wildly off from
+        // its target (e.g., user started capture with phone pointing in
+        // a completely wrong direction, or the guide system latched a
+        // stale target), the offset will be huge and propagating it to
+        // all frames will shift the entire session into nonsense.
+        //
+        // In that case we fall back to offset=0 (no anchor applied) and
+        // log a clear warning. The session will project using raw IMU
+        // absYaw, which means the atlas won't be target-aligned but will
+        // at least preserve internal relative geometry between frames.
+        //
+        // Threshold chosen as 45°: real capture misalignment is
+        // normally < 10°; anything beyond that is almost certainly a
+        // bad-first-frame situation, not drift.
+        val maxReasonableOffsetDeg = 45f
+        val sessionYawOffset: Float = if (abs(rawSessionYawOffset) > maxReasonableOffsetDeg) {
+            Log.w(
+                "AtlasSessionAnchor",
+                "ANCHOR_REJECTED sessionYawOffset=${"%.2f".format(rawSessionYawOffset)}° " +
+                        "exceeds max=${"%.0f".format(maxReasonableOffsetDeg)}°. " +
+                        "First frame absAz=${firstFrame?.absAzimuthDeg?.let { "%.2f".format(it) }}° " +
+                        "targetAz=${firstFrame?.targetAzimuthDeg?.let { "%.2f".format(it) }}°. " +
+                        "Falling back to offset=0 (raw IMU). Atlas will use compass " +
+                        "reference, not target-aligned. This usually indicates the first " +
+                        "frame was captured while phone was pointing in a different " +
+                        "direction than expected."
+            )
+            0f
+        } else {
+            rawSessionYawOffset
         }
 
         Log.i(
@@ -930,7 +962,7 @@ object AtlasProjector {
         //
         // This was the bug that made H0/H45 disappear after the anchor
         // was introduced.
-        val ordered = if (sessionYawOffset != 0f) {
+        val orderedWithOffset = if (sessionYawOffset != 0f) {
             orderedRaw.map { frame ->
                 if (frame.absAzimuthDeg == null) frame else frame.copy(
                     absAzimuthDeg = normalizeTwistDeg(frame.absAzimuthDeg + sessionYawOffset)
@@ -938,6 +970,61 @@ object AtlasProjector {
             }
         } else {
             orderedRaw
+        }
+
+        // ============================================================
+        // Z0 yaw stabilizer.
+        //
+        // Near the zenith (pitch ≈ 90°), the yaw and roll axes are
+        // mathematically coupled (gimbal lock). The Android sensor
+        // fusion picks an arbitrary representation among the infinite
+        // valid ones — e.g. yaw=28° roll=92° vs yaw=118° roll=2° — for
+        // the same physical pose. Averaging those values (as we do in
+        // computeAveragedZenithPose) gives a number that has no physical
+        // meaning and typically lands ~90° off.
+        //
+        // Our observed avgRoll values for Z0 (123°, 110°, 35°, 92°)
+        // confirm this: they're not "roll noise", they're the gimbal
+        // lock artifact where the IMU redistributed the yaw rotation
+        // into the roll channel.
+        //
+        // Fix: override the Z0's absAzimuthDeg with the absAzimuthDeg
+        // of the last non-zenith frame captured immediately before.
+        // Those frames are at pitch=45° or pitch=0°, far from gimbal
+        // lock, so their yaw reading is stable and trustworthy.
+        // Absolute pitch is taken from the Z0 sensor (which IS stable
+        // even at the pole — pitch=90 is unambiguous). Roll is already
+        // forced to 0 in the hardZenith projection path downstream.
+        // ============================================================
+        val ordered = run {
+            val lastNonZenithAbsYaw: Float? = orderedWithOffset
+                .lastOrNull { !isZenithFrame(it) && it.absAzimuthDeg != null }
+                ?.absAzimuthDeg
+
+            if (lastNonZenithAbsYaw == null) {
+                Log.i(
+                    "AtlasZ0YawStabilizer",
+                    "NO_REFERENCE_AVAILABLE: no non-Z0 frame with absAzimuthDeg. " +
+                            "Keeping Z0 yaw from sensor average (may be unreliable)."
+                )
+                orderedWithOffset
+            } else {
+                orderedWithOffset.map { frame ->
+                    if (!isZenithFrame(frame) || frame.absAzimuthDeg == null) {
+                        frame
+                    } else {
+                        val originalYaw = frame.absAzimuthDeg
+                        Log.i(
+                            "AtlasZ0YawStabilizer",
+                            "Z0_YAW_REPLACED frame=${frame.frameId} " +
+                                    "originalAbsYaw=${"%.2f".format(originalYaw)}° " +
+                                    "replacedWithAbsYaw=${"%.2f".format(lastNonZenithAbsYaw)}° " +
+                                    "(from last non-Z0 frame, stable outside gimbal lock)"
+                        )
+                        frame.copy(absAzimuthDeg = lastNonZenithAbsYaw)
+                    }
+                }
+            }
         }
 
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
