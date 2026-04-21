@@ -11,33 +11,16 @@ import com.example.sunproject.data.model.FrameRecord
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.atan2
-import kotlin.math.sqrt
 
 /**
- * Debug renderer that produces a single PNG with the Z0 cap rendered
- * using multiple candidate yaws. The last H45 of the session is rendered
- * alongside as a reference, so the user can visually identify which
- * candidate aligns with the ring below.
+ * Debug renderer to identify the correct yaw formula for the Z0 cap.
+ * Produces a single PNG with multiple rows:
+ *   Row 0: full atlas (all H0 + H45, no Z0) as REFERENCE.
+ *   Row 1..N: same full atlas + Z0 rendered at candidate yaw N.
  *
- * Usage: call renderDebugSheet(sessionDir) from AtlasBuildUseCase or
- * CaptureActivity. Output written to atlas/atlas_zenith_yaw_debug.png.
- *
- * The sheet has N+1 rows. Each row is an independent atlas rendered at
- * width × (height/4), showing only the altitude band 0..90 (we crop
- * below the horizon is already excluded by AtlasConfig default).
- *
- * Row 0: only the last H45 and its two neighbors (reference, correct).
- * Rows 1..N: row 0 + the Z0 with candidate yaw N.
- *
- * Candidate yaws tried:
- *   - refYaw (= last H45 measuredAzimuthDeg)
- *   - refYaw + 90
- *   - refYaw + 180
- *   - refYaw + 270
- *   - relYaw (current formula: refYaw + atan2(R[0,1], R[0,0]))
- *   - relYaw with sign flip: refYaw + atan2(R[1,0], R[0,0])
- *   - snapshotYaw (frame.absAzimuthDeg)
- *   - frame absAzimuthDeg unchanged (control)
+ * The user compares rows 1..N against row 0 and identifies which Z0
+ * row continues the H45 ring features seamlessly. That candidate's
+ * formula is the correct one.
  */
 object ZenithYawDebugRenderer {
 
@@ -57,25 +40,21 @@ object ZenithYawDebugRenderer {
                 return
             }
 
-        // Reference frames: last H45 and the two adjacent H45s so the user
-        // has context around the seam.
         val h45Frames = frames.filter { it.ringId.equals("H45", ignoreCase = true) }
-        val refFrames = h45Frames.takeLast(3)
-        if (refFrames.isEmpty()) {
-            Log.w("ZenithYawDebug", "No H45 frames in session")
-            return
-        }
+        val refFrame = h45Frames.lastOrNull()
+            ?: run {
+                Log.w("ZenithYawDebug", "No H45 in session")
+                return
+            }
 
-        val refFrame = h45Frames.last()
+        val nonZenithFrames = frames.filterNot { it.ringId.equals("Z0", ignoreCase = true) }
 
-        // Build yaw candidates.
         val candidates = buildCandidates(z0, refFrame)
 
-        // Render params.
         val rowW = 1800
-        val rowH = 300
-        val labelH = 30
-        val rows = candidates.size + 1 // one extra for reference-only at top
+        val rowH = 450
+        val labelH = 36
+        val rows = candidates.size + 1
         val totalW = rowW
         val totalH = rows * (rowH + labelH)
 
@@ -85,46 +64,99 @@ object ZenithYawDebugRenderer {
 
         val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE
-            textSize = 22f
+            textSize = 26f
         }
 
-        // Row 0: reference only.
-        drawLabel(canvas, "REFERENCE: last 3 H45 only (no Z0)",
-            0, 0, textPaint)
-        renderRow(
-            canvas = canvas,
-            xOff = 0,
-            yOff = labelH,
-            rowW = rowW,
-            rowH = rowH,
-            refFrames = refFrames,
-            z0Frame = null,
-            z0YawDeg = 0f
-        )
+        // Build the reference atlas ONCE. Reuse it as the starting point
+        // for every candidate row by copying its pixels.
+        val refAtlasPixels = buildReferenceAtlasPixels(nonZenithFrames, rowW, rowH)
 
-        // Subsequent rows: reference + Z0 at candidate yaw.
+        // Row 0: reference atlas alone.
+        drawLabel(
+            canvas = canvas,
+            text = "REFERENCE: H0 + H45 only (no Z0)",
+            x = 0,
+            y = 0,
+            paint = textPaint
+        )
+        blitPixels(canvas, refAtlasPixels, rowW, rowH, 0, labelH)
+
+        // Rows 1..N: reference + Z0 at candidate yaw.
         for ((i, cand) in candidates.withIndex()) {
             val rowY = (i + 1) * (rowH + labelH)
-            drawLabel(canvas,
-                "[${i + 1}] ${cand.label}: yaw=${"%.2f".format(cand.yawDeg)}",
-                0, rowY, textPaint
-            )
-            renderRow(
+            drawLabel(
                 canvas = canvas,
-                xOff = 0,
-                yOff = rowY + labelH,
-                rowW = rowW,
-                rowH = rowH,
-                refFrames = refFrames,
-                z0Frame = z0,
-                z0YawDeg = cand.yawDeg
+                text = "[${i + 1}] ${cand.label}: yaw=${"%.2f".format(cand.yawDeg)}",
+                x = 0,
+                y = rowY,
+                paint = textPaint
             )
+
+            val atlas = SkyAtlas(AtlasConfig(widthPx = rowW, heightPx = rowH))
+            // Prime atlas with reference pixels so Z0 overlays onto a real panorama.
+            primeAtlasFromPixels(atlas, refAtlasPixels)
+            renderZ0OnAtlas(atlas, z0, cand.yawDeg)
+
+            blitPixels(canvas, atlas.pixels, rowW, rowH, 0, rowY + labelH)
         }
 
         val outFile = File(paths.atlasDir, "atlas_zenith_yaw_debug.png")
-        FileOutputStream(outFile).use { out.compress(Bitmap.CompressFormat.PNG, 100, it) }
-        Log.i("ZenithYawDebug",
-            "Wrote ${outFile.absolutePath} with ${candidates.size} candidates")
+        FileOutputStream(outFile).use {
+            out.compress(Bitmap.CompressFormat.PNG, 100, it)
+        }
+        Log.i("ZenithYawDebug", "Wrote ${outFile.absolutePath}")
+    }
+
+    private fun buildReferenceAtlasPixels(
+        nonZenithFrames: List<FrameRecord>,
+        widthPx: Int,
+        heightPx: Int
+    ): IntArray {
+        val atlas = SkyAtlas(AtlasConfig(widthPx = widthPx, heightPx = heightPx))
+        for (fr in nonZenithFrames) {
+            val src = BitmapFactory.decodeFile(fr.originalPath) ?: continue
+            try {
+                AtlasProjector.projectSingleFrameToAtlas(fr, atlas)
+            } catch (t: Throwable) {
+                Log.e("ZenithYawDebug", "render failed for ${fr.frameId}", t)
+            } finally {
+                src.recycle()
+            }
+        }
+        return atlas.pixels.copyOf()
+    }
+
+    private fun primeAtlasFromPixels(atlas: SkyAtlas, pixels: IntArray) {
+        // Copy reference pixels into atlas. Note that weightSums stays at 0,
+        // which is fine — we're only overlaying Z0 where Z0 has data, and
+        // the Z0 will blend over the primed pixels with default weights.
+        System.arraycopy(pixels, 0, atlas.pixels, 0, pixels.size)
+    }
+
+    /**
+     * Renders the Z0 frame on the atlas using the forced yaw. Bypasses
+     * AtlasProjector.projectSingleFrameToAtlas because that helper uses
+     * the frame's own absAzimuthDeg and ignores any override. Here we
+     * replicate the core projection loop directly so the candidate yaw
+     * actually takes effect.
+     */
+    private fun renderZ0OnAtlas(atlas: SkyAtlas, z0: FrameRecord, yawDeg: Float) {
+        // Rewrite the frame's absolute pose to force the projector into
+        // the hard-zenith branch at the given yaw. Roll is forced to 0
+        // because forceHardZenith path already discards it.
+        val forcedZ0 = z0.copy(
+            absAzimuthDeg = normalizeDeg(yawDeg),
+            absPitchDeg = (z0.absPitchDeg ?: z0.measuredPitchDeg).coerceIn(84f, 90f),
+            absRollDeg = 0f
+        )
+        val src = BitmapFactory.decodeFile(forcedZ0.originalPath) ?: return
+        try {
+            AtlasProjector.projectSingleFrameToAtlas(forcedZ0, atlas)
+        } catch (t: Throwable) {
+            Log.e("ZenithYawDebug", "Z0 render failed", t)
+        } finally {
+            src.recycle()
+        }
     }
 
     private fun buildCandidates(
@@ -133,9 +165,8 @@ object ZenithYawDebugRenderer {
     ): List<YawCandidate> {
         val refYaw = refFrame.measuredAzimuthDeg
 
-        // Compute both possible delta-yaw formulations.
         val mRef = storedMatrix(refFrame)
-        val mZ0  = storedMatrix(z0)
+        val mZ0 = storedMatrix(z0)
 
         val (delta01, delta10) = if (mRef != null && mZ0 != null) {
             val r00 = mZ0[0] * mRef[0] + mZ0[1] * mRef[1] + mZ0[2] * mRef[2]
@@ -151,86 +182,59 @@ object ZenithYawDebugRenderer {
 
         val snapshotYaw = z0.absAzimuthDeg
 
-        val candidates = mutableListOf<YawCandidate>()
-        candidates += YawCandidate("refYaw (no delta)",      norm(refYaw))
-        candidates += YawCandidate("refYaw + 90",            norm(refYaw + 90f))
-        candidates += YawCandidate("refYaw + 180",           norm(refYaw + 180f))
-        candidates += YawCandidate("refYaw + 270",           norm(refYaw + 270f))
-        candidates += YawCandidate("refYaw + delta01",       norm(refYaw + delta01))
-        candidates += YawCandidate("refYaw - delta01",       norm(refYaw - delta01))
-        candidates += YawCandidate("refYaw + delta10",       norm(refYaw + delta10))
-        candidates += YawCandidate("refYaw - delta10",       norm(refYaw - delta10))
+        val out = mutableListOf<YawCandidate>()
+        out += YawCandidate("refYaw (no delta)", normalizeDeg(refYaw))
+        out += YawCandidate("refYaw + 90", normalizeDeg(refYaw + 90f))
+        out += YawCandidate("refYaw + 180", normalizeDeg(refYaw + 180f))
+        out += YawCandidate("refYaw + 270", normalizeDeg(refYaw + 270f))
+        out += YawCandidate("refYaw + delta01", normalizeDeg(refYaw + delta01))
+        out += YawCandidate("refYaw - delta01", normalizeDeg(refYaw - delta01))
+        out += YawCandidate("refYaw + delta10", normalizeDeg(refYaw + delta10))
+        out += YawCandidate("refYaw - delta10", normalizeDeg(refYaw - delta10))
         if (snapshotYaw != null) {
-            candidates += YawCandidate("snapshotYaw",        norm(snapshotYaw))
-            candidates += YawCandidate("snapshotYaw + 90",   norm(snapshotYaw + 90f))
-            candidates += YawCandidate("snapshotYaw + 180",  norm(snapshotYaw + 180f))
-            candidates += YawCandidate("snapshotYaw + 270",  norm(snapshotYaw + 270f))
+            out += YawCandidate("snapshotYaw", normalizeDeg(snapshotYaw))
+            out += YawCandidate("snapshotYaw + 90", normalizeDeg(snapshotYaw + 90f))
+            out += YawCandidate("snapshotYaw + 180", normalizeDeg(snapshotYaw + 180f))
+            out += YawCandidate("snapshotYaw + 270", normalizeDeg(snapshotYaw + 270f))
         }
 
-        // Log candidates for reference.
-        candidates.forEachIndexed { i, c ->
-            Log.i("ZenithYawDebug", "  cand[${i+1}] ${c.label}: yaw=${"%.2f".format(c.yawDeg)}")
+        out.forEachIndexed { i, c ->
+            Log.i(
+                "ZenithYawDebug",
+                "cand[${i + 1}] ${c.label}: yaw=${"%.2f".format(c.yawDeg)}"
+            )
         }
 
-        return candidates
+        return out
     }
 
-    private fun renderRow(
+    private fun blitPixels(
         canvas: Canvas,
-        xOff: Int,
-        yOff: Int,
-        rowW: Int,
-        rowH: Int,
-        refFrames: List<FrameRecord>,
-        z0Frame: FrameRecord?,
-        z0YawDeg: Float
+        pixels: IntArray,
+        srcW: Int,
+        srcH: Int,
+        dstX: Int,
+        dstY: Int
     ) {
-        val atlas = SkyAtlas(
-            AtlasConfig(
-                widthPx = rowW,
-                heightPx = rowH
-            )
-        )
-
-        // Render H45 reference frames first.
-        for (ref in refFrames) {
-            val src = BitmapFactory.decodeFile(ref.originalPath) ?: continue
-            try {
-                AtlasProjector.projectSingleFrameToAtlas(ref, atlas)
-            } catch (t: Throwable) {
-                Log.e("ZenithYawDebug", "H45 render failed for ${ref.frameId}", t)
-            } finally {
-                src.recycle()
-            }
-        }
-
-        // Render Z0 with the forced yaw if requested.
-        if (z0Frame != null) {
-            val forcedZ0 = z0Frame.copy(
-                absAzimuthDeg = z0YawDeg,
-                absPitchDeg = z0Frame.absPitchDeg ?: z0Frame.measuredPitchDeg,
-                absRollDeg = 0f
-            )
-            try {
-                AtlasProjector.projectSingleFrameToAtlas(forcedZ0, atlas)
-            } catch (t: Throwable) {
-                Log.e("ZenithYawDebug", "Z0 render failed", t)
-            }
-        }
-
-        // Blit atlas into canvas.
-        val atlasBmp = atlas.toBitmap()
+        val bmp = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
+        bmp.setPixels(pixels, 0, srcW, 0, 0, srcW, srcH)
         canvas.drawBitmap(
-            atlasBmp,
-            Rect(0, 0, atlasBmp.width, atlasBmp.height),
-            Rect(xOff, yOff, xOff + rowW, yOff + rowH),
+            bmp,
+            Rect(0, 0, srcW, srcH),
+            Rect(dstX, dstY, dstX + srcW, dstY + srcH),
             null
         )
-        atlasBmp.recycle()
+        bmp.recycle()
     }
 
-    private fun drawLabel(canvas: Canvas, text: String, x: Int, y: Int, paint: Paint) {
-        canvas.drawText(text, x.toFloat() + 8f, y.toFloat() + 22f, paint)
+    private fun drawLabel(
+        canvas: Canvas,
+        text: String,
+        x: Int,
+        y: Int,
+        paint: Paint
+    ) {
+        canvas.drawText(text, x.toFloat() + 8f, y.toFloat() + 28f, paint)
     }
 
     private fun storedMatrix(fr: FrameRecord): FloatArray? {
@@ -246,7 +250,7 @@ object ZenithYawDebugRenderer {
         return floatArrayOf(m00, m01, m02, m10, m11, m12, m20, m21, m22)
     }
 
-    private fun norm(deg: Float): Float {
+    private fun normalizeDeg(deg: Float): Float {
         var v = deg % 360f
         if (v < 0f) v += 360f
         return v
