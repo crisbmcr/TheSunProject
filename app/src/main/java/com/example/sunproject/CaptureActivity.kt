@@ -338,32 +338,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         btnAuto.setOnLongClickListener {
-            val dir = sessionDir
-            if (dir == null || capturedFiles.isEmpty()) {
-                Toast.makeText(this, "Captura al menos una sesión primero", Toast.LENGTH_SHORT).show()
+            if (capturedFiles.isEmpty()) {
+                Toast.makeText(this, "Captura al menos una foto primero", Toast.LENGTH_SHORT).show()
             } else {
-                cameraExecutor.execute {
-                    try {
-                        val debugFile = atlasBuildUseCase.renderZenithYawDebug(dir)
-                        runOnUiThread {
-                            Toast.makeText(
-                                this,
-                                "Debug sheet: ${debugFile.name}",
-                                Toast.LENGTH_SHORT
-                            ).show()
-                            startActivity(
-                                Intent(this, AnalysisActivity::class.java).apply {
-                                    putExtra("panorama_path", debugFile.absolutePath)
-                                }
-                            )
-                        }
-                    } catch (t: Throwable) {
-                        Log.e("ZenithYawDebug", "render failed", t)
-                        runOnUiThread {
-                            Toast.makeText(this, "Error: ${t.message}", Toast.LENGTH_LONG).show()
-                        }
-                    }
-                }
+                openProjectedAtlasAll()
             }
             true
         }
