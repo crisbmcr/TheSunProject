@@ -957,40 +957,92 @@ object AtlasProjector {
             try {
                 val frameWeight = qualityWeightForFrame(frame)
 
-                val matrixSeed = cameraMountBasis
-                    ?.let { deriveZenithPoseSeedFromMatrixTangent(frame, it) }
+                // Z0 cap orientation via relative-matrix anchoring to the
+                // last non-zenith frame of the session (typically the last
+                // H45).
+                //
+                // Rationale: we already trust non-zenith frames' yaw
+                // (measuredAzimuthDeg, gyro-only, drift-free within a
+                // session). For the Z0, instead of trying to extract an
+                // absolute yaw from the matrix directly — which depends on
+                // sensor convention (which device axis is "image up"), and
+                // varies between handsets — we measure how much the phone's
+                // orientation rotated around the world-vertical axis
+                // between the reference frame and the Z0 shutter. That
+                // delta is invariant to sensor convention because both
+                // matrices come from the same pipeline.
+                //
+                // Formula: R_world = M_z0 · M_refᵀ describes the world-
+                // frame rotation from ref pose to Z0 pose. Its yaw
+                // component is atan2(R[0,1], R[0,0]) in a
+                // (east, north, up) basis with azimuth CW-from-north.
+                // Applied to ref_yaw, this gives the Z0 yaw to pass to
+                // the projector.
+                //
+                // If the reference frame or either matrix is unavailable,
+                // fall back to the pre-zenith snapshot (frame.absAzimuthDeg).
+                val refFrame = nonZenithFrames.lastOrNull { storedDeviceToWorldMatrix(it) != null }
+                val m_ref = refFrame?.let { storedDeviceToWorldMatrix(it) }
+                val m_z0  = storedDeviceToWorldMatrix(frame)
 
-                val useMatrixSeed = matrixSeed != null &&
-                        cameraMountBasis != null &&
-                        isReliableMatrixZenithSeed(matrixSeed, cameraMountBasis)
-
-                if (matrixSeed != null && !useMatrixSeed) {
-                    val forwardTilt = if (cameraMountBasis != null) {
-                        forwardTiltDeg(cameraMountBasis)
-                    } else {
-                        Float.NaN
-                    }
-
-                    Log.w(
-                        "AtlasZenithMatrixSeed",
-                        "frame=${frame.frameId} rejected " +
-                                "yawAbs=${"%.2f".format(matrixSeed.absoluteYawDeg)} " +
-                                "rawPitchAbs=${"%.2f".format(matrixSeed.absolutePitchDeg)} " +
-                                "rollAbs=${"%.2f".format(matrixSeed.absoluteRollDeg)} " +
-                                "forwardTilt=${"%.2f".format(forwardTilt)}"
-                    )
-                }
-
-                val zenithPose = if (useMatrixSeed) {
-                    matrixSeed!!
+                val relativeYaw: Float? = if (refFrame != null && m_ref != null && m_z0 != null) {
+                    // R_world = M_z0 · M_refᵀ   (3x3, row-major)
+                    // We only need R[0][0] and R[0][1]:
+                    //   R[0][0] = Σ_k M_z0[0][k] * M_ref[0][k]
+                    //   R[0][1] = Σ_k M_z0[0][k] * M_ref[1][k]
+                    val r00 = m_z0[0] * m_ref[0] + m_z0[1] * m_ref[1] + m_z0[2] * m_ref[2]
+                    val r01 = m_z0[0] * m_ref[3] + m_z0[1] * m_ref[4] + m_z0[2] * m_ref[5]
+                    val deltaYawDeg = Math.toDegrees(atan2(r01.toDouble(), r00.toDouble())).toFloat()
+                    val refYaw = refFrame.measuredAzimuthDeg
+                    normalizeTwistDeg(refYaw + deltaYawDeg)
                 } else {
-                    estimateZenithPoseDeg(
-                        frame = frame,
-                        src = src,
-                        baseAtlas = atlas,
-                        frameWeight = frameWeight
-                    )
+                    null
                 }
+
+                val zenithPose: ZenithPoseEstimate = when {
+                    relativeYaw != null -> {
+                        val pitchAbs = frame.absPitchDeg ?: frame.measuredPitchDeg
+                        val rollAbs  = frame.absRollDeg  ?: frame.measuredRollDeg
+                        val snapshotYaw = frame.absAzimuthDeg
+                        val diff = if (snapshotYaw != null) {
+                            shortestAngleDeltaDeg(snapshotYaw, relativeYaw)
+                        } else {
+                            Float.NaN
+                        }
+                        Log.i(
+                            "AtlasZenithPoseSource",
+                            "frame=${frame.frameId} source=MATRIX_RELATIVE " +
+                                    "refFrame=${refFrame?.frameId} " +
+                                    "refYaw=${"%.2f".format(refFrame?.measuredAzimuthDeg ?: Float.NaN)} " +
+                                    "relYaw=${"%.2f".format(relativeYaw)} " +
+                                    "snapshotYaw=${snapshotYaw?.let { "%.2f".format(it) } ?: "null"} " +
+                                    "diff=${"%.2f".format(diff)}"
+                        )
+                        buildZenithPoseEstimateFromAbsolute(
+                            frame = frame,
+                            absoluteYawDeg = relativeYaw,
+                            absolutePitchDeg = pitchAbs,
+                            absoluteRollDeg = rollAbs,
+                            score = Float.POSITIVE_INFINITY,
+                            comparedPixels = 0,
+                            confidence = 1f
+                        )
+                    }
+                    else -> {
+                        Log.w(
+                            "AtlasZenithPoseSource",
+                            "frame=${frame.frameId} source=SNAPSHOT_FALLBACK " +
+                                    "reason=no_matrix_or_ref"
+                        )
+                        estimateZenithPoseDeg(
+                            frame = frame,
+                            src = src,
+                            baseAtlas = atlas,
+                            frameWeight = frameWeight
+                        )
+                    }
+                }
+                val useMatrixSeed = relativeYaw != null
 
                 Log.d(
                     "AtlasZenithPoseSeed",

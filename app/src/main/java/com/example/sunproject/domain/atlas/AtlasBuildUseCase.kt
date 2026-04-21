@@ -58,4 +58,10 @@ class AtlasBuildUseCase(
         atlas.writePng(out)
         return out
     }
+
+    fun renderZenithYawDebug(sessionDir: File): File {
+        ZenithYawDebugRenderer.renderDebugSheet(sessionDir)
+        val paths = store.createSessionPaths(sessionDir)
+        return File(paths.atlasDir, "atlas_zenith_yaw_debug.png")
+    }
 }
