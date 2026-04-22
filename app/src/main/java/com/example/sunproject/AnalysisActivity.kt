@@ -91,12 +91,32 @@ class AnalysisActivity : AppCompatActivity() {
         Thread {
             try {
                 val base = baseBitmap ?: return@Thread
-                // Config por defecto del atlas. Debe coincidir con AtlasBuildUseCase.
                 val cfg = AtlasConfig(widthPx = base.width, heightPx = base.height)
                 val mutable = base.copy(Bitmap.Config.ARGB_8888, true)
                 SolarPathOverlay.drawChart(mutable, cfg, chart)
                 overlayBitmap = mutable
                 runOnUiThread { panoramaImageView.setImageBitmap(mutable) }
+
+                // Exportar PNG al mismo directorio. Una sola vez por sesión de
+                // análisis (si el usuario apaga y vuelve a encender el toggle,
+                // no reescribimos — ya está el archivo).
+                val atlasFileStr = atlasPath ?: return@Thread
+                val atlasFile = java.io.File(atlasFileStr)
+                val outName = atlasFile.nameWithoutExtension + "_abaco." + atlasFile.extension
+                val outFile = java.io.File(atlasFile.parentFile, outName)
+
+                if (!outFile.exists()) {
+                    val written = SolarPathOverlay.exportWithChart(atlasFile, cfg, chart)
+                    runOnUiThread {
+                        if (written != null) {
+                            Toast.makeText(
+                                this,
+                                "Ábaco guardado: ${written.name}",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                }
             } catch (t: Throwable) {
                 Log.e("SolarOverlay", "render falló", t)
             }
