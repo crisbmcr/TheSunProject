@@ -661,7 +661,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         if (zenithMode) {
             val capturePitchDeg = absolutePitchDeg
             val pitchErr = abs(capturePitchDeg - target.pitch)
-            val aligned = pitchErr <= 2.0f
+// Target = 90° y tol=1.0° => acepta pitch >= 89°. Con pitch=89°, el cap
+// baja a ~54.6° del lado del tel y ~56.6° del lado opuesto (asimetría 2°
+// en vez de 4° cuando permitíamos pitch=86°). Con pitch=90° es simétrico.
+            val aligned = pitchErr <= 1.0f
 
             Log.d(
                 "SunGuideZenithAuto",
@@ -670,7 +673,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                         "pitchErr=${"%.2f".format(pitchErr)} " +
                         "aligned=$aligned"
             )
-
             if (!aligned) {
                 alignmentStartMs = 0L
                 return

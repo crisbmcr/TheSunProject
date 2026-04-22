@@ -229,7 +229,7 @@ class GuideView @JvmOverloads constructor(
         capturePoints.clear()
         for (az in 0 until 360 step 30) { capturePoints.add(CapturePoint(az.toFloat(), 0f)) }
         for (az in 0 until 360 step 45) { capturePoints.add(CapturePoint(az.toFloat(), 45f)) }
-        capturePoints.add(CapturePoint(0f, 88f))
+        capturePoints.add(CapturePoint(0f, 90f))
     }
 
     private fun drawHorizon(canvas: Canvas) {

@@ -15,6 +15,15 @@
         android:scaleType="fitCenter"
         android:contentDescription="Panorama 360" />
 
+    <ToggleButton
+        android:id="@+id/btnSolarChart"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textOn="Ábaco: ON"
+        android:textOff="Ábaco: OFF"
+        android:padding="12dp"
+        android:layout_margin="12dp"/>
+
     <ProgressBar
         android:id="@+id/loadingIndicator"
         android:layout_width="wrap_content"
