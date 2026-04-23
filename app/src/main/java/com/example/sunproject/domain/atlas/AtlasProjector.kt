@@ -100,6 +100,19 @@ private const val ZENITH_ERP_FADE_START_ALT_DEG = 74f
 private const val ZENITH_ERP_FADE_FULL_ALT_DEG = 82f
 private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 
+private var cachedGyroToTrueNorthCorrectionDeg: Float? = null
+
+/**
+ * Corrección entre el gyro-North del atlas (measuredAzimuthDeg anclado al
+ * inicio de la sesión) y el true-North. Se setea una vez por sesión al
+ * proyectar frames. Incluye la declinación magnética del lugar porque
+ * absAzimuthDeg ya pasó por applyDeclination en CaptureActivity.
+ *
+ * ZenithMatrixProjector la consulta para rotar el rayo mundo y mantener
+ * alineado el Z0 con H0/H45.
+ */
+fun gyroToTrueNorthCorrectionDeg(): Float = cachedGyroToTrueNorthCorrectionDeg ?: 0f
+
 private data class RgbGain(
     val r: Float,
     val g: Float,
@@ -268,25 +281,17 @@ object AtlasProjector {
         )
     }
     private fun baseYawDeg(frame: FrameRecord): Float {
-        // Use measuredAzimuthDeg (GAME_ROTATION_VECTOR, gyro-only + session
-        // anchor at start) instead of absAzimuthDeg (ROTATION_VECTOR, gyro
-        // fused with magnetometer). The magnetometer can silently
-        // recalibrate mid-session and shift the absolute azimuth by 20°+
-        // between consecutive frames, which tears the H45 ring away from
-        // the H0 ring in the atlas.
-        //
-        // Empirically (4 sessions measured): measuredAzimuthDeg stayed
-        // within 1.6° of the target for every non-Z0 frame. absAzimuthDeg
-        // drifted up to 24° within a single session in the same data.
-        //
-        // For Z0 frames this path is not used — their yaw was already
-        // injected as absAzimuthDeg at capture time via the pre-zenith
-        // snapshot logic in CaptureActivity.
-        return if (frame.ringId.equals("Z0", ignoreCase = true)) {
-            frame.absAzimuthDeg ?: frame.measuredAzimuthDeg
+        val correctionDeg = cachedGyroToTrueNorthCorrectionDeg ?: 0f
+
+        val baseDeg = if (frame.ringId.equals("Z0", ignoreCase = true)) {
+            // Z0 usa la matriz directamente vía ZenithMatrixProjector.
+            // Este path sólo se usa en el fallback (approximateFootprint).
+            frame.absAzimuthDeg ?: (frame.measuredAzimuthDeg + correctionDeg)
         } else {
-            frame.measuredAzimuthDeg
+            frame.measuredAzimuthDeg + correctionDeg
         }
+
+        return normalizeTwistDeg(baseDeg)
     }
     private fun basePitchDeg(frame: FrameRecord): Float {
         return frame.absPitchDeg ?: frame.measuredPitchDeg
@@ -896,6 +901,13 @@ object AtlasProjector {
         // the Euler singularity) and persists it as absAzimuthDeg.
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
         val zenithFrames = ordered.filter { isZenithFrame(it) }
+
+        cachedGyroToTrueNorthCorrectionDeg = computeGyroToTrueNorthCorrection(nonZenithFrames)
+        Log.i(
+            "AtlasDeclCorrection",
+            "correction=${cachedGyroToTrueNorthCorrectionDeg?.let { "%.2f".format(it) } ?: "null"}°" +
+                    " (positivo = rotar atlas al este para llegar a true-N)"
+        )
 
         val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
         val persistedMountBasis = loadPersistedMountCalibration()
@@ -2242,5 +2254,33 @@ object AtlasProjector {
         val len = length(v)
         if (len < 1e-6f) return floatArrayOf(0f, 0f, 0f)
         return floatArrayOf(v[0] / len, v[1] / len, v[2] / len)
+    }
+
+    /**
+     * Calcula el offset entre el gyro-North del atlas y el true-North,
+     * usando el primer frame no-zenital con absAzimuthDeg disponible.
+     * absAzimuthDeg ya lleva aplicada la declinación magnética (ver
+     * CaptureActivity.applyDeclination), por lo que la resta captura
+     * el total (declinación + ruido del anchor gyro).
+     *
+     * Retorna null si no hay ningún frame con absAzimuthDeg (típicamente:
+     * GPS nunca entregó ubicación durante la captura). En ese caso el atlas
+     * queda en gyro-North, mismo comportamiento que antes del fix.
+     */
+    private fun computeGyroToTrueNorthCorrection(frames: List<FrameRecord>): Float? {
+        val ref = frames.firstOrNull { it.absAzimuthDeg != null } ?: return null
+        val absYaw = ref.absAzimuthDeg ?: return null
+        val gyroYaw = ref.measuredAzimuthDeg
+
+        var delta = absYaw - gyroYaw
+        while (delta > 180f) delta -= 360f
+        while (delta <= -180f) delta += 360f
+
+        Log.d(
+            "AtlasDeclCorrection",
+            "refFrame=${ref.frameId} absYaw=${"%.2f".format(absYaw)} " +
+                    "gyroYaw=${"%.2f".format(gyroYaw)} delta=${"%.2f".format(delta)}"
+        )
+        return delta
     }
 }

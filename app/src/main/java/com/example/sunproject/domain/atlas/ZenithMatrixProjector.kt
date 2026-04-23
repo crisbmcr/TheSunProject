@@ -61,7 +61,8 @@ object ZenithMatrixProjector {
         srcW: Int,
         srcH: Int,
         atlas: SkyAtlas,
-        displayRotation: Int
+        displayRotation: Int,
+        yawCorrectionDeg: Float = 0f
     ): Pair<Mat, Mat> {
         require(rWorldDevice.size == 9) { "rWorldDevice debe tener 9 floats" }
         require(displayRotation == 0) {
@@ -96,7 +97,9 @@ object ZenithMatrixProjector {
         val lutRow = FloatArray(w * 2)
         val maskRow = ByteArray(w)
         var validCount = 0
-
+        val correctionRad = Math.toRadians(yawCorrectionDeg.toDouble()).toFloat()
+        val cosCorr = cos(correctionRad)
+        val sinCorr = sin(correctionRad)
         for (y in 0 until h) {
             val altRad = Math.toRadians(
                 AtlasMath.yToAltitude(y, atlas.config).toDouble()
@@ -106,12 +109,22 @@ object ZenithMatrixProjector {
 
             for (x in 0 until w) {
                 // Rayo d_world en ENU (azimut CW desde el Norte).
-                val dwx = cosAlt * sinAz[x]
-                val dwy = cosAlt * cosAz[x]
+                val dwxRaw = cosAlt * sinAz[x]
+                val dwyRaw = cosAlt * cosAz[x]
                 val dwz = sinAlt
 
-                // d_device = M^T * d_world.
-                // (M^T * v)[i] = sum_j M[j,i] * v[j] = sum_j M[j*3+i] * v[j]
+// Rotación en azimut para matchear true-North. Preserva altitud
+// porque es una rotación alrededor del eje Z.
+//
+// Azimut CW desde Norte: si yawCorrection > 0, el "Norte del atlas"
+// está yawCorrection° al este del true-North. Al consultar el píxel
+// del atlas en azimut A (true-N), queremos leerlo en (A - correction)
+// del gyro-N. Equivalente: rotar el rayo d_world por -correction
+// antes de aplicarle M^T.
+                val dwx =  dwxRaw * cosCorr + dwyRaw * sinCorr
+                val dwy = -dwxRaw * sinCorr + dwyRaw * cosCorr
+
+// d_device = M^T * d_world.
                 val ddx = m00 * dwx + m10 * dwy + m20 * dwz
                 val ddy = m01 * dwx + m11 * dwy + m21 * dwz
                 val ddz = m02 * dwx + m12 * dwy + m22 * dwz
@@ -191,6 +204,7 @@ object ZenithMatrixProjector {
         val srcW = src.width
         val srcH = src.height
 
+        val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
         val (lut, mask) = buildEquirectLut(
             rWorldDevice = rWorldDevice,
             hfovDeg = hfov,
@@ -198,7 +212,8 @@ object ZenithMatrixProjector {
             srcW = srcW,
             srcH = srcH,
             atlas = atlas,
-            displayRotation = displayRotation
+            displayRotation = displayRotation,
+            yawCorrectionDeg = correctionDeg
         )
 
         val srcMat = Mat()
