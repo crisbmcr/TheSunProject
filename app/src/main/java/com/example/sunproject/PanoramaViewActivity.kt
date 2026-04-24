@@ -46,8 +46,37 @@ class PanoramaViewActivity : AppCompatActivity() {
             return
         }
 
+        // === Configuración del renderer — debe hacerse ANTES que GLSurfaceView se adjunte
+        // a la ventana, o sea, sincronicamente en onCreate. Cualquier cosa async (decodificar
+        // bitmap, leer session.json, etc.) se hace después y se inyecta al renderer vía setters.
         glView.setEGLContextClientVersion(2)
 
+        val yawCorrectionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
+        Log.i(TAG, "Corrección yaw Fase 3: $yawCorrectionDeg°")
+
+        val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val newRenderer = PanoramaRenderer()
+        val newController = GyroCameraController(sensorManager, yawCorrectionDeg)
+
+        // Conectar renderer ↔ controller. Referencia del array se mantiene; el controller
+        // muta el contenido cuando llegan eventos del sensor.
+        newRenderer.setExternalViewMatrix(newController.currentViewMatrix())
+
+        renderer = newRenderer
+        gyroController = newController
+
+        glView.setRenderer(newRenderer)
+        glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+        // HUD inicial mientras carga el bitmap.
+        hudText.text = "Panorama 3D — cargando atlas..."
+
+        // Arrancar el sensor ya, aunque el bitmap todavía no esté listo — así la
+        // cámara virtual ya está orientada cuando aparezcan los píxeles.
+        newController.start()
+
+        // === Carga del bitmap en background. Cuando termine, se inyecta al renderer y
+        // en el siguiente frame se hace el GL upload.
         lifecycleScope.launch {
             val bitmap = withContext(Dispatchers.IO) {
                 runCatching {
@@ -64,37 +93,9 @@ class PanoramaViewActivity : AppCompatActivity() {
             }
 
             Log.i(TAG, "Atlas cargado ${bitmap.width}x${bitmap.height} de ${File(panoramaPath).name}")
-            hudText.text = "Panorama 3D — ${bitmap.width}x${bitmap.height}\n" +
-                    "v1: cámara fija mirando al Norte"
 
-            // 1. Obtener la corrección de yaw de Fase 3 si está disponible.
-//    Si no hay corrección (sesión sin GPS, o spread alto), devuelve 0f
-//    y la cámara queda en gyro-N puro — consistente con el fallback del atlas.
-            val yawCorrectionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
-            Log.i(TAG, "Corrección yaw Fase 3: $yawCorrectionDeg°")
+            newRenderer.setAtlasBitmap(bitmap)
 
-// 2. Crear el renderer y el controller.
-            val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-            val newRenderer = PanoramaRenderer(bitmap)
-            val newController = GyroCameraController(sensorManager, yawCorrectionDeg)
-
-// 3. Conectar: el renderer lee la viewMatrix del controller en cada frame.
-            newRenderer.setExternalViewMatrix(newController.currentViewMatrix())
-
-            renderer = newRenderer
-            gyroController = newController
-
-            glView.setRenderer(newRenderer)
-            glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-
-
-            // 4. Arrancar el listener del sensor. Lo hacemos incondicional porque:
-//    - Si onResume ya pasó (flujo típico), gyroController era null entonces y
-//      el ?.start() de onResume fue no-op. Tenemos que arrancarlo ahora.
-//    - Si onResume todavía no pasó, registerListener es idempotente y no hay problema.
-            newController.start()
-
-// Actualizar HUD con info extra.
             val correctionStr = if (yawCorrectionDeg != 0f) {
                 "yaw fix: %.2f°".format(yawCorrectionDeg)
             } else {
@@ -107,13 +108,13 @@ class PanoramaViewActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (renderer != null) glView.onResume()
+        glView.onResume()
         gyroController?.start()
     }
 
     override fun onPause() {
         super.onPause()
         gyroController?.stop()
-        if (renderer != null) glView.onPause()
+        glView.onPause()
     }
 }

@@ -21,15 +21,13 @@ private const val TAG = "PanoramaRenderer"
  * El Bitmap del atlas se sube como textura GL_TEXTURE_2D en onSurfaceCreated.
  * Importante: el Bitmap debe estar en config ARGB_8888 y no reciclado al momento del upload.
  */
-class PanoramaRenderer(
-    private val atlasBitmap: Bitmap
-) : GLSurfaceView.Renderer {
+class PanoramaRenderer : GLSurfaceView.Renderer {
 
     private val sphere = SphereMesh(
         slices = 60,
         stacks = 30,
-        atlasMinAltitudeDeg = 0f,      // horizonte (fila inferior del atlas)
-        atlasMaxAltitudeDeg = 90f      // cenit (fila superior del atlas)
+        atlasMinAltitudeDeg = 0f,
+        atlasMaxAltitudeDeg = 90f
     )
 
     private var program = 0
@@ -39,6 +37,14 @@ class PanoramaRenderer(
     private var uTextureLoc = -1
 
     private var textureId = 0
+
+    // Bitmap pendiente de upload como textura. Se setea desde fuera con
+    // setAtlasBitmap() — típicamente desde la Activity después de decodificar
+    // el archivo en background. El upload real ocurre en el render thread
+    // (en onDrawFrame) para no romper el contexto GL.
+    @Volatile
+    private var pendingBitmap: Bitmap? = null
+    private var bitmapUploaded = false
 
     private val projectionMatrix = FloatArray(16)
     private val viewMatrix = FloatArray(16)
@@ -82,9 +88,6 @@ class PanoramaRenderer(
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glEnable(GLES20.GL_DEPTH_TEST)
 
-        // Para skybox visto desde adentro: el winding del SphereMesh está armado
-        // para que los triángulos sean CCW desde el centro. Culleamos los que son CW
-        // (las "caras externas" de la esfera).
         GLES20.glDisable(GLES20.GL_CULL_FACE)
 
         program = buildProgram(vertexShaderSource, fragmentShaderSource)
@@ -93,12 +96,13 @@ class PanoramaRenderer(
         uMvpMatrixLoc = GLES20.glGetUniformLocation(program, "uMvpMatrix")
         uTextureLoc = GLES20.glGetUniformLocation(program, "uTexture")
 
-        textureId = uploadTexture(atlasBitmap)
+        // Reseteamos el flag — si el Surface se recrea (p.ej. al volver de pause),
+        // hay que re-uploadear la textura aunque el bitmap ya haya sido seteado antes.
+        bitmapUploaded = false
 
         Matrix.setIdentityM(modelMatrix, 0)
 
-        Log.i(TAG, "onSurfaceCreated OK — program=$program textureId=$textureId " +
-                "atlas=${atlasBitmap.width}x${atlasBitmap.height}")
+        Log.i(TAG, "onSurfaceCreated OK — program=$program")
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -112,9 +116,21 @@ class PanoramaRenderer(
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
-        // Si hay un controller que inyectó una viewMatrix, la usamos. Si no, fallback
-        // a cámara estática mirando al Norte (como v1).
+        // Subir bitmap pendiente si hay y todavía no se subió. Esto corre en el render
+        // thread, que es donde tiene que correr cualquier operación GL.
+        val bitmapToUpload = pendingBitmap
+        if (!bitmapUploaded && bitmapToUpload != null) {
+            textureId = uploadTexture(bitmapToUpload)
+            bitmapUploaded = true
+            Log.i(TAG, "Textura subida — textureId=$textureId atlas=${bitmapToUpload.width}x${bitmapToUpload.height}")
+        }
+
+        // Si todavía no hay textura subida, no dibujamos el skybox — el glClear
+        // ya pintó negro, que es el loading state.
+        if (!bitmapUploaded) return
+
         val currentView = externalViewMatrix
+        // ... resto del onDrawFrame igual ...
         if (currentView != null) {
             // Copiamos a viewMatrix local porque el controller puede seguir escribiendo
             // en paralelo. Una copia de 16 floats es trivial.
@@ -157,6 +173,16 @@ class PanoramaRenderer(
      */
     fun setExternalViewMatrix(matrix: FloatArray?) {
         externalViewMatrix = matrix
+    }
+
+    /**
+     * Inyecta el bitmap del atlas. El upload real como textura OpenGL ocurre
+     * en el siguiente onDrawFrame (porque debe correr en el render thread).
+     * Puede llamarse desde cualquier thread.
+     */
+    fun setAtlasBitmap(bitmap: Bitmap) {
+        pendingBitmap = bitmap
+        bitmapUploaded = false
     }
 
     private fun updateProjection() {
