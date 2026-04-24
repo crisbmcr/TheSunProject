@@ -25,7 +25,12 @@ class PanoramaRenderer(
     private val atlasBitmap: Bitmap
 ) : GLSurfaceView.Renderer {
 
-    private val sphere = SphereMesh(slices = 60, stacks = 30)
+    private val sphere = SphereMesh(
+        slices = 60,
+        stacks = 30,
+        atlasMinAltitudeDeg = 0f,      // horizonte (fila inferior del atlas)
+        atlasMaxAltitudeDeg = 90f      // cenit (fila superior del atlas)
+    )
 
     private var program = 0
     private var aPositionLoc = -1

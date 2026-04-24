@@ -24,9 +24,34 @@ import kotlin.math.sin
  * Seam longitudinal: se duplica el meridiano inicial con un set de vértices adicional
  * en u=1.0 para evitar interpolación inversa de UV en el wrap.
  */
+/**
+ * Genera una esfera UV centrada en el origen, radio 1, con el polo norte en +Z (Up ENU).
+ *
+ * Parámetros nuevos:
+ *  - atlasMinAltitudeDeg: altitud cubierta por la FILA INFERIOR del atlas (v=1 en UV).
+ *  - atlasMaxAltitudeDeg: altitud cubierta por la FILA SUPERIOR del atlas (v=0 en UV).
+ *
+ * Por defecto asumimos el atlas de este proyecto: hemisferio superior (0° a 90°).
+ * La mitad inferior geométrica de la esfera (altitud < 0°) queda cubierta con el piso
+ * del atlas repetido/clampeado — no es dato real, por eso abajo se verá uniforme
+ * o con estiramiento. Esto es esperado: no capturamos el suelo.
+ *
+ * Convenciones:
+ *  - Stack 0 es el polo norte (+Z, cenit, altitud +90°).
+ *  - Stack N es el polo sur (-Z, nadir, altitud -90°).
+ *  - Slice 0 arranca apuntando a +Y (Norte ENU) y gira hacia +X (Este ENU).
+ *  - UV horizontal: u ∈ [0,1] recorre la longitud (0 = Norte, 0.25 = Este, 0.5 = Sur, 0.75 = Oeste).
+ *  - UV vertical: v se calcula proporcionalmente al rango real del atlas.
+ *    Si la altitud del vértice queda fuera del rango, clampea.
+ *
+ * Seam longitudinal: se duplica el meridiano inicial con un set de vértices adicional
+ * en u=1.0 para evitar interpolación inversa de UV en el wrap.
+ */
 class SphereMesh(
     private val slices: Int = 60,
-    private val stacks: Int = 30
+    private val stacks: Int = 30,
+    private val atlasMinAltitudeDeg: Float = 0f,
+    private val atlasMaxAltitudeDeg: Float = 90f
 ) {
     val vertexBuffer: FloatBuffer
     val texCoordBuffer: FloatBuffer
@@ -44,11 +69,21 @@ class SphereMesh(
         var vIdx = 0
         var tIdx = 0
 
+        val atlasAltRangeDeg = (atlasMaxAltitudeDeg - atlasMinAltitudeDeg).coerceAtLeast(1e-3f)
+
         for (stack in 0..stacks) {
-            val v = stack.toFloat() / stacks                  // 0 en polo norte, 1 en polo sur
-            val altitudeRad = (Math.PI / 2.0) - v * Math.PI   // +π/2 en cenit, -π/2 en nadir
+            val tStack = stack.toFloat() / stacks              // 0 en polo norte, 1 en polo sur
+            val altitudeRad = (Math.PI / 2.0) - tStack * Math.PI  // +π/2 en cenit, -π/2 en nadir
+            val altitudeDeg = Math.toDegrees(altitudeRad).toFloat()
             val cosAlt = cos(altitudeRad).toFloat()
             val sinAlt = sin(altitudeRad).toFloat()
+
+            // Mapeo de altitud geométrica del vértice → fila v del atlas.
+            // v=0 corresponde a atlasMaxAltitudeDeg, v=1 a atlasMinAltitudeDeg.
+            // Si el vértice está fuera del rango (ej: nadir cuando el atlas solo cubre
+            // el hemisferio superior), clampeamos a los bordes.
+            val v = ((atlasMaxAltitudeDeg - altitudeDeg) / atlasAltRangeDeg)
+                .coerceIn(0f, 1f)
 
             for (slice in 0..slices) {
                 val u = slice.toFloat() / slices              // 0 en Norte, 0.25 en Este...
