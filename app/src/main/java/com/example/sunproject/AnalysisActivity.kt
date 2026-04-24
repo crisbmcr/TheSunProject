@@ -22,11 +22,14 @@ import com.google.android.gms.location.LocationServices
 import java.io.File
 import java.time.Instant
 import java.time.ZoneId
+import android.content.Intent
+import android.widget.Button
 
 class AnalysisActivity : AppCompatActivity() {
 
     private lateinit var panoramaImageView: ImageView
     private lateinit var btnSolarChart: ToggleButton
+    private lateinit var btnOpen3d: Button
 
     private var baseBitmap: Bitmap? = null
     private var overlayBitmap: Bitmap? = null
@@ -39,6 +42,7 @@ class AnalysisActivity : AppCompatActivity() {
 
         panoramaImageView = findViewById(R.id.panoramaImageView)
         btnSolarChart = findViewById(R.id.btnSolarChart)
+        btnOpen3d = findViewById(R.id.btnOpen3d)
 
         atlasPath = intent.getStringExtra("panorama_path")
         if (atlasPath == null) {
@@ -58,6 +62,17 @@ class AnalysisActivity : AppCompatActivity() {
 
         btnSolarChart.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked) renderWithOverlay() else renderBase()
+        }
+        btnOpen3d.setOnClickListener {
+            val path = atlasPath
+            if (path.isNullOrBlank() || !File(path).exists()) {
+                Toast.makeText(this, "No hay atlas para visualizar en 3D", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val intent = Intent(this, PanoramaViewActivity::class.java).apply {
+                putExtra(PanoramaViewActivity.EXTRA_PANORAMA_PATH, path)
+            }
+            startActivity(intent)
         }
     }
 

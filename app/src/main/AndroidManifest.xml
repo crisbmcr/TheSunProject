@@ -50,6 +50,5 @@
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@style/Theme.AppCompat.NoActionBar" />
     </application>
-    </application>
 
 </manifest>

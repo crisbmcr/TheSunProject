@@ -31,4 +31,13 @@
         android:layout_centerInParent="true"
         android:visibility="gone" />
 
+    <Button
+        android:id="@+id/btnOpen3d"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_alignParentBottom="true"
+        android:layout_alignParentEnd="true"
+        android:layout_margin="16dp"
+        android:text="Ver en 3D" />
+
 </RelativeLayout>
