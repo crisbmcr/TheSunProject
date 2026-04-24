@@ -85,9 +85,7 @@ class PanoramaRenderer(
         // Para skybox visto desde adentro: el winding del SphereMesh está armado
         // para que los triángulos sean CCW desde el centro. Culleamos los que son CW
         // (las "caras externas" de la esfera).
-        GLES20.glEnable(GLES20.GL_CULL_FACE)
-        GLES20.glCullFace(GLES20.GL_BACK)
-        GLES20.glFrontFace(GLES20.GL_CCW)
+        GLES20.glDisable(GLES20.GL_CULL_FACE)
 
         program = buildProgram(vertexShaderSource, fragmentShaderSource)
         aPositionLoc = GLES20.glGetAttribLocation(program, "aPosition")
@@ -151,24 +149,25 @@ class PanoramaRenderer(
 
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+    }
 
-        /**
-         * Inyecta una viewMatrix externa (típicamente desde un CameraController).
-         * Pasar null para volver al fallback estático.
-         */
-        fun setExternalViewMatrix(matrix: FloatArray?) {
-            externalViewMatrix = matrix
-        }
+    /**
+     * Inyecta una viewMatrix externa (típicamente desde un CameraController).
+     * Pasar null para volver al fallback estático.
+     */
+    fun setExternalViewMatrix(matrix: FloatArray?) {
+        externalViewMatrix = matrix
     }
 
     private fun updateProjection() {
         val aspect = viewportWidth.toFloat() / viewportHeight.toFloat()
         val fovRad = Math.toRadians(fovDegrees.toDouble())
-        val top = (Math.tan(fovRad / 2.0) * 0.1).toFloat()
+        val near = 0.01f
+        val far = 100f
+        val top = (Math.tan(fovRad / 2.0) * near).toFloat()
         val right = top * aspect
-        Matrix.frustumM(projectionMatrix, 0, -right, right, -top, top, 0.1f, 10f)
+        Matrix.frustumM(projectionMatrix, 0, -right, right, -top, top, near, far)
     }
-
     private fun uploadTexture(bitmap: Bitmap): Int {
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
