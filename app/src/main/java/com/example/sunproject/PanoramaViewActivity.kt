@@ -87,11 +87,12 @@ class PanoramaViewActivity : AppCompatActivity() {
             glView.setRenderer(newRenderer)
             glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
 
-// 4. Arrancar el listener del sensor si la Activity ya está en estado Resumed
-//    (caso típico: la carga del bitmap fue rápida). Si no, onResume lo arrancará.
-            if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
-                newController.start()
-            }
+
+            // 4. Arrancar el listener del sensor. Lo hacemos incondicional porque:
+//    - Si onResume ya pasó (flujo típico), gyroController era null entonces y
+//      el ?.start() de onResume fue no-op. Tenemos que arrancarlo ahora.
+//    - Si onResume todavía no pasó, registerListener es idempotente y no hay problema.
+            newController.start()
 
 // Actualizar HUD con info extra.
             val correctionStr = if (yawCorrectionDeg != 0f) {

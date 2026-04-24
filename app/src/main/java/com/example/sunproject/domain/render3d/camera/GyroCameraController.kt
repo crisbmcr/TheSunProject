@@ -8,6 +8,7 @@ import android.opengl.Matrix
 import android.util.Log
 
 private const val TAG = "GyroCameraController"
+private var frameLogCount = 0
 
 /**
  * Controller de cámara para la vista 3D que usa el giroscopio del dispositivo
@@ -89,22 +90,28 @@ class GyroCameraController(
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_ROTATION_VECTOR) return
 
-        // 1. Sensor → R_world_from_device (4x4, lo que dice Android).
+        // 1. Leer matriz del sensor. Android la llama "R", y por convención aceptada
+//    es la que transforma vectores del mundo al frame cámara del dispositivo
+//    (cuando se usa en combinación con la proyección estándar de OpenGL).
+//    Esto es empírico: si probamos "transpose" la imagen se invierte mal, así
+//    que la matriz del sensor directa ES la viewMatrix que OpenGL espera.
         SensorManager.getRotationMatrixFromVector(rotationMatrixWorldFromDevice, event.values)
 
-        // 2. Transponer para pasar de "mapea device → world" a "mapea world → device".
-        //    Como el frame cámara de OpenGL coincide con el frame device de Android,
-        //    esa misma matriz es nuestro viewMatrix base.
-        Matrix.transposeM(rotationMatrixDeviceFromWorld, 0, rotationMatrixWorldFromDevice, 0)
-
-        // 3. Aplicar corrección de yaw (Fase 3): rotar el mundo alrededor de Z antes
-        //    de pasarlo al frame cámara. En forma matricial:
-        //      viewMatrix = R_device_from_world · R_yawCorrection
+// 2. Aplicar corrección de yaw (Fase 3) pre-multiplicando la matriz del sensor
+//    por la rotación alrededor de Z. Importante: el orden importa. Pre-multiplicar
+//    equivale a "rotar el mundo antes de que llegue a la cámara".
+//      viewMatrix = R_sensor · R_yawCorrection
         Matrix.multiplyMM(
             viewMatrix, 0,
-            rotationMatrixDeviceFromWorld, 0,
+            rotationMatrixWorldFromDevice, 0,   // <-- usa la matriz SIN transponer
             yawCorrectionMatrix, 0
         )
+
+// Log útil para diagnóstico — cada ~30 frames para no saturar logcat.
+        frameLogCount++
+        if (frameLogCount % 30 == 0) {
+            logSensorDiagnostic(event.values)
+        }
 
         hasValidReading = true
     }
@@ -112,5 +119,24 @@ class GyroCameraController(
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         // No nos preocupamos por accuracy en v1. El fix de Fase 3 ya promedia y descarta
         // lecturas con mucho spread, así que el yawCorrection incoming ya pasó un filtro.
+    }
+    private fun logSensorDiagnostic(rotationVectorValues: FloatArray) {
+        // Extraer azimuth / pitch / roll en grados para log de lectura fácil.
+        // IMPORTANT: esto es solo diagnóstico, no se usa en el render.
+        val tmpR = FloatArray(9)  // 3x3 para getOrientation
+        val values4 = if (rotationVectorValues.size >= 4) rotationVectorValues else floatArrayOf(
+            rotationVectorValues.getOrElse(0) { 0f },
+            rotationVectorValues.getOrElse(1) { 0f },
+            rotationVectorValues.getOrElse(2) { 0f },
+            0f
+        )
+        SensorManager.getRotationMatrixFromVector(tmpR, values4)
+        val orientation = FloatArray(3)
+        SensorManager.getOrientation(tmpR, orientation)
+        val azDeg = Math.toDegrees(orientation[0].toDouble()).toFloat()
+        val pitchDeg = Math.toDegrees(orientation[1].toDouble()).toFloat()
+        val rollDeg = Math.toDegrees(orientation[2].toDouble()).toFloat()
+        Log.d(TAG, "sensor az=%.1f° pitch=%.1f° roll=%.1f° yawCorrection=%.2f°"
+            .format(azDeg, pitchDeg, rollDeg, yawCorrectionDeg))
     }
 }
