@@ -86,8 +86,10 @@ class SphereMesh(
                 .coerceIn(0f, 1f)
 
             for (slice in 0..slices) {
-                val u = slice.toFloat() / slices              // 0 en Norte, 0.25 en Este...
-                val azimuthRad = u * 2.0 * Math.PI            // azimut CW desde Norte
+                val u = slice.toFloat() / slices
+// Atlas: columna 0 = Sur, columna media = Norte, columna N-1 = Sur (wrap).
+// Para que la geometría quede alineada, el slice 0 apunta al Sur.
+                val azimuthRad = (u * 2.0 * Math.PI) - Math.PI
                 val cosAz = cos(azimuthRad).toFloat()
                 val sinAz = sin(azimuthRad).toFloat()
 

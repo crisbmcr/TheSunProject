@@ -46,6 +46,12 @@ class PanoramaRenderer(
     private val mvpMatrix = FloatArray(16)
     private val tempMatrix = FloatArray(16)
 
+    // Matrix externa (inyectada desde un CameraController). Si se setea, sobreescribe
+// el setLookAtM estático del onDrawFrame. Acceso @Volatile porque se escribe desde
+// un thread del sensor y se lee desde el render thread.
+    @Volatile
+    private var externalViewMatrix: FloatArray? = null
+
     private var viewportWidth = 1
     private var viewportHeight = 1
     private var fovDegrees = 75f
@@ -108,13 +114,20 @@ class PanoramaRenderer(
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
 
-        // Cámara estática v1: parada en el origen, mirando al Norte (+Y), Up = +Z.
-        // eyeX,Y,Z = 0,0,0 | centerX,Y,Z = 0,1,0 | upX,Y,Z = 0,0,1
-        Matrix.setLookAtM(viewMatrix, 0,
-            0f, 0f, 0f,     // eye
-            0f, 1f, 0f,     // center (Norte)
-            0f, 0f, 1f      // up (cenit)
-        )
+        // Si hay un controller que inyectó una viewMatrix, la usamos. Si no, fallback
+        // a cámara estática mirando al Norte (como v1).
+        val currentView = externalViewMatrix
+        if (currentView != null) {
+            // Copiamos a viewMatrix local porque el controller puede seguir escribiendo
+            // en paralelo. Una copia de 16 floats es trivial.
+            System.arraycopy(currentView, 0, viewMatrix, 0, 16)
+        } else {
+            Matrix.setLookAtM(viewMatrix, 0,
+                0f, 0f, 0f,     // eye
+                0f, 1f, 0f,     // center (Norte)
+                0f, 0f, 1f      // up (cenit)
+            )
+        }
 
         // MVP = projection * view * model
         Matrix.multiplyMM(tempMatrix, 0, viewMatrix, 0, modelMatrix, 0)
@@ -138,6 +151,14 @@ class PanoramaRenderer(
 
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+
+        /**
+         * Inyecta una viewMatrix externa (típicamente desde un CameraController).
+         * Pasar null para volver al fallback estático.
+         */
+        fun setExternalViewMatrix(matrix: FloatArray?) {
+            externalViewMatrix = matrix
+        }
     }
 
     private fun updateProjection() {

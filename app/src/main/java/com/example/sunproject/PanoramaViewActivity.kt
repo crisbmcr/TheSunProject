@@ -1,13 +1,17 @@
 package com.example.sunproject
 
+import android.content.Context
 import android.graphics.BitmapFactory
+import android.hardware.SensorManager
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.util.Log
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.example.sunproject.domain.atlas.AtlasProjector
 import com.example.sunproject.domain.render3d.PanoramaRenderer
+import com.example.sunproject.domain.render3d.camera.GyroCameraController
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -25,6 +29,7 @@ class PanoramaViewActivity : AppCompatActivity() {
     private lateinit var glView: GLSurfaceView
     private lateinit var hudText: TextView
     private var renderer: PanoramaRenderer? = null
+    private var gyroController: GyroCameraController? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,20 +67,52 @@ class PanoramaViewActivity : AppCompatActivity() {
             hudText.text = "Panorama 3D — ${bitmap.width}x${bitmap.height}\n" +
                     "v1: cámara fija mirando al Norte"
 
-            renderer = PanoramaRenderer(bitmap).also {
-                glView.setRenderer(it)
-                glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+            // 1. Obtener la corrección de yaw de Fase 3 si está disponible.
+//    Si no hay corrección (sesión sin GPS, o spread alto), devuelve 0f
+//    y la cámara queda en gyro-N puro — consistente con el fallback del atlas.
+            val yawCorrectionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
+            Log.i(TAG, "Corrección yaw Fase 3: $yawCorrectionDeg°")
+
+// 2. Crear el renderer y el controller.
+            val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+            val newRenderer = PanoramaRenderer(bitmap)
+            val newController = GyroCameraController(sensorManager, yawCorrectionDeg)
+
+// 3. Conectar: el renderer lee la viewMatrix del controller en cada frame.
+            newRenderer.setExternalViewMatrix(newController.currentViewMatrix())
+
+            renderer = newRenderer
+            gyroController = newController
+
+            glView.setRenderer(newRenderer)
+            glView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+
+// 4. Arrancar el listener del sensor si la Activity ya está en estado Resumed
+//    (caso típico: la carga del bitmap fue rápida). Si no, onResume lo arrancará.
+            if (lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+                newController.start()
             }
+
+// Actualizar HUD con info extra.
+            val correctionStr = if (yawCorrectionDeg != 0f) {
+                "yaw fix: %.2f°".format(yawCorrectionDeg)
+            } else {
+                "gyro-N puro (sin fix)"
+            }
+            hudText.text = "Panorama 3D — ${bitmap.width}x${bitmap.height}\n" +
+                    "modo: giroscopio  |  $correctionStr"
         }
     }
 
     override fun onResume() {
         super.onResume()
         if (renderer != null) glView.onResume()
+        gyroController?.start()
     }
 
     override fun onPause() {
         super.onPause()
+        gyroController?.stop()
         if (renderer != null) glView.onPause()
     }
 }
