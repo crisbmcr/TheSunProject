@@ -100,18 +100,7 @@ private const val ZENITH_ERP_FADE_START_ALT_DEG = 74f
 private const val ZENITH_ERP_FADE_FULL_ALT_DEG = 82f
 private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 
-private var cachedGyroToTrueNorthCorrectionDeg: Float? = null
 
-/**
- * Corrección entre el gyro-North del atlas (measuredAzimuthDeg anclado al
- * inicio de la sesión) y el true-North. Se setea una vez por sesión al
- * proyectar frames. Incluye la declinación magnética del lugar porque
- * absAzimuthDeg ya pasó por applyDeclination en CaptureActivity.
- *
- * ZenithMatrixProjector la consulta para rotar el rayo mundo y mantener
- * alineado el Z0 con H0/H45.
- */
-fun gyroToTrueNorthCorrectionDeg(): Float = cachedGyroToTrueNorthCorrectionDeg ?: 0f
 
 private data class RgbGain(
     val r: Float,
@@ -156,6 +145,16 @@ private data class CameraMountBasis(
 )
 
 object AtlasProjector {
+    private var cachedGyroToTrueNorthCorrectionDeg: Float? = null
+
+    /**
+     * Corrección entre el gyro-North del atlas y el true-North.
+     * Incluye declinación magnética (vía applyDeclination en CaptureActivity)
+     * y ruido del anchor gyro inicial. Se setea una vez por sesión en
+     * projectFramesToAtlas. ZenithMatrixProjector la consulta para
+     * rotar el rayo mundo y mantener Z0 alineado con H0/H45.
+     */
+    fun gyroToTrueNorthCorrectionDeg(): Float = cachedGyroToTrueNorthCorrectionDeg ?: 0f
 
     fun approximateFootprint(frame: FrameRecord): FrameFootprint {
         val hfov = (frame.hfovDeg ?: 65f).coerceIn(1f, 179f)
@@ -282,17 +281,18 @@ object AtlasProjector {
     }
     private fun baseYawDeg(frame: FrameRecord): Float {
         val correctionDeg = cachedGyroToTrueNorthCorrectionDeg ?: 0f
-
+        // Para H0/H45: gyro + correción = true-N
+        // Para Z0: absAzimuthDeg (si existe) ya lleva declinación por applyDeclination;
+        //         si cae al fallback measuredAzimuthDeg, sumamos la corrección.
         val baseDeg = if (frame.ringId.equals("Z0", ignoreCase = true)) {
-            // Z0 usa la matriz directamente vía ZenithMatrixProjector.
-            // Este path sólo se usa en el fallback (approximateFootprint).
             frame.absAzimuthDeg ?: (frame.measuredAzimuthDeg + correctionDeg)
         } else {
             frame.measuredAzimuthDeg + correctionDeg
         }
-
         return normalizeTwistDeg(baseDeg)
     }
+
+
     private fun basePitchDeg(frame: FrameRecord): Float {
         return frame.absPitchDeg ?: frame.measuredPitchDeg
     }
@@ -902,11 +902,12 @@ object AtlasProjector {
         val nonZenithFrames = ordered.filterNot { isZenithFrame(it) }
         val zenithFrames = ordered.filter { isZenithFrame(it) }
 
+// FIX DECLINACIÓN: calcular corrección gyro→true-N para esta sesión
         cachedGyroToTrueNorthCorrectionDeg = computeGyroToTrueNorthCorrection(nonZenithFrames)
         Log.i(
             "AtlasDeclCorrection",
-            "correction=${cachedGyroToTrueNorthCorrectionDeg?.let { "%.2f".format(it) } ?: "null"}°" +
-                    " (positivo = rotar atlas al este para llegar a true-N)"
+            "correction=${cachedGyroToTrueNorthCorrectionDeg?.let { "%.2f".format(it) } ?: "null"}° " +
+                    "(positivo = rotar atlas al este para llegar a true-N)"
         )
 
         val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
@@ -2257,30 +2258,74 @@ object AtlasProjector {
     }
 
     /**
-     * Calcula el offset entre el gyro-North del atlas y el true-North,
-     * usando el primer frame no-zenital con absAzimuthDeg disponible.
-     * absAzimuthDeg ya lleva aplicada la declinación magnética (ver
-     * CaptureActivity.applyDeclination), por lo que la resta captura
-     * el total (declinación + ruido del anchor gyro).
+     * Calcula el offset gyro-N → true-N promediando TODOS los frames no-zenitales
+     * con absAzimuthDeg disponible. Usa mean angular con sin/cos para manejar el
+     * wrap-around en 360°. Descarta la corrección si la dispersión entre frames
+     * es alta (indicador de magnetómetro mal calibrado).
      *
-     * Retorna null si no hay ningún frame con absAzimuthDeg (típicamente:
-     * GPS nunca entregó ubicación durante la captura). En ese caso el atlas
-     * queda en gyro-North, mismo comportamiento que antes del fix.
+     * Retorna null si:
+     *   - no hay ningún frame con absAzimuthDeg (GPS nunca disponible), o
+     *   - la dispersión angular entre frames supera MAX_SPREAD_DEG (mag errático)
+     *
+     * En esos casos el atlas queda en gyro-N (comportamiento pre-fix).
      */
     private fun computeGyroToTrueNorthCorrection(frames: List<FrameRecord>): Float? {
-        val ref = frames.firstOrNull { it.absAzimuthDeg != null } ?: return null
-        val absYaw = ref.absAzimuthDeg ?: return null
-        val gyroYaw = ref.measuredAzimuthDeg
+        // Umbral máximo de desviación angular aceptable entre frames.
+        // Cauchari típico: deltas -6° a -11° (spread ~5°).
+        // Magnetómetro errático: deltas -5° a -47° (spread ~40°).
+        // Un umbral de 15° separa claramente los dos casos.
+        val MAX_SPREAD_DEG = 15f
 
-        var delta = absYaw - gyroYaw
-        while (delta > 180f) delta -= 360f
-        while (delta <= -180f) delta += 360f
+        val validFrames = frames.filter { it.absAzimuthDeg != null }
+        if (validFrames.isEmpty()) {
+            Log.w("AtlasDeclCorrection", "skip: sin frames con absAzimuthDeg (GPS no disponible)")
+            return null
+        }
+
+        // Calcular delta por frame, wrap a [-180°, +180°].
+        val deltas = validFrames.map { f ->
+            var d = (f.absAzimuthDeg ?: 0f) - f.measuredAzimuthDeg
+            while (d > 180f) d -= 360f
+            while (d <= -180f) d += 360f
+            d
+        }
+
+        // Promedio angular via vector unitario (correcto cerca del wrap).
+        var sumX = 0.0
+        var sumY = 0.0
+        deltas.forEach { d ->
+            val r = Math.toRadians(d.toDouble())
+            sumX += kotlin.math.cos(r)
+            sumY += kotlin.math.sin(r)
+        }
+        val meanRad = kotlin.math.atan2(sumY, sumX)
+        val meanDeg = Math.toDegrees(meanRad).toFloat()
+
+        // Dispersión: distancia angular máxima al promedio.
+        val spreadDeg = deltas.maxOf { d ->
+            var diff = d - meanDeg
+            while (diff > 180f) diff -= 360f
+            while (diff <= -180f) diff += 360f
+            kotlin.math.abs(diff)
+        }
 
         Log.d(
             "AtlasDeclCorrection",
-            "refFrame=${ref.frameId} absYaw=${"%.2f".format(absYaw)} " +
-                    "gyroYaw=${"%.2f".format(gyroYaw)} delta=${"%.2f".format(delta)}"
+            "samples=${validFrames.size} mean=${"%.2f".format(meanDeg)}° " +
+                    "spread=${"%.2f".format(spreadDeg)}° deltas=" +
+                    deltas.joinToString(prefix = "[", postfix = "]") { "%.1f".format(it) }
         )
-        return delta
+
+        if (spreadDeg > MAX_SPREAD_DEG) {
+            Log.w(
+                "AtlasDeclCorrection",
+                "REJECT correction: spread=${"%.2f".format(spreadDeg)}° " +
+                        "> threshold=${MAX_SPREAD_DEG}°. Magnetómetro inestable. " +
+                        "Atlas quedará en gyro-N (sin fix). Recalibrar magnetómetro antes de próxima captura."
+            )
+            return null
+        }
+
+        return meanDeg
     }
 }

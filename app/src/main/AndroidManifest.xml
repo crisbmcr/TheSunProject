@@ -43,6 +43,13 @@
         <activity
             android:name=".AnalysisActivity"
             android:theme="@style/Theme.AppCompat.NoActionBar" />
+        <!-- Visor 3D navegable del atlas -->
+        <activity
+            android:name=".PanoramaViewActivity"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
+    </application>
     </application>
 
 </manifest>

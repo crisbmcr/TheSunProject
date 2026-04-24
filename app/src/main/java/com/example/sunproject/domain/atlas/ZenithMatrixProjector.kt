@@ -97,9 +97,16 @@ object ZenithMatrixProjector {
         val lutRow = FloatArray(w * 2)
         val maskRow = ByteArray(w)
         var validCount = 0
+        // FIX DECLINACIÓN: precalcular rotación en azimut para alinear con true-N
         val correctionRad = Math.toRadians(yawCorrectionDeg.toDouble()).toFloat()
         val cosCorr = cos(correctionRad)
         val sinCorr = sin(correctionRad)
+
+        Log.d(
+            "ZenithMatrix",
+            "buildEquirectLut yawCorrection=${"%.2f".format(yawCorrectionDeg)}° " +
+                    "srcW=$srcW srcH=$srcH displayRotation=$displayRotation"
+        )
         for (y in 0 until h) {
             val altRad = Math.toRadians(
                 AtlasMath.yToAltitude(y, atlas.config).toDouble()
@@ -109,18 +116,13 @@ object ZenithMatrixProjector {
 
             for (x in 0 until w) {
                 // Rayo d_world en ENU (azimut CW desde el Norte).
+                // Rayo d_world en ENU (azimut CW desde Norte).
                 val dwxRaw = cosAlt * sinAz[x]
                 val dwyRaw = cosAlt * cosAz[x]
                 val dwz = sinAlt
 
-// Rotación en azimut para matchear true-North. Preserva altitud
-// porque es una rotación alrededor del eje Z.
-//
-// Azimut CW desde Norte: si yawCorrection > 0, el "Norte del atlas"
-// está yawCorrection° al este del true-North. Al consultar el píxel
-// del atlas en azimut A (true-N), queremos leerlo en (A - correction)
-// del gyro-N. Equivalente: rotar el rayo d_world por -correction
-// antes de aplicarle M^T.
+// FIX DECLINACIÓN: rotar el rayo por -yawCorrection alrededor del eje Z
+// para que coincida con H0/H45. Preserva altitud.
                 val dwx =  dwxRaw * cosCorr + dwyRaw * sinCorr
                 val dwy = -dwxRaw * sinCorr + dwyRaw * cosCorr
 
@@ -205,6 +207,11 @@ object ZenithMatrixProjector {
         val srcH = src.height
 
         val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
+        Log.d(
+            "ZenithMatrix",
+            "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}°"
+        )
+
         val (lut, mask) = buildEquirectLut(
             rWorldDevice = rWorldDevice,
             hfovDeg = hfov,
