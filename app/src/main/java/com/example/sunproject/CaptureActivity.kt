@@ -94,11 +94,35 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var lastStablePreZenithAbsYawDeg: Float? = null
     private var lastStablePreZenithUpdateMs: Long = 0L
 
+    // ============================================================
+    // Z0 GRAV+MAG MATRIX BUFFERS (Fase 5)
+    // ============================================================
+    // Ring buffers de los últimos N samples de gravedad y campo
+    // magnético crudo. En el momento del disparo del Z0 se promedian
+    // los componentes (vectores, no ángulos) y se llama
+    // SensorManager.getRotationMatrix() para construir la matriz de
+    // orientación absoluta sin pasar por TYPE_ROTATION_VECTOR.
+    //
+    // Tamaño 30 a SENSOR_DELAY_GAME ≈ 150-600ms de ventana. Suficiente
+    // para suavizar el ruido del magnetómetro (~1-3° jitter típico).
+    private val gravityBufferX = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private val gravityBufferY = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private val gravityBufferZ = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private var gravityBufferIndex = 0
+    private var gravityBufferFilled = false
+
+    private val magVecBufferX = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private val magVecBufferY = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private val magVecBufferZ = FloatArray(Z0_MATRIX_BUFFER_SIZE)
+    private var magVecBufferIndex = 0
+    private var magVecBufferFilled = false
+
     //private val alpha = 0.08f
     //private var isFirstReading = true
     private data class Vec3(var x: Float, var y: Float, var z: Float)
     private var gameRotationVectorSensor: Sensor? = null
     private var magneticFieldSensor: Sensor? = null
+    private var gravitySensor: Sensor? = null
 
     private var magneticAccuracy: Int = SensorManager.SENSOR_STATUS_UNRELIABLE
     private var magneticFieldNormUt: Float = 0f
@@ -252,6 +276,32 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val zenithAssistEnterDeg = 70f
 
     private val zenithAssistExitDeg = 64f
+
+    // ============================================================
+    // Z0 MATRIX SOURCE FLAG (Fase 5)
+    // ============================================================
+    // Si está en true, la matriz 3x3 R_world←device del Z0 se construye
+    // vía SensorManager.getRotationMatrix(R, null, gravity, magnetic) en
+    // el momento del disparo, en vez de copiarla de TYPE_ROTATION_VECTOR.
+    //
+    // Por qué: TYPE_ROTATION_VECTOR es composite (accel+mag+gyro vía
+    // Kalman). Entre la última H45 y el Z0, el yaw integrado por gyro
+    // acumula deriva. La matriz construida desde gravity+mag es
+    // self-contained, no depende de frames anteriores ni del estado
+    // del filtro, y cerca del cenit no degenera porque NO calcula yaw
+    // por atan2 sobre Euler — usa los dos vectores de referencia
+    // (down + heading horizontal) para construir la base ortonormal
+    // directa (TRIAD / Wahba 2-vectores).
+    //
+    // Si la lectura falla validación (magAccuracy bajo, norma de
+    // gravedad anómala, etc.) hay fallback automático a la matriz vieja.
+    //
+    // Poner false para A/B contra el comportamiento previo sin tocar
+    // más código.
+    private val USE_GRAV_MAG_Z0_MATRIX = true
+
+    private val Z0_MATRIX_BUFFER_SIZE = 30
+    private val Z0_MATRIX_MIN_SAMPLES = 15
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
@@ -318,6 +368,13 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         rotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
         gameRotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
         magneticFieldSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
+        gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+        Log.i(
+            "Z0MatrixGravMag",
+            "init flag=$USE_GRAV_MAG_Z0_MATRIX " +
+                    "gravitySensor=${gravitySensor != null} " +
+                    "magSensor=${magneticFieldSensor != null}"
+        )
         btnCapture.setOnClickListener { takePhotoManual() }
 
         // Long-press para FORZAR stitch con 2+ fotos (debug)
@@ -375,6 +432,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         magneticFieldSensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+
+        gravitySensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
 
@@ -450,6 +511,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 val y = event.values[1]
                 val z = event.values[2]
                 magneticFieldNormUt = sqrt(x * x + y * y + z * z)
+
+                // Push crudo (x,y,z) al ring buffer para construir la
+                // matriz de orientación del Z0 (Fase 5). Promedio de
+                // vectores, no de ángulos: lineal y sin singularidades.
+                magVecBufferX[magVecBufferIndex] = x
+                magVecBufferY[magVecBufferIndex] = y
+                magVecBufferZ[magVecBufferIndex] = z
+                magVecBufferIndex = (magVecBufferIndex + 1) % Z0_MATRIX_BUFFER_SIZE
+                if (magVecBufferIndex == 0) magVecBufferFilled = true
             }
 
             Sensor.TYPE_ROTATION_VECTOR -> {
@@ -527,6 +597,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     checkAutoCapture()
 
                 }
+            }
+
+            Sensor.TYPE_GRAVITY -> {
+                // Vector gravedad pre-filtrado por Android (descontada
+                // la aceleración lineal). Norma esperada ≈ 9.81 m/s²
+                // cuando el celular está quieto. Push directo al buffer.
+                gravityBufferX[gravityBufferIndex] = event.values[0]
+                gravityBufferY[gravityBufferIndex] = event.values[1]
+                gravityBufferZ[gravityBufferIndex] = event.values[2]
+                gravityBufferIndex = (gravityBufferIndex + 1) % Z0_MATRIX_BUFFER_SIZE
+                if (gravityBufferIndex == 0) gravityBufferFilled = true
             }
 
             Sensor.TYPE_GAME_ROTATION_VECTOR -> {
@@ -931,6 +1012,37 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             )
         }
 
+        // Matriz de rotación a persistir. Por defecto la del
+        // TYPE_ROTATION_VECTOR (lastAbsRotationMatrix). Para el Z0,
+        // si el flag está activo, intentamos construir una matriz
+        // self-contained desde gravity+mag. Si la validación falla
+        // (magAccuracy bajo, norma anómala, etc.) caemos al fallback
+        // sin perder nada.
+        val gravMagMatrix: FloatArray? =
+            if (isZenithCapture && USE_GRAV_MAG_Z0_MATRIX) {
+                computeGravMagZenithMatrix()
+            } else {
+                null
+            }
+
+        val matrixForFrame: FloatArray? = when {
+            gravMagMatrix != null -> gravMagMatrix
+            hasLastAbsRotationMatrix -> lastAbsRotationMatrix
+            else -> null
+        }
+
+        if (isZenithCapture) {
+            val matrixSource = when {
+                gravMagMatrix != null -> "GRAV_MAG"
+                hasLastAbsRotationMatrix -> "ROTATION_VECTOR_FALLBACK"
+                else -> "NONE"
+            }
+            Log.i(
+                "Z0MatrixGravMag",
+                "Z0 capture MATRIX_SOURCE=$matrixSource flag=$USE_GRAV_MAG_Z0_MATRIX"
+            )
+        }
+
         val frozenPose = CapturedPose(
 
             azimuthDeg = displayAzimuth,
@@ -943,23 +1055,23 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             absPitchDeg = absPitchForFrame,
             absRollDeg = absRollForFrame,
 
-            rotationM00 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[0] else null,
+            rotationM00 = matrixForFrame?.get(0),
 
-            rotationM01 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[1] else null,
+            rotationM01 = matrixForFrame?.get(1),
 
-            rotationM02 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[2] else null,
+            rotationM02 = matrixForFrame?.get(2),
 
-            rotationM10 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[3] else null,
+            rotationM10 = matrixForFrame?.get(3),
 
-            rotationM11 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[4] else null,
+            rotationM11 = matrixForFrame?.get(4),
 
-            rotationM12 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[5] else null,
+            rotationM12 = matrixForFrame?.get(5),
 
-            rotationM20 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[6] else null,
+            rotationM20 = matrixForFrame?.get(6),
 
-            rotationM21 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[7] else null,
+            rotationM21 = matrixForFrame?.get(7),
 
-            rotationM22 = if (hasLastAbsRotationMatrix) lastAbsRotationMatrix[8] else null,
+            rotationM22 = matrixForFrame?.get(8),
 
             capturedAtUtcMs = System.currentTimeMillis()
         )
@@ -1818,6 +1930,135 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         return Triple(avgYaw, avgPitch, avgRoll)
     }
+
+    /**
+     * Construye la matriz de rotación R_world←device del Z0 a partir
+     * de los buffers de gravedad y campo magnético, sin pasar por
+     * TYPE_ROTATION_VECTOR.
+     *
+     * Pipeline:
+     *   1. Promediar los componentes (x,y,z) de gravedad y mag sobre
+     *      los últimos N samples (linear, no circular — son vectores).
+     *   2. Validar magneticAccuracy ≥ MEDIUM.
+     *   3. Validar norma de gravedad ≈ 9.81 (celular quieto).
+     *   4. Validar norma magnética en rango razonable (20-80 µT).
+     *   5. Llamar SensorManager.getRotationMatrix(R, null, grav, mag).
+     *      Esa API construye R via TRIAD/Wahba sobre los dos vectores
+     *      de referencia, sin filtros ni Euler. No tiene gimbal lock
+     *      cerca del cenit.
+     *
+     * Devuelve los 9 floats row-major de R, o null si la lectura falla
+     * cualquier validación. En ese caso el caller debe hacer fallback
+     * a la matriz de TYPE_ROTATION_VECTOR (lastAbsRotationMatrix).
+     */
+    private fun computeGravMagZenithMatrix(): FloatArray? {
+        val gravCount =
+            if (gravityBufferFilled) Z0_MATRIX_BUFFER_SIZE else gravityBufferIndex
+        val magCount =
+            if (magVecBufferFilled) Z0_MATRIX_BUFFER_SIZE else magVecBufferIndex
+
+        if (gravCount < Z0_MATRIX_MIN_SAMPLES || magCount < Z0_MATRIX_MIN_SAMPLES) {
+            Log.w(
+                "Z0MatrixGravMag",
+                "REJECT not enough samples gravCount=$gravCount magCount=$magCount " +
+                        "(min=$Z0_MATRIX_MIN_SAMPLES)"
+            )
+            return null
+        }
+
+        // Promedio lineal de cada componente. Es correcto porque son
+        // vectores físicos, no ángulos — no hay wrap a 360°.
+        var sumGx = 0.0; var sumGy = 0.0; var sumGz = 0.0
+        for (i in 0 until gravCount) {
+            sumGx += gravityBufferX[i]
+            sumGy += gravityBufferY[i]
+            sumGz += gravityBufferZ[i]
+        }
+        val gx = (sumGx / gravCount).toFloat()
+        val gy = (sumGy / gravCount).toFloat()
+        val gz = (sumGz / gravCount).toFloat()
+
+        var sumMx = 0.0; var sumMy = 0.0; var sumMz = 0.0
+        for (i in 0 until magCount) {
+            sumMx += magVecBufferX[i]
+            sumMy += magVecBufferY[i]
+            sumMz += magVecBufferZ[i]
+        }
+        val mx = (sumMx / magCount).toFloat()
+        val my = (sumMy / magCount).toFloat()
+        val mz = (sumMz / magCount).toFloat()
+
+        val gravNorm = sqrt(gx * gx + gy * gy + gz * gz)
+        val magNorm = sqrt(mx * mx + my * my + mz * mz)
+
+        // Validación 1: magneticAccuracy. SENSOR_STATUS_ACCURACY_MEDIUM
+        // o superior. Lo mismo que headingReliable() en el resto del
+        // código.
+        if (magneticAccuracy < SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM) {
+            Log.w(
+                "Z0MatrixGravMag",
+                "REJECT magAccuracy too low: $magneticAccuracy " +
+                        "(need ≥ ${SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM})"
+            )
+            return null
+        }
+
+        // Validación 2: norma de gravedad. Si el celular está quieto,
+        // |g| ≈ 9.81 m/s². Una desviación >0.5 m/s² indica movimiento
+        // de mano o aceleración lineal residual — TYPE_GRAVITY no
+        // descuenta del todo el shake.
+        if (kotlin.math.abs(gravNorm - 9.81f) > 0.5f) {
+            Log.w(
+                "Z0MatrixGravMag",
+                "REJECT gravNorm anomalous: ${"%.3f".format(gravNorm)} (expected ≈9.81)"
+            )
+            return null
+        }
+
+        // Validación 3: norma magnética. El campo terrestre va de ~25
+        // a ~65 µT. Fuera de [20, 80] indica interferencia ferromagnética
+        // local fuerte o magnetómetro descalibrado.
+        if (magNorm < 20f || magNorm > 80f) {
+            Log.w(
+                "Z0MatrixGravMag",
+                "REJECT magNorm out of range: ${"%.1f".format(magNorm)}uT"
+            )
+            return null
+        }
+
+        // Llamada canónica: TRIAD / Wahba 2-vectores via API legacy de
+        // Android. Devuelve R_world←device en frame ENU magnético.
+        val R = FloatArray(9)
+        val gravArr = floatArrayOf(gx, gy, gz)
+        val magArr = floatArrayOf(mx, my, mz)
+        val ok = SensorManager.getRotationMatrix(R, null, gravArr, magArr)
+
+        if (!ok) {
+            // Falla solo si gravity y mag son colineales (escenario
+            // físicamente imposible salvo bug del sensor).
+            Log.w(
+                "Z0MatrixGravMag",
+                "REJECT getRotationMatrix returned false " +
+                        "grav=(${"%.2f".format(gx)},${"%.2f".format(gy)},${"%.2f".format(gz)}) " +
+                        "mag=(${"%.2f".format(mx)},${"%.2f".format(my)},${"%.2f".format(mz)})"
+            )
+            return null
+        }
+
+        Log.i(
+            "Z0MatrixGravMag",
+            "ACCEPT gravCount=$gravCount magCount=$magCount " +
+                    "gravNorm=${"%.3f".format(gravNorm)} " +
+                    "magNorm=${"%.1f".format(magNorm)}uT " +
+                    "magAccuracy=$magneticAccuracy " +
+                    "R=[${"%.3f".format(R[0])},${"%.3f".format(R[1])},${"%.3f".format(R[2])}; " +
+                    "${"%.3f".format(R[3])},${"%.3f".format(R[4])},${"%.3f".format(R[5])}; " +
+                    "${"%.3f".format(R[6])},${"%.3f".format(R[7])},${"%.3f".format(R[8])}]"
+        )
+
+        return R
+    }
+
     private fun applyDeclination(azimuthDeg: Float): Float {
         var out = azimuthDeg
         lastLocation?.let {
