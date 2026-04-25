@@ -49,6 +49,34 @@ import kotlin.math.sqrt
 
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
+    companion object {
+        // ============================================================
+        // Z0 MATRIX SOURCE FLAG (Fase 5)
+        // ============================================================
+        // Si está en true, la matriz 3x3 R_world←device del Z0 se construye
+        // vía SensorManager.getRotationMatrix(R, null, gravity, magnetic) en
+        // el momento del disparo, en vez de copiarla de TYPE_ROTATION_VECTOR.
+        //
+        // Por qué: TYPE_ROTATION_VECTOR es composite (accel+mag+gyro vía
+        // Kalman). Entre la última H45 y el Z0, el yaw integrado por gyro
+        // acumula deriva. La matriz construida desde gravity+mag es
+        // self-contained, no depende de frames anteriores ni del estado
+        // del filtro, y cerca del cenit no degenera porque NO calcula yaw
+        // por atan2 sobre Euler — usa los dos vectores de referencia
+        // (down + heading horizontal) para construir la base ortonormal
+        // directa (TRIAD / Wahba 2-vectores).
+        //
+        // Si la lectura falla validación (magAccuracy bajo, norma de
+        // gravedad anómala, etc.) hay fallback automático a la matriz vieja.
+        //
+        // Poner false para A/B contra el comportamiento previo sin tocar
+        // más código.
+        private const val USE_GRAV_MAG_Z0_MATRIX = true
+
+        private const val Z0_MATRIX_BUFFER_SIZE = 30
+        private const val Z0_MATRIX_MIN_SAMPLES = 15
+    }
+
     // UI
     private lateinit var cameraPreview: PreviewView
     private lateinit var guideView: GuideView
@@ -277,31 +305,6 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
     private val zenithAssistExitDeg = 64f
 
-    // ============================================================
-    // Z0 MATRIX SOURCE FLAG (Fase 5)
-    // ============================================================
-    // Si está en true, la matriz 3x3 R_world←device del Z0 se construye
-    // vía SensorManager.getRotationMatrix(R, null, gravity, magnetic) en
-    // el momento del disparo, en vez de copiarla de TYPE_ROTATION_VECTOR.
-    //
-    // Por qué: TYPE_ROTATION_VECTOR es composite (accel+mag+gyro vía
-    // Kalman). Entre la última H45 y el Z0, el yaw integrado por gyro
-    // acumula deriva. La matriz construida desde gravity+mag es
-    // self-contained, no depende de frames anteriores ni del estado
-    // del filtro, y cerca del cenit no degenera porque NO calcula yaw
-    // por atan2 sobre Euler — usa los dos vectores de referencia
-    // (down + heading horizontal) para construir la base ortonormal
-    // directa (TRIAD / Wahba 2-vectores).
-    //
-    // Si la lectura falla validación (magAccuracy bajo, norma de
-    // gravedad anómala, etc.) hay fallback automático a la matriz vieja.
-    //
-    // Poner false para A/B contra el comportamiento previo sin tocar
-    // más código.
-    private val USE_GRAV_MAG_Z0_MATRIX = true
-
-    private val Z0_MATRIX_BUFFER_SIZE = 30
-    private val Z0_MATRIX_MIN_SAMPLES = 15
     // -------------------- ordenar por azimuth --------------------
     private val azRegex = Regex("""_az(\d{3})_""")
 
