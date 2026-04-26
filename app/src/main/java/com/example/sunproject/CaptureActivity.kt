@@ -233,6 +233,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val absPitchDeg: Float?,
         val absRollDeg: Float?,
 
+        // Matriz principal — la que el resto del pipeline lee para
+        // proyección. Para H0/H45 viene de TYPE_ROTATION_VECTOR. Para Z0
+        // puede venir de grav+mag o de TYPE_ROTATION_VECTOR según el flag
+        // USE_GRAV_MAG_Z0_MATRIX.
         val rotationM00: Float?,
 
         val rotationM01: Float?,
@@ -250,6 +254,28 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val rotationM21: Float?,
 
         val rotationM22: Float?,
+
+        // Matriz grav+mag — siempre que las validaciones pasen, en TODOS
+        // los frames (H0/H45 y Z0). Null si los buffers no estaban listos
+        // o las normas/accuracy no cumplieron umbral. Persiste como dato
+        // adicional; nadie la lee aguas abajo hasta la edición 4.
+        val rotationGravMagM00: Float?,
+
+        val rotationGravMagM01: Float?,
+
+        val rotationGravMagM02: Float?,
+
+        val rotationGravMagM10: Float?,
+
+        val rotationGravMagM11: Float?,
+
+        val rotationGravMagM12: Float?,
+
+        val rotationGravMagM20: Float?,
+
+        val rotationGravMagM21: Float?,
+
+        val rotationGravMagM22: Float?,
 
         val capturedAtUtcMs: Long
     )
@@ -987,34 +1013,59 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             )
         }
 
-        // Matriz de rotación a persistir. Por defecto la del
-        // TYPE_ROTATION_VECTOR (lastAbsRotationMatrix). Para el Z0,
-        // si el flag está activo, intentamos construir una matriz
-        // self-contained desde gravity+mag. Si la validación falla
-        // (magAccuracy bajo, norma anómala, etc.) caemos al fallback
-        // sin perder nada.
-        val gravMagMatrix: FloatArray? =
-            if (isZenithCapture && USE_GRAV_MAG_Z0_MATRIX) {
-                computeGravMagZenithMatrix()
-            } else {
-                null
-            }
+        // ============================================================
+        // Cómputo de la matriz grav+mag — para TODOS los frames (Fase 6)
+        // ============================================================
+        // Hasta Fase 5 esto se calculaba solo para el Z0 (cuando
+        // USE_GRAV_MAG_Z0_MATRIX estaba activo). Ahora se calcula también
+        // para H0/H45, porque la fix de bias correction necesita la matriz
+        // grav+mag de los frames no-zenitales para estimar R_bias =
+        // R_rotvec · R_gravmag^T.
+        //
+        // El cálculo es idéntico para H0/H45 y Z0 — los buffers son los
+        // mismos, las validaciones son las mismas. Si la lectura falla
+        // por cualquier motivo (mag descalibrado, celular en movimiento,
+        // norma anómala) → null y no se persiste nada en los 9 campos
+        // rotationGravMag**.
+        //
+        // IMPORTANTE: este cómputo NO afecta la matriz "principal"
+        // (rotationM00..M22) — las H0/H45 siguen usando lastAbsRotationMatrix
+        // como antes. Solo agregamos la matriz grav+mag como dato adicional
+        // persistido, sin tocar el resto del pipeline.
+        val gravMagMatrix: FloatArray? = computeGravMagZenithMatrix()
+
+        // Matriz "principal" — la que va al campo rotationM00..M22 y
+        // que el resto del pipeline lee. Lógica IDÉNTICA a la de Fase 5:
+        // solo el Z0 con flag activo prefiere grav+mag; H0/H45 siempre
+        // van con TYPE_ROTATION_VECTOR.
+        val useGravMagAsPrimary = isZenithCapture && USE_GRAV_MAG_Z0_MATRIX && gravMagMatrix != null
 
         val matrixForFrame: FloatArray? = when {
-            gravMagMatrix != null -> gravMagMatrix
+            useGravMagAsPrimary -> gravMagMatrix
             hasLastAbsRotationMatrix -> lastAbsRotationMatrix
             else -> null
         }
 
         if (isZenithCapture) {
             val matrixSource = when {
-                gravMagMatrix != null -> "GRAV_MAG"
+                useGravMagAsPrimary -> "GRAV_MAG"
                 hasLastAbsRotationMatrix -> "ROTATION_VECTOR_FALLBACK"
                 else -> "NONE"
             }
             Log.i(
                 "Z0MatrixGravMag",
                 "Z0 capture MATRIX_SOURCE=$matrixSource flag=$USE_GRAV_MAG_Z0_MATRIX"
+            )
+        }
+
+        // Log diagnóstico para H0/H45 — útil para verificar que la matriz
+        // grav+mag se está computando bien también fuera del Z0. Estos logs
+        // alimentan la edición 4 (cómputo del bias).
+        if (!isZenithCapture) {
+            Log.i(
+                "Z0MatrixGravMag",
+                "H0/H45 capture target=${target.azimuth}/${target.pitch} " +
+                        "gravMagMatrix=${if (gravMagMatrix != null) "OK" else "null"}"
             )
         }
 
@@ -1047,6 +1098,24 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             rotationM21 = matrixForFrame?.get(7),
 
             rotationM22 = matrixForFrame?.get(8),
+
+            rotationGravMagM00 = gravMagMatrix?.get(0),
+
+            rotationGravMagM01 = gravMagMatrix?.get(1),
+
+            rotationGravMagM02 = gravMagMatrix?.get(2),
+
+            rotationGravMagM10 = gravMagMatrix?.get(3),
+
+            rotationGravMagM11 = gravMagMatrix?.get(4),
+
+            rotationGravMagM12 = gravMagMatrix?.get(5),
+
+            rotationGravMagM20 = gravMagMatrix?.get(6),
+
+            rotationGravMagM21 = gravMagMatrix?.get(7),
+
+            rotationGravMagM22 = gravMagMatrix?.get(8),
 
             capturedAtUtcMs = System.currentTimeMillis()
         )
@@ -1441,6 +1510,24 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             rotationM21 = pose.rotationM21,
 
             rotationM22 = pose.rotationM22,
+
+            rotationGravMagM00 = pose.rotationGravMagM00,
+
+            rotationGravMagM01 = pose.rotationGravMagM01,
+
+            rotationGravMagM02 = pose.rotationGravMagM02,
+
+            rotationGravMagM10 = pose.rotationGravMagM10,
+
+            rotationGravMagM11 = pose.rotationGravMagM11,
+
+            rotationGravMagM12 = pose.rotationGravMagM12,
+
+            rotationGravMagM20 = pose.rotationGravMagM20,
+
+            rotationGravMagM21 = pose.rotationGravMagM21,
+
+            rotationGravMagM22 = pose.rotationGravMagM22,
 
             latitudeDeg = loc?.latitude,
 

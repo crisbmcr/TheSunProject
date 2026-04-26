@@ -69,6 +69,20 @@ class JsonSessionStore : SessionRepository {
             .put("rotationM20", frame.rotationM20)
             .put("rotationM21", frame.rotationM21)
             .put("rotationM22", frame.rotationM22)
+
+            // Matriz grav+mag (Fase 6 — bias correction). Null si la
+            // captura no logró promedios válidos. Coexiste con los campos
+            // rotationM** de arriba (que vienen de TYPE_ROTATION_VECTOR).
+            .put("rotationGravMagM00", frame.rotationGravMagM00)
+            .put("rotationGravMagM01", frame.rotationGravMagM01)
+            .put("rotationGravMagM02", frame.rotationGravMagM02)
+            .put("rotationGravMagM10", frame.rotationGravMagM10)
+            .put("rotationGravMagM11", frame.rotationGravMagM11)
+            .put("rotationGravMagM12", frame.rotationGravMagM12)
+            .put("rotationGravMagM20", frame.rotationGravMagM20)
+            .put("rotationGravMagM21", frame.rotationGravMagM21)
+            .put("rotationGravMagM22", frame.rotationGravMagM22)
+
             .put("latitudeDeg", frame.latitudeDeg)
             .put("longitudeDeg", frame.longitudeDeg)
             .put("altitudeM", frame.altitudeM)
@@ -139,6 +153,22 @@ class JsonSessionStore : SessionRepository {
                 rotationM20 = o.optFloatOrNull("rotationM20"),
                 rotationM21 = o.optFloatOrNull("rotationM21"),
                 rotationM22 = o.optFloatOrNull("rotationM22"),
+
+                // Matriz grav+mag (Fase 6). En JSONs viejos estos campos
+                // no existen → optFloatOrNull devuelve null y no se rompe
+                // la carga. En FrameRecord también default = null, así
+                // que el resto del pipeline funciona como antes hasta que
+                // alguna edición posterior los empiece a leer.
+                rotationGravMagM00 = o.optFloatOrNull("rotationGravMagM00"),
+                rotationGravMagM01 = o.optFloatOrNull("rotationGravMagM01"),
+                rotationGravMagM02 = o.optFloatOrNull("rotationGravMagM02"),
+                rotationGravMagM10 = o.optFloatOrNull("rotationGravMagM10"),
+                rotationGravMagM11 = o.optFloatOrNull("rotationGravMagM11"),
+                rotationGravMagM12 = o.optFloatOrNull("rotationGravMagM12"),
+                rotationGravMagM20 = o.optFloatOrNull("rotationGravMagM20"),
+                rotationGravMagM21 = o.optFloatOrNull("rotationGravMagM21"),
+                rotationGravMagM22 = o.optFloatOrNull("rotationGravMagM22"),
+
                 latitudeDeg = o.optDouble("latitudeDeg").takeIf { !it.isNaN() },
                 longitudeDeg = o.optDouble("longitudeDeg").takeIf { !it.isNaN() },
                 altitudeM = o.optDouble("altitudeM").takeIf { !it.isNaN() },
