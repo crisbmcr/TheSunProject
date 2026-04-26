@@ -2429,11 +2429,8 @@ object AtlasProjector {
         )
     }
 
-    private fun transpose3x3(m: FloatArray): FloatArray = floatArrayOf(
-        m[0], m[3], m[6],
-        m[1], m[4], m[7],
-        m[2], m[5], m[8]
-    )
+    // transpose3x3 ya existe más arriba en el archivo (junto a mulMat3Vec) —
+    // se reusa esa. Solo agregamos matMul3x3 aquí, que es nueva.
 
     private fun matMul3x3(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
         a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
