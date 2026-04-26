@@ -156,6 +156,29 @@ object AtlasProjector {
      */
     fun gyroToTrueNorthCorrectionDeg(): Float = cachedGyroToTrueNorthCorrectionDeg ?: 0f
 
+    // ============================================================
+    // BIAS ROTVEC ↔ GRAV+MAG (Fase 6)
+    // ============================================================
+    // Matriz 3x3 row-major que lleva una matriz expresada en frame
+    // grav+mag al frame rotvec (TYPE_ROTATION_VECTOR de Android):
+    //   R_rotvec = R_bias · R_gravmag
+    //
+    // Se computa una vez por sesión en projectFramesToAtlas, promediando
+    // R_rotvec_i · R_gravmag_i^T sobre los frames H0/H45 que tengan AMBAS
+    // matrices presentes y consistentes. SVD para obtener un promedio
+    // que sea matriz de rotación válida.
+    //
+    // Si por cualquier motivo el bias no se puede estimar (faltan frames,
+    // spread alto, rotación implícita anómala) → null. ZenithMatrixProjector
+    // entonces se comporta como antes (sin corrección).
+    //
+    // Como se setea solo durante projectFramesToAtlas, queda disponible
+    // por toda la sesión hasta que se proyecte otra. Concurrent reads ok
+    // porque es un assignment atómico de referencia.
+    private var cachedRotvecGravMagBiasMatrix: FloatArray? = null
+
+    fun rotvecGravMagBiasMatrix(): FloatArray? = cachedRotvecGravMagBiasMatrix
+
     fun approximateFootprint(frame: FrameRecord): FrameFootprint {
         val hfov = (frame.hfovDeg ?: 65f).coerceIn(1f, 179f)
         val vfov = (frame.vfovDeg ?: 50f).coerceIn(1f, 179f)
@@ -909,6 +932,12 @@ object AtlasProjector {
             "correction=${cachedGyroToTrueNorthCorrectionDeg?.let { "%.2f".format(it) } ?: "null"}° " +
                     "(positivo = rotar atlas al este para llegar a true-N)"
         )
+
+        // FIX BIAS ROTVEC↔GRAV+MAG (Fase 6): estimar la rotación que lleva
+        // matrices grav+mag al frame rotvec. Solo usa H0/H45 (frames con
+        // pose estable, lejos del cenit). Resultado se cachea pero NO se
+        // aplica todavía — la edición 5 lo consume desde ZenithMatrixProjector.
+        cachedRotvecGravMagBiasMatrix = computeRotvecToGravMagBias(nonZenithFrames)
 
         val sessionMountBasis = estimateCameraMountBasis(nonZenithFrames)
         val persistedMountBasis = loadPersistedMountCalibration()
@@ -2269,6 +2298,236 @@ object AtlasProjector {
      *
      * En esos casos el atlas queda en gyro-N (comportamiento pre-fix).
      */
+    /**
+     * Computa la matriz de bias R_bias tal que R_rotvec = R_bias · R_gravmag,
+     * promediando sobre los frames H0/H45 que tienen AMBAS matrices presentes.
+     *
+     * Pipeline:
+     *   1. Filtrar frames con rotationM** (rotvec) Y rotationGravMagM** (grav+mag).
+     *   2. Para cada frame: R_bias_i = R_rotvec · R_gravmag^T.
+     *   3. Sumar todas las R_bias_i en una matriz M.
+     *   4. SVD(M) = U · Σ · V^T → R_avg = U · V^T (corregido el signo si det<0).
+     *      Esto da la matriz de rotación más cercana al promedio aritmético
+     *      en el sentido de Frobenius — solución estándar de Wahba para
+     *      promediar rotaciones.
+     *   5. Validar:
+     *      - Al menos 10 frames usados.
+     *      - Spread (rotación máxima entre R_bias_i y R_avg) < 3°.
+     *      - Rotación implícita de R_avg < 15° (es un bias, no un giro grande).
+     *      Si alguna falla → return null.
+     *
+     * Retorna FloatArray(9) row-major o null.
+     */
+    private fun computeRotvecToGravMagBias(frames: List<FrameRecord>): FloatArray? {
+        val MIN_FRAMES = 10
+        val MAX_SPREAD_DEG = 3f
+        val MAX_BIAS_ROTATION_DEG = 15f
+
+        // Step 1: filtrar frames con ambas matrices presentes.
+        val pairs = mutableListOf<Pair<FloatArray, FloatArray>>()
+        for (f in frames) {
+            val rotvec = storedDeviceToWorldMatrix(f) ?: continue
+            val gravMag = storedGravMagMatrix(f) ?: continue
+            pairs.add(rotvec to gravMag)
+        }
+
+        Log.i(
+            "Z0BiasCorrection",
+            "estimateBias: framesWithBoth=${pairs.size} (need ≥ $MIN_FRAMES)"
+        )
+
+        if (pairs.size < MIN_FRAMES) {
+            Log.w(
+                "Z0BiasCorrection",
+                "REJECT: not enough frames with both matrices " +
+                        "(have=${pairs.size}, need=$MIN_FRAMES)"
+            )
+            return null
+        }
+
+        // Step 2-3: computar R_bias_i = R_rotvec · R_gravmag^T, sumar.
+        val biasList = mutableListOf<FloatArray>()
+        val M = DoubleArray(9) // accumulator (Double para precisión en suma)
+        for ((rotvec, gravMag) in pairs) {
+            val gravMagT = transpose3x3(gravMag)
+            val biasI = matMul3x3(rotvec, gravMagT) // 3×3 que debería ser ~identidad
+            biasList.add(biasI)
+            for (k in 0 until 9) M[k] += biasI[k].toDouble()
+        }
+
+        // Step 4: SVD del promedio. M es la suma; M/N es el promedio aritmético.
+        // SVD de M/N o de M da el mismo U·V^T (la escala no afecta).
+        val Mfloat = FloatArray(9) { M[it].toFloat() }
+        val Rsvd = projectToRotationViaSVD(Mfloat) ?: run {
+            Log.w("Z0BiasCorrection", "REJECT: SVD failed (matrix degenerate)")
+            return null
+        }
+
+        // Step 5a: validar rotación implícita del bias.
+        val biasAngleDeg = rotationAngleOfMatrixDeg(Rsvd)
+        if (biasAngleDeg > MAX_BIAS_ROTATION_DEG) {
+            Log.w(
+                "Z0BiasCorrection",
+                "REJECT: bias rotation too large " +
+                        "(${"%.2f".format(biasAngleDeg)}° > $MAX_BIAS_ROTATION_DEG°). " +
+                        "Probable bug or sensor problem, not a real bias."
+            )
+            return null
+        }
+
+        // Step 5b: validar spread — la rotación máxima entre cada R_bias_i
+        // y el promedio R_svd. Si las muestras individuales están muy
+        // dispersas el promedio no es confiable.
+        var maxSpreadDeg = 0f
+        for (biasI in biasList) {
+            val biasIRsvdT = matMul3x3(biasI, transpose3x3(Rsvd))
+            val spreadDeg = rotationAngleOfMatrixDeg(biasIRsvdT)
+            if (spreadDeg > maxSpreadDeg) maxSpreadDeg = spreadDeg
+        }
+        if (maxSpreadDeg > MAX_SPREAD_DEG) {
+            Log.w(
+                "Z0BiasCorrection",
+                "REJECT: spread too high " +
+                        "(${"%.2f".format(maxSpreadDeg)}° > $MAX_SPREAD_DEG°). " +
+                        "Magnetometer or rotvec inconsistent across frames."
+            )
+            return null
+        }
+
+        Log.i(
+            "Z0BiasCorrection",
+            "ACCEPT: framesUsed=${pairs.size} " +
+                    "biasAngle=${"%.3f".format(biasAngleDeg)}° " +
+                    "spread=${"%.3f".format(maxSpreadDeg)}° " +
+                    "R=[${"%.4f".format(Rsvd[0])},${"%.4f".format(Rsvd[1])},${"%.4f".format(Rsvd[2])}; " +
+                    "${"%.4f".format(Rsvd[3])},${"%.4f".format(Rsvd[4])},${"%.4f".format(Rsvd[5])}; " +
+                    "${"%.4f".format(Rsvd[6])},${"%.4f".format(Rsvd[7])},${"%.4f".format(Rsvd[8])}]"
+        )
+
+        return Rsvd
+    }
+
+    /**
+     * Lee la matriz grav+mag persistida en FrameRecord.
+     * Igual que storedDeviceToWorldMatrix pero sobre los 9 campos rotationGravMagM**.
+     */
+    private fun storedGravMagMatrix(frame: FrameRecord): FloatArray? {
+        val m00 = frame.rotationGravMagM00 ?: return null
+        val m01 = frame.rotationGravMagM01 ?: return null
+        val m02 = frame.rotationGravMagM02 ?: return null
+        val m10 = frame.rotationGravMagM10 ?: return null
+        val m11 = frame.rotationGravMagM11 ?: return null
+        val m12 = frame.rotationGravMagM12 ?: return null
+        val m20 = frame.rotationGravMagM20 ?: return null
+        val m21 = frame.rotationGravMagM21 ?: return null
+        val m22 = frame.rotationGravMagM22 ?: return null
+
+        return floatArrayOf(
+            m00, m01, m02,
+            m10, m11, m12,
+            m20, m21, m22
+        )
+    }
+
+    private fun transpose3x3(m: FloatArray): FloatArray = floatArrayOf(
+        m[0], m[3], m[6],
+        m[1], m[4], m[7],
+        m[2], m[5], m[8]
+    )
+
+    private fun matMul3x3(a: FloatArray, b: FloatArray): FloatArray = floatArrayOf(
+        a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
+        a[0] * b[1] + a[1] * b[4] + a[2] * b[7],
+        a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
+        a[3] * b[0] + a[4] * b[3] + a[5] * b[6],
+        a[3] * b[1] + a[4] * b[4] + a[5] * b[7],
+        a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
+        a[6] * b[0] + a[7] * b[3] + a[8] * b[6],
+        a[6] * b[1] + a[7] * b[4] + a[8] * b[7],
+        a[6] * b[2] + a[7] * b[5] + a[8] * b[8]
+    )
+
+    /**
+     * Ángulo de rotación implícito en una matriz de rotación 3×3, en grados.
+     * Para R, traza = 1 + 2·cos(θ), entonces θ = acos((traza − 1) / 2).
+     */
+    private fun rotationAngleOfMatrixDeg(R: FloatArray): Float {
+        val trace = R[0] + R[4] + R[8]
+        val cosTheta = ((trace - 1f) / 2f).coerceIn(-1f, 1f)
+        return Math.toDegrees(acos(cosTheta.toDouble())).toFloat()
+    }
+
+    /**
+     * Proyecta una matriz 3×3 cualquiera a la matriz de rotación más cercana
+     * usando SVD via OpenCV. Esto resuelve el problema de Wahba: dado
+     * M = sum(R_i), encontrar el R que mejor representa el promedio.
+     *
+     * R_avg = U · diag(1, 1, det(U·V^T)) · V^T
+     *
+     * El factor diag(1, 1, det) corrige el signo si SVD devuelve una reflexión
+     * en vez de rotación (sucede cuando det(M) < 0, raro pero posible).
+     *
+     * Retorna null si OpenCV no puede hacer SVD (matriz degenerada).
+     */
+    private fun projectToRotationViaSVD(M: FloatArray): FloatArray? {
+        return try {
+            val Mmat = org.opencv.core.Mat(3, 3, org.opencv.core.CvType.CV_32F)
+            Mmat.put(0, 0, M)
+
+            val w = org.opencv.core.Mat()
+            val u = org.opencv.core.Mat()
+            val vt = org.opencv.core.Mat()
+            org.opencv.core.Core.SVDecomp(Mmat, w, u, vt)
+
+            // R = U · V^T, con corrección de signo si det negativo.
+            val ut = org.opencv.core.Mat()
+            org.opencv.core.Core.transpose(vt, ut) // V (vt es V^T → transpose para V; pero ya tenemos VT)
+            // Wait: vt es V^T directamente. Queremos U · V^T = U · vt.
+            val uvt = org.opencv.core.Mat()
+            org.opencv.core.Core.gemm(u, vt, 1.0, org.opencv.core.Mat(), 0.0, uvt)
+
+            // Si det(uvt) < 0, es reflexión. Negar la última columna de U y rehacer.
+            val det = org.opencv.core.Core.determinant(uvt)
+            val Rmat = if (det < 0) {
+                val uFixed = u.clone()
+                // Negar columna 2 de U
+                for (row in 0 until 3) {
+                    val v = uFixed.get(row, 2)
+                    uFixed.put(row, 2, -v[0])
+                }
+                val uvtFixed = org.opencv.core.Mat()
+                org.opencv.core.Core.gemm(uFixed, vt, 1.0, org.opencv.core.Mat(), 0.0, uvtFixed)
+                uFixed.release()
+                uvtFixed
+            } else {
+                uvt
+            }
+
+            // Extraer FloatArray
+            val out = FloatArray(9)
+            val tmp = FloatArray(1)
+            for (r in 0 until 3) {
+                for (c in 0 until 3) {
+                    Rmat.get(r, c, tmp)
+                    out[r * 3 + c] = tmp[0]
+                }
+            }
+
+            Mmat.release()
+            w.release()
+            u.release()
+            vt.release()
+            ut.release()
+            if (Rmat !== uvt) uvt.release()
+            Rmat.release()
+
+            out
+        } catch (t: Throwable) {
+            Log.e("Z0BiasCorrection", "SVD failed", t)
+            null
+        }
+    }
+
     private fun computeGyroToTrueNorthCorrection(frames: List<FrameRecord>): Float? {
         // Umbral máximo de desviación angular aceptable entre frames.
         // Cauchari típico: deltas -6° a -11° (spread ~5°).
