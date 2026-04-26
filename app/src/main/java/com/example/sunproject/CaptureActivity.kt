@@ -2053,16 +2053,33 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val gravNorm = sqrt(gx * gx + gy * gy + gz * gz)
         val magNorm = sqrt(mx * mx + my * my + mz * mz)
 
-        // Validación 1: magneticAccuracy. SENSOR_STATUS_ACCURACY_MEDIUM
-        // o superior. Lo mismo que headingReliable() en el resto del
-        // código.
-        if (magneticAccuracy < SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM) {
-            Log.w(
-                "Z0MatrixGravMag",
-                "REJECT magAccuracy too low: $magneticAccuracy " +
-                        "(need ≥ ${SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM})"
-            )
-            return null
+        // Validación 1 (RELAJADA — Fase 6): aceptamos cualquier
+        // magneticAccuracy, incluido UNRELIABLE (0).
+        //
+        // Razonamiento: para la corrección de bias rotvec ↔ grav+mag
+        // no necesitamos true-N preciso. Lo único que importa es la
+        // CONSISTENCIA entre rotvec y grav+mag. Como TYPE_ROTATION_VECTOR
+        // también usa el magnetómetro internamente, ambas lecturas tienen
+        // el mismo sesgo cuando el sensor está unreliable, y la diferencia
+        // (que es lo que define R_bias) lo cancela.
+        //
+        // El ruido residual lo controla la validación de spread en
+        // computeRotvecToGravMagBias: si las muestras individuales son
+        // muy dispersas, el bias se rechaza globalmente. Acá solo nos
+        // aseguramos de tener DATOS para que esa validación opere.
+        //
+        // Para el caso del Z0 con flag activo (Fase 5): el bias correction
+        // de Fase 6 lo va a llevar al frame correcto aunque el grav+mag
+        // crudo del Z0 esté sesgado. Si Fase 6 falla, el fallback a
+        // ROTATION_VECTOR queda igual que antes.
+        //
+        // Logueamos el valor para diagnóstico, pero no rechazamos.
+        val magAccLabel = when (magneticAccuracy) {
+            SensorManager.SENSOR_STATUS_ACCURACY_HIGH -> "HIGH"
+            SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM -> "MEDIUM"
+            SensorManager.SENSOR_STATUS_ACCURACY_LOW -> "LOW"
+            SensorManager.SENSOR_STATUS_UNRELIABLE -> "UNRELIABLE"
+            else -> "UNKNOWN($magneticAccuracy)"
         }
 
         // Validación 2: norma de gravedad. Si el celular está quieto,
@@ -2077,13 +2094,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             return null
         }
 
-        // Validación 3: norma magnética. El campo terrestre va de ~25
-        // a ~65 µT. Fuera de [20, 80] indica interferencia ferromagnética
-        // local fuerte o magnetómetro descalibrado.
-        if (magNorm < 20f || magNorm > 80f) {
+        // Validación 3 (RELAJADA — Fase 6): rechazo solo de valores
+        // físicamente absurdos (>200 µT indica imán cerca del celular,
+        // <5 µT indica falla del sensor). El rango "normal" del campo
+        // terrestre 25-65 µT lo dejamos pasar y también valores bajos
+        // por interferencia local — son inevitables en muchos sitios
+        // reales y la validación de spread los va a filtrar después si
+        // son inconsistentes.
+        if (magNorm < 5f || magNorm > 200f) {
             Log.w(
                 "Z0MatrixGravMag",
-                "REJECT magNorm out of range: ${"%.1f".format(magNorm)}uT"
+                "REJECT magNorm physically absurd: ${"%.1f".format(magNorm)}uT"
             )
             return null
         }
@@ -2112,7 +2133,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             "ACCEPT gravCount=$gravCount magCount=$magCount " +
                     "gravNorm=${"%.3f".format(gravNorm)} " +
                     "magNorm=${"%.1f".format(magNorm)}uT " +
-                    "magAccuracy=$magneticAccuracy " +
+                    "magAccuracy=$magneticAccuracy ($magAccLabel) " +
                     "R=[${"%.3f".format(R[0])},${"%.3f".format(R[1])},${"%.3f".format(R[2])}; " +
                     "${"%.3f".format(R[3])},${"%.3f".format(R[4])},${"%.3f".format(R[5])}; " +
                     "${"%.3f".format(R[6])},${"%.3f".format(R[7])},${"%.3f".format(R[8])}]"
