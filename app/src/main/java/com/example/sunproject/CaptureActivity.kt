@@ -123,6 +123,26 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var gameRotationVectorSensor: Sensor? = null
     private var magneticFieldSensor: Sensor? = null
     private var gravitySensor: Sensor? = null
+    private var gyroscopeSensor: Sensor? = null
+
+    // Buffer circular del giroscopio para transporte de orientación
+    // entre el último H45 y el Z0 (Fase 7).
+    private val gyroTransport = com.example.sunproject.domain.sensor.GyroTransport(
+        capacity = GYRO_BUFFER_CAPACITY,
+        maxGapNs = GYRO_MAX_GAP_NS
+    )
+
+    // Snapshot atómico de (matriz rotvec, timestamp) tomado al disparar
+    // el último frame H45. Sirve como anchor para propagar la orientación
+    // hasta el shutter del Z0 vía integración del giroscopio.
+    private val gyroAnchorMatrix = FloatArray(9)
+    private var gyroAnchorTimestampNs: Long = 0L
+    private var hasGyroAnchor: Boolean = false
+
+    // Vector gravity instantáneo más reciente (en device frame).
+    // Se usa para refinar el tilt del Z0 luego del transporte.
+    private val instantGravity = FloatArray(3)
+    private var hasInstantGravity: Boolean = false
 
     private var magneticAccuracy: Int = SensorManager.SENSOR_STATUS_UNRELIABLE
     private var magneticFieldNormUt: Float = 0f
@@ -370,11 +390,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         gameRotationVectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
         magneticFieldSensor = sensorManager.getDefaultSensor(Sensor.TYPE_MAGNETIC_FIELD)
         gravitySensor = sensorManager.getDefaultSensor(Sensor.TYPE_GRAVITY)
+        gyroscopeSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
         Log.i(
             "Z0MatrixGravMag",
             "init flag=$USE_GRAV_MAG_Z0_MATRIX " +
                     "gravitySensor=${gravitySensor != null} " +
                     "magSensor=${magneticFieldSensor != null}"
+        )
+        Log.i(
+            "Z0GyroTransport",
+            "init flag=$USE_GYRO_TRANSPORT_Z0 " +
+                    "gyroscopeSensor=${gyroscopeSensor != null}"
         )
         btnCapture.setOnClickListener { takePhotoManual() }
 
@@ -437,6 +463,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         gravitySensor?.let {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
+        }
+
+        gyroscopeSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
 
@@ -609,6 +639,26 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 gravityBufferZ[gravityBufferIndex] = event.values[2]
                 gravityBufferIndex = (gravityBufferIndex + 1) % Z0_MATRIX_BUFFER_SIZE
                 if (gravityBufferIndex == 0) gravityBufferFilled = true
+
+                // Snapshot del último gravity instantáneo. Se usa para
+                // refinar el tilt del Z0 luego del transporte gyro.
+                instantGravity[0] = event.values[0]
+                instantGravity[1] = event.values[1]
+                instantGravity[2] = event.values[2]
+                hasInstantGravity = true
+            }
+
+            Sensor.TYPE_GYROSCOPE -> {
+                // Velocidad angular en rad/s, frame del device.
+                // Android compensa el bias internamente en TYPE_GYROSCOPE
+                // (a diferencia de TYPE_GYROSCOPE_UNCALIBRATED).
+                // Empuja al buffer circular para integración posterior.
+                gyroTransport.pushSample(
+                    event.timestamp,
+                    event.values[0],
+                    event.values[1],
+                    event.values[2]
+                )
             }
 
             Sensor.TYPE_GAME_ROTATION_VECTOR -> {
@@ -1014,33 +1064,83 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         // ============================================================
-        // Cómputo de la matriz grav+mag — para TODOS los frames (Fase 6)
+        // Cómputo de la matriz grav+mag — sigue activo SOLO como dato
+        // adicional persistido (campos rotationGravMag**). Ya NO se usa
+        // como matriz principal del Z0 desde Fase 7.
         // ============================================================
-        // Hasta Fase 5 esto se calculaba solo para el Z0 (cuando
-        // USE_GRAV_MAG_Z0_MATRIX estaba activo). Ahora se calcula también
-        // para H0/H45, porque la fix de bias correction necesita la matriz
-        // grav+mag de los frames no-zenitales para estimar R_bias =
-        // R_rotvec · R_gravmag^T.
-        //
-        // El cálculo es idéntico para H0/H45 y Z0 — los buffers son los
-        // mismos, las validaciones son las mismas. Si la lectura falla
-        // por cualquier motivo (mag descalibrado, celular en movimiento,
-        // norma anómala) → null y no se persiste nada en los 9 campos
-        // rotationGravMag**.
-        //
-        // IMPORTANTE: este cómputo NO afecta la matriz "principal"
-        // (rotationM00..M22) — las H0/H45 siguen usando lastAbsRotationMatrix
-        // como antes. Solo agregamos la matriz grav+mag como dato adicional
-        // persistido, sin tocar el resto del pipeline.
         val gravMagMatrix: FloatArray? = computeGravMagZenithMatrix()
 
-        // Matriz "principal" — la que va al campo rotationM00..M22 y
-        // que el resto del pipeline lee. Lógica IDÉNTICA a la de Fase 5:
-        // solo el Z0 con flag activo prefiere grav+mag; H0/H45 siempre
-        // van con TYPE_ROTATION_VECTOR.
-        val useGravMagAsPrimary = isZenithCapture && USE_GRAV_MAG_Z0_MATRIX && gravMagMatrix != null
+        // ============================================================
+        // GYRO TRANSPORT (Fase 7) — solo para Z0
+        // ============================================================
+        // Si hay anchor disponible del último H45, propagamos su orientación
+        // por integración del giroscopio hasta el momento de este shutter.
+        // Después refinamos el tilt usando gravity instantánea (mantiene el
+        // heading propagado, corrige solo pitch/roll si el gyro acumuló
+        // drift en la vertical).
+        var gyroTransportedMatrix: FloatArray? = null
+        var gyroTransportDiag: FloatArray? = null
+        if (isZenithCapture && USE_GYRO_TRANSPORT_Z0 && hasGyroAnchor && hasLastAbsRotationMatrix) {
+            val nowNs = SystemClock.elapsedRealtimeNanos()
+            val deltaTMs = (nowNs - gyroAnchorTimestampNs) / 1_000_000L
+
+            if (deltaTMs in 0..MAX_TRANSPORT_DT_MS) {
+                val diag = FloatArray(3)
+                val rDelta = gyroTransport.integrateBetween(
+                    gyroAnchorTimestampNs,
+                    nowNs,
+                    diag
+                )
+                if (rDelta != null) {
+                    // R_propagated = R_anchor · R_delta_device
+                    val propagated = multiply3x3(gyroAnchorMatrix, rDelta)
+
+                    // Refinar tilt con gravity instantánea: el gyro pudo
+                    // haber acumulado drift en pitch/roll durante la propagación,
+                    // pero gravity en t_now mide la vertical real con error <1°.
+                    val refined = if (hasInstantGravity) {
+                        refineTiltWithGravity(propagated, instantGravity)
+                    } else {
+                        propagated
+                    }
+                    gyroTransportedMatrix = refined
+                    gyroTransportDiag = diag
+
+                    Log.i(
+                        "Z0GyroTransport",
+                        "TRANSPORT_OK deltaTMs=$deltaTMs " +
+                                "integratedAngle=${"%.2f".format(diag[0])}° " +
+                                "samples=${diag[1].toInt()} " +
+                                "maxGapMs=${"%.1f".format(diag[2])} " +
+                                "tiltRefined=${hasInstantGravity}"
+                    )
+                } else {
+                    Log.w(
+                        "Z0GyroTransport",
+                        "TRANSPORT_FAIL_INTEGRATE deltaTMs=$deltaTMs " +
+                                "samples=${gyroTransport.sampleCount()}"
+                    )
+                }
+            } else {
+                Log.w(
+                    "Z0GyroTransport",
+                    "TRANSPORT_FAIL_DT deltaTMs=$deltaTMs > $MAX_TRANSPORT_DT_MS"
+                )
+            }
+        }
+
+        // Matriz "principal" — selección con prioridad:
+        //   1. Gyro transport (Fase 7) si Z0 + anchor + integración válida
+        //   2. Grav+mag (Fase 5) si Z0 + flag + lectura válida
+        //   3. Rotvec instantáneo (comportamiento histórico)
+        val useGyroTransport = gyroTransportedMatrix != null
+        val useGravMagAsPrimary = !useGyroTransport &&
+                isZenithCapture &&
+                USE_GRAV_MAG_Z0_MATRIX &&
+                gravMagMatrix != null
 
         val matrixForFrame: FloatArray? = when {
+            useGyroTransport -> gyroTransportedMatrix
             useGravMagAsPrimary -> gravMagMatrix
             hasLastAbsRotationMatrix -> lastAbsRotationMatrix
             else -> null
@@ -1048,13 +1148,15 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         if (isZenithCapture) {
             val matrixSource = when {
+                useGyroTransport -> "GYRO_TRANSPORT"
                 useGravMagAsPrimary -> "GRAV_MAG"
                 hasLastAbsRotationMatrix -> "ROTATION_VECTOR_FALLBACK"
                 else -> "NONE"
             }
             Log.i(
-                "Z0MatrixGravMag",
-                "Z0 capture MATRIX_SOURCE=$matrixSource flag=$USE_GRAV_MAG_Z0_MATRIX"
+                "Z0GyroTransport",
+                "Z0 capture MATRIX_SOURCE=$matrixSource " +
+                        "flagGyro=$USE_GYRO_TRANSPORT_Z0 flagGravMag=$USE_GRAV_MAG_Z0_MATRIX"
             )
         }
 
@@ -1155,6 +1257,31 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
                     appendMetadata(file.name, frozenPose)
                     appendFrameRecord(file, target, capturedFiles.size, frozenPose)
+
+                    // ============================================================
+                    // GYRO TRANSPORT ANCHOR (Fase 7)
+                    // ============================================================
+                    // Cada vez que se captura un frame que NO es Z0, actualizamos
+                    // el anchor con la matriz rotvec instantánea + timestamp del
+                    // sensor. Cuando llegue el shutter del Z0, este anchor va a
+                    // apuntar al H45 inmediatamente anterior, y propagamos por
+                    // gyro desde ahí hasta el momento del Z0.
+                    //
+                    // Snapshot atómico: lastAbsRotationMatrix y lastAbsTsNs se
+                    // actualizan en el mismo handler de TYPE_ROTATION_VECTOR, así
+                    // que copiarlos secuencialmente acá no introduce desincronización
+                    // en práctica (peor caso ~5ms = 0.025° de drift adicional, despreciable).
+                    if (!isZenithCapture && hasLastAbsRotationMatrix) {
+                        System.arraycopy(lastAbsRotationMatrix, 0, gyroAnchorMatrix, 0, 9)
+                        gyroAnchorTimestampNs = lastAbsTsNs
+                        hasGyroAnchor = true
+                        Log.d(
+                            "Z0GyroTransport",
+                            "ANCHOR_UPDATED frame=${file.nameWithoutExtension} " +
+                                    "tsNs=$gyroAnchorTimestampNs " +
+                                    "shotIndex=${capturedFiles.size}"
+                        )
+                    }
 
                     target.isCaptured = true
                     Log.d("SunGuideStage", "after_save ${guideView.getStageDebugString()}")
@@ -2208,6 +2335,110 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private fun lowPassScalar(prev: Float, current: Float, alpha: Float): Float {
         return prev + alpha * (current - prev)
     }
+
+    /**
+     * Multiplicación de matrices 3x3 row-major.
+     * Devuelve C = A · B en un nuevo FloatArray(9).
+     */
+    private fun multiply3x3(a: FloatArray, b: FloatArray): FloatArray {
+        val c = FloatArray(9)
+        c[0] = a[0]*b[0] + a[1]*b[3] + a[2]*b[6]
+        c[1] = a[0]*b[1] + a[1]*b[4] + a[2]*b[7]
+        c[2] = a[0]*b[2] + a[1]*b[5] + a[2]*b[8]
+        c[3] = a[3]*b[0] + a[4]*b[3] + a[5]*b[6]
+        c[4] = a[3]*b[1] + a[4]*b[4] + a[5]*b[7]
+        c[5] = a[3]*b[2] + a[4]*b[5] + a[5]*b[8]
+        c[6] = a[6]*b[0] + a[7]*b[3] + a[8]*b[6]
+        c[7] = a[6]*b[1] + a[7]*b[4] + a[8]*b[7]
+        c[8] = a[6]*b[2] + a[7]*b[5] + a[8]*b[8]
+        return c
+    }
+
+    /**
+     * Refina el tilt de R (matriz device→world) usando gravity instantánea.
+     *
+     * Idea: la tercera columna de R (cuando R es device→world row-major,
+     * R = [right | up | forward] en convención típica) representa cuál es
+     * la dirección "device-Z" expresada en world. La gravity instantánea
+     * representa la dirección "world-down" expresada en device.
+     *
+     * Para nuestro convenio (consistente con SensorManager.getRotationMatrix
+     * row-major, que produce R tal que R · v_device = v_world):
+     *   - La fila 3 de R (índices 6,7,8) es lo que device-Z mapea a world.
+     *   - g_device normalizado debería mapear a (0, 0, -1)_world bajo R^T.
+     *
+     * Aplicamos una rotación R_correction tal que:
+     *   - R_correction · up_propagated = up_measured
+     *   - donde up_propagated = -R^T[2,:] = (-R[2], -R[5], -R[8]) (en world)
+     *   - up_measured = -g_device normalizado, llevado a world via R
+     *
+     * En la práctica esto se reduce a: rotar R alrededor de un eje horizontal
+     * para alinear su "up estimado" con el "up medido" por gravity. La rotación
+     * preserva el heading (yaw) porque su eje vive en el plano horizontal.
+     *
+     * Si el desalineamiento es < 0.1° devuelve R sin tocar (no refinamiento
+     * innecesario). Si > 5° devuelve R sin tocar (algo está mal, mejor no
+     * empeorarlo — caería al log de diagnóstico).
+     */
+    private fun refineTiltWithGravity(R: FloatArray, gDevice: FloatArray): FloatArray {
+        // Normalizar gravity en device frame.
+        val gNorm = sqrt(gDevice[0]*gDevice[0] + gDevice[1]*gDevice[1] + gDevice[2]*gDevice[2])
+        if (gNorm < 1e-3f) return R
+        val gx = gDevice[0] / gNorm
+        val gy = gDevice[1] / gNorm
+        val gz = gDevice[2] / gNorm
+
+        // up_measured en world = R · (-g_device_normalized).
+        // Es la dirección que la gravedad medida "dice que es Up" expresada en world.
+        val upMx = -(R[0]*gx + R[1]*gy + R[2]*gz)
+        val upMy = -(R[3]*gx + R[4]*gy + R[5]*gz)
+        val upMz = -(R[6]*gx + R[7]*gy + R[8]*gz)
+
+        // up_propagated en world: la dirección Up del world según R actual = (0, 0, 1).
+        // Si R fuera "perfecta", upMx,upMy,upMz ya serían (0,0,1). El desalineamiento
+        // es la rotación más corta entre upM y (0,0,1).
+        val dot = upMz.coerceIn(-1f, 1f)
+        val angleRad = kotlin.math.acos(dot)
+        val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
+
+        if (angleDeg < 0.1f) return R   // ya está bien alineado
+        if (angleDeg > 5f) {
+            Log.w(
+                "Z0GyroTransport",
+                "tilt refinement skipped: misalignment=${"%.2f".format(angleDeg)}° > 5°"
+            )
+            return R
+        }
+
+        // Eje de rotación = upM × (0,0,1), normalizado.
+        val axX = upMy
+        val axY = -upMx
+        val axZ = 0f
+        val axNorm = sqrt(axX*axX + axY*axY + axZ*axZ)
+        if (axNorm < 1e-6f) return R
+        val ax = axX / axNorm
+        val ay = axY / axNorm
+        val az = axZ / axNorm
+
+        // Construir R_correction (Rodrigues) que rota upM hacia (0,0,1).
+        val theta = -angleRad   // ojo signo: queremos llevar upM hacia +Z, no al revés
+        val c = kotlin.math.cos(theta)
+        val s = kotlin.math.sin(theta)
+        val omc = 1f - c
+        val rc = floatArrayOf(
+            c + ax*ax*omc,      ax*ay*omc - az*s,   ax*az*omc + ay*s,
+            ay*ax*omc + az*s,   c + ay*ay*omc,      ay*az*omc - ax*s,
+            az*ax*omc - ay*s,   az*ay*omc + ax*s,   c + az*az*omc
+        )
+        val refined = multiply3x3(rc, R)
+
+        Log.d(
+            "Z0GyroTransport",
+            "tilt refined: misalignment=${"%.2f".format(angleDeg)}° corrected"
+        )
+        return refined
+    }
+
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS =
@@ -2232,12 +2463,50 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // Si la lectura falla validación (magAccuracy bajo, norma de
         // gravedad anómala, etc.) hay fallback automático a la matriz vieja.
         //
-        // Poner false para A/B contra el comportamiento previo sin tocar
-        // más código.
+        // Mantener TRUE: este es el fallback de segundo nivel cuando gyro
+        // transport (Fase 7) no está disponible. Solo se ejecuta si
+        // USE_GYRO_TRANSPORT_Z0 = false o si no hay anchor válido.
         private const val USE_GRAV_MAG_Z0_MATRIX = true
 
         private const val Z0_MATRIX_BUFFER_SIZE = 30
         private const val Z0_MATRIX_MIN_SAMPLES = 15
+
+        // ============================================================
+        // Z0 GYRO TRANSPORT FLAG (Fase 7)
+        // ============================================================
+        // Si está en true, la matriz del Z0 se construye propagando con
+        // el giroscopio desde el último H45 capturado, en lugar de leer
+        // rotvec/gravmag instantáneo en el shutter del Z0.
+        //
+        // Por qué: el cluster H0/H45 vive en frame "gyro-anchored" (ver
+        // displayAzimuth y comentario en TYPE_ROTATION_VECTOR handler).
+        // Lecturas instantáneas del magnetómetro en el momento del Z0
+        // pueden tener jitter de 4°+ frame-a-frame en sitios magnéticos
+        // sucios. Transportar por gyro mantiene al Z0 en el MISMO frame
+        // del cluster, con drift acotado por la duración del transporte.
+        //
+        // Drift esperado: 0.05-0.2°/s post-bias-compensation de Android.
+        // Para Δt típico de 5-10s entre img_20 y Z0, drift acumulado
+        // < 1° en condiciones normales.
+        //
+        // Si no hay anchor válido (no hubo H45 previo, gaps en buffer del
+        // gyro, Δt > MAX_TRANSPORT_DT_MS), fallback automático al método
+        // anterior (gravmag o rotvec según USE_GRAV_MAG_Z0_MATRIX).
+        private const val USE_GYRO_TRANSPORT_Z0 = true
+
+        // Δt máximo entre anchor (último H45) y Z0 para considerar la
+        // integración confiable. Si excede, el drift acumulado del gyro
+        // es inaceptable y se hace fallback.
+        private const val MAX_TRANSPORT_DT_MS = 30_000L
+
+        // Capacidad del buffer del giroscopio. A 200 Hz con SENSOR_DELAY_GAME
+        // cubre ~20s, suficiente para cubrir img_20 → Z0 con holgura.
+        private const val GYRO_BUFFER_CAPACITY = 4096
+
+        // Gap máximo entre samples consecutivos del gyro durante el
+        // intervalo de integración. Un gap > 200ms suele indicar que
+        // Android pausó el sensor y la integración ya no es confiable.
+        private const val GYRO_MAX_GAP_NS = 200_000_000L
     }
 }
 
