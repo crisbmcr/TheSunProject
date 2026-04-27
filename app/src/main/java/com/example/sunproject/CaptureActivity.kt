@@ -2609,7 +2609,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // cubre ~1.3s, holgura amplia para ventanas de 200ms.
         private const val ROTVEC_BUFFER_CAPACITY = 256
     }
-    }
+
 }
 
 @OptIn(ExperimentalCamera2Interop::class)
