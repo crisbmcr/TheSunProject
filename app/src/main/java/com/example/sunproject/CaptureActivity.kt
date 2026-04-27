@@ -1185,8 +1185,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             )
         }
 
-        // Log diagnóstico para H0/H45 — útil para verificar que la matriz
-        // grav+mag se está computando bien también fuera del Z0. Estos logs
+        // Estos logs
         // alimentan la edición 4 (cómputo del bias).
         if (!isZenithCapture) {
             Log.i(
@@ -1194,6 +1193,54 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 "H0/H45 capture target=${target.azimuth}/${target.pitch} " +
                         "gravMagMatrix=${if (gravMagMatrix != null) "OK" else "null"}"
             )
+        }
+
+        // ============================================================
+        // FROZEN ANCHOR (Refinement 1, Fase 7)
+        // ============================================================
+        // Congelar la matriz anchor para el gyro transport JUSTO ANTES
+        // del shutter, con el mismo timing que frozenPose.
+        //
+        // Para H0/H45: la matriz se promedia via SVD sobre los últimos
+        // ROTVEC_ANCHOR_AVG_WINDOW_MS del rotvec, atenuando el jitter
+        // del Kalman interno por √N samples.
+        //
+        // Para Z0: no se computa anchor (el Z0 NO sirve como anchor del
+        // próximo Z0; siempre lo hereda del último H45).
+        //
+        // onImageSaved (que corre con latencia variable post-shutter)
+        // lee este frozenAnchorMatrix en lugar de la matriz viva, así
+        // todos los anchors quedan tomados en el mismo instante físico
+        // que la foto.
+        if (!isZenithCapture && hasLastAbsRotationMatrix) {
+            val nowNs = SystemClock.elapsedRealtimeNanos()
+            val diag = IntArray(1)
+            val avgMatrix = rotvecBuffer.averageOverWindow(
+                endTimeNs = nowNs,
+                windowMs = ROTVEC_ANCHOR_AVG_WINDOW_MS,
+                outDiag = diag
+            )
+            if (avgMatrix != null) {
+                System.arraycopy(avgMatrix, 0, frozenAnchorMatrix, 0, 9)
+                frozenAnchorTimestampNs = nowNs
+                hasFrozenAnchor = true
+                Log.d(
+                    "Z0GyroTransport",
+                    "ANCHOR_FROZEN avg samples=${diag[0]} window=${ROTVEC_ANCHOR_AVG_WINDOW_MS}ms"
+                )
+            } else {
+                // Fallback: snapshot instantáneo si la ventana quedó vacía
+                // (improbable pero defensivo).
+                System.arraycopy(lastAbsRotationMatrix, 0, frozenAnchorMatrix, 0, 9)
+                frozenAnchorTimestampNs = lastAbsTsNs
+                hasFrozenAnchor = true
+                Log.w(
+                    "Z0GyroTransport",
+                    "ANCHOR_FROZEN_FALLBACK no samples in window, using instant snapshot"
+                )
+            }
+        } else {
+            hasFrozenAnchor = false
         }
 
         val frozenPose = CapturedPose(
@@ -1284,27 +1331,32 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     appendFrameRecord(file, target, capturedFiles.size, frozenPose)
 
                     // ============================================================
-                    // GYRO TRANSPORT ANCHOR (Fase 7)
+                    // GYRO TRANSPORT ANCHOR (Fase 7 + Refinement 1)
                     // ============================================================
-                    // Cada vez que se captura un frame que NO es Z0, actualizamos
-                    // el anchor con la matriz rotvec instantánea + timestamp del
-                    // sensor. Cuando llegue el shutter del Z0, este anchor va a
-                    // apuntar al H45 inmediatamente anterior, y propagamos por
-                    // gyro desde ahí hasta el momento del Z0.
+                    // Cada vez que se captura un frame que NO es Z0, copiamos el
+                    // FROZEN anchor (computado al inicio de takePhotoForTarget,
+                    // antes del cap.takePicture) como anchor para el gyro
+                    // transport del próximo Z0.
                     //
-                    // Snapshot atómico: lastAbsRotationMatrix y lastAbsTsNs se
-                    // actualizan en el mismo handler de TYPE_ROTATION_VECTOR, así
-                    // que copiarlos secuencialmente acá no introduce desincronización
-                    // en práctica (peor caso ~5ms = 0.025° de drift adicional, despreciable).
-                    if (!isZenithCapture && hasLastAbsRotationMatrix) {
-                        System.arraycopy(lastAbsRotationMatrix, 0, gyroAnchorMatrix, 0, 9)
-                        gyroAnchorTimestampNs = lastAbsTsNs
+                    // Por qué frozen y no live:
+                    //   - El callback onImageSaved corre con latencia variable
+                    //     post-shutter (50-200ms). Si copiáramos el snapshot
+                    //     LIVE acá, el celular probablemente ya empezó a moverse
+                    //     hacia el siguiente target, contaminando el anchor con
+                    //     la transición.
+                    //   - frozenAnchorMatrix se computó en el mismo instante
+                    //     físico que la foto, promediando los 200ms previos
+                    //     (reducción de jitter √40 ≈ 6×).
+                    if (!isZenithCapture && hasFrozenAnchor) {
+                        System.arraycopy(frozenAnchorMatrix, 0, gyroAnchorMatrix, 0, 9)
+                        gyroAnchorTimestampNs = frozenAnchorTimestampNs
                         hasGyroAnchor = true
                         Log.d(
                             "Z0GyroTransport",
                             "ANCHOR_UPDATED frame=${file.nameWithoutExtension} " +
                                     "tsNs=$gyroAnchorTimestampNs " +
-                                    "shotIndex=${capturedFiles.size}"
+                                    "shotIndex=${capturedFiles.size} " +
+                                    "source=FROZEN_AVG"
                         )
                     }
 
