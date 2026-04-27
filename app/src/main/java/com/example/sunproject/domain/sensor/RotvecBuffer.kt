@@ -100,7 +100,10 @@ class RotvecBuffer(
         val avgMat = Mat(3, 3, CvType.CV_64F)
         val avgArr = DoubleArray(9)
         for (j in 0 until 9) avgArr[j] = sum[j] / n
-        avgMat.put(0, 0, avgArr)
+        // Spread operator: Mat.put(Int, Int, vararg Double) requiere
+        // expandir el DoubleArray como varargs. Sin el `*`, Kotlin no
+        // matchea ninguna sobrecarga (no hay put(Int, Int, DoubleArray)).
+        avgMat.put(0, 0, *avgArr)
 
         val w = Mat()
         val u = Mat()
