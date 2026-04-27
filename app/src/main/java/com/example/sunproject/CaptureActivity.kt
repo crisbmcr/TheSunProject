@@ -2603,7 +2603,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // Reducción de ruido √40 ≈ 6×. La parte de baja frecuencia
         // (sesgo del magnetómetro durante todo el ring) NO se atenúa
         // con esto — ese es el techo físico.
-        private const val ROTVEC_ANCHOR_AVG_WINDOW_MS = 200L
+        private const val ROTVEC_ANCHOR_AVG_WINDOW_MS = 400L
 
         // Capacidad del buffer del rotvec. 256 samples a SENSOR_DELAY_GAME
         // cubre ~1.3s, holgura amplia para ventanas de 200ms.
