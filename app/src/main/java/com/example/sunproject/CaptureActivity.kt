@@ -139,6 +139,26 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var gyroAnchorTimestampNs: Long = 0L
     private var hasGyroAnchor: Boolean = false
 
+    // Buffer circular del rotvec para promediar el anchor en una ventana
+    // alrededor del shutter. Refinement 1 de Fase 7: reduce el ruido
+    // alta-frecuencia del Kalman interno (jitter ~±0.5-1°) por factor √N.
+    private val rotvecBuffer = com.example.sunproject.domain.sensor.RotvecBuffer(
+        capacity = ROTVEC_BUFFER_CAPACITY
+    )
+
+    // Anchor congelado al inicio de takePhotoForTarget. Sigue el mismo
+    // patrón que frozenPose: capturado ANTES del shutter, guardado para
+    // que onImageSaved lo persista cuando el callback eventualmente corra
+    // (con latencia variable de la cámara).
+    //
+    // Es la matriz promediada via SVD sobre los últimos
+    // ROTVEC_ANCHOR_AVG_WINDOW_MS antes de disparar la cámara.
+    // Si la ventana no tiene samples (caso patológico), se cae al
+    // snapshot instantáneo de lastAbsRotationMatrix.
+    private val frozenAnchorMatrix = FloatArray(9)
+    private var frozenAnchorTimestampNs: Long = 0L
+    private var hasFrozenAnchor: Boolean = false
+
     // Vector gravity instantáneo más reciente (en device frame).
     // Se usa para refinar el tilt del Z0 luego del transporte.
     private val instantGravity = FloatArray(3)
@@ -555,6 +575,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
             Sensor.TYPE_ROTATION_VECTOR -> {
                 updateLastAbsRotationMatrix(event.values)
+                // Push al buffer circular para promedio del anchor.
+                // lastAbsRotationMatrix recién quedó actualizado en la
+                // línea anterior, así que es la matriz coherente con
+                // event.timestamp.
+                rotvecBuffer.pushSample(event.timestamp, lastAbsRotationMatrix)
                 val raw = extractAnglesFromRotationVector(event.values)
 
                 val rawAz = applyDeclination(raw[0])
@@ -2513,6 +2538,25 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // intervalo de integración. Un gap > 200ms suele indicar que
         // Android pausó el sensor y la integración ya no es confiable.
         private const val GYRO_MAX_GAP_NS = 200_000_000L
+
+        // ============================================================
+        // ANCHOR ROTVEC AVERAGING (Refinement 1, Fase 7)
+        // ============================================================
+        // El anchor del último H45 se promediaba como snapshot instantáneo
+        // del rotvec. Un sample único tiene jitter del Kalman interno de
+        // ±0.5-1°. Promediando los últimos N ms en una ventana antes del
+        // shutter, el ruido alta-frecuencia se atenúa por √N samples.
+        //
+        // Ventana de 200ms a SENSOR_DELAY_GAME (~200 Hz) ≈ 40 samples.
+        // Reducción de ruido √40 ≈ 6×. La parte de baja frecuencia
+        // (sesgo del magnetómetro durante todo el ring) NO se atenúa
+        // con esto — ese es el techo físico.
+        private const val ROTVEC_ANCHOR_AVG_WINDOW_MS = 200L
+
+        // Capacidad del buffer del rotvec. 256 samples a SENSOR_DELAY_GAME
+        // cubre ~1.3s, holgura amplia para ventanas de 200ms.
+        private const val ROTVEC_BUFFER_CAPACITY = 256
+    }
     }
 }
 
