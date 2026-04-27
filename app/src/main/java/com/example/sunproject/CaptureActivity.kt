@@ -2388,11 +2388,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val gy = gDevice[1] / gNorm
         val gz = gDevice[2] / gNorm
 
-        // up_measured en world = R · (-g_device_normalized).
-        // Es la dirección que la gravedad medida "dice que es Up" expresada en world.
-        val upMx = -(R[0]*gx + R[1]*gy + R[2]*gz)
-        val upMy = -(R[3]*gx + R[4]*gy + R[5]*gz)
-        val upMz = -(R[6]*gx + R[7]*gy + R[8]*gz)
+        // up_measured en world = R · g_device_normalized.
+        // TYPE_GRAVITY de Android apunta hacia ARRIBA en device frame (es la
+        // dirección "Up" que siente el celular en reposo, no la aceleración
+        // gravitacional hacia abajo). Por lo tanto NO hay que invertir el signo:
+        // R · g_device = up_world directamente.
+        val upMx = R[0]*gx + R[1]*gy + R[2]*gz
+        val upMy = R[3]*gx + R[4]*gy + R[5]*gz
+        val upMz = R[6]*gx + R[7]*gy + R[8]*gz
 
         // up_propagated en world: la dirección Up del world según R actual = (0, 0, 1).
         // Si R fuera "perfecta", upMx,upMy,upMz ya serían (0,0,1). El desalineamiento
@@ -2421,7 +2424,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val az = axZ / axNorm
 
         // Construir R_correction (Rodrigues) que rota upM hacia (0,0,1).
-        val theta = -angleRad   // ojo signo: queremos llevar upM hacia +Z, no al revés
+        // angleRad es el ángulo entre upM y +Z; el eje (axX,axY,axZ) viene de
+        // upM × (0,0,1), que es la dirección correcta para rotar upM HACIA +Z
+        // con ángulo positivo. No hace falta negar.
+        val theta = angleRad
         val c = kotlin.math.cos(theta)
         val s = kotlin.math.sin(theta)
         val omc = 1f - c
