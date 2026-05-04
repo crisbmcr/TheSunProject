@@ -206,10 +206,20 @@ object ZenithMatrixProjector {
         val srcW = src.width
         val srcH = src.height
 
-        val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
+        // Cuando el Z0 viene de gyro transport (Fase 7), su matriz ya
+        // está en el frame del cluster H0/H45 — el transporte por gyro
+        // hereda la pose del último H45 sin pasar por el magnetómetro.
+        // Aplicar yawCorrection (Fase 3) acá lo desalinearía respecto
+        // al cluster.
+        //
+        // Si en el futuro queremos alinear todo el atlas a true-N,
+        // la corrección debe aplicarse a TODOS los frames (H0 + H45 + Z0)
+        // por igual al exportar el atlas, NO solo al Z0 al renderizarlo.
+        val correctionDeg = 0f
         Log.d(
             "ZenithMatrix",
-            "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}°"
+            "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}° " +
+                    "(disabled because gyro transport keeps Z0 in cluster frame)"
         )
 
         val (lut, mask) = buildEquirectLut(
