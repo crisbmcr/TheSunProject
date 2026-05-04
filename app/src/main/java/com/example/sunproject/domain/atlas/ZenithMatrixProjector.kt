@@ -37,10 +37,20 @@ import kotlin.math.tan
  */
 object ZenithMatrixProjector {
 
-    // Peso maximo que un Z0 puede aportar por pixel. El resto del atlas
-    // (H0+H45) ya cubre altitudes medias; el Z0 solo debe dominar cerca
-    // del polo.
-    private const val ZENITH_MAX_WEIGHT = 0.40f
+    // Peso maximo que un Z0 puede aportar por pixel.
+    //
+    // Subido de 0.40 a 1.0 (sin cap efectivo). Razón: con 0.40 el Z0
+    // contribuye solo ~28% del color cuando se solapa con H45 (peso 1.0)
+    // en la zona alta del polo, lo que blanqueaba el Z0 al promediarse
+    // con bordes deformados de H45 que también llegan a esa zona.
+    //
+    // El fade por altitud (ZENITH_FADE_START_ALT_DEG=74°, FULL=82°) se
+    // mantiene: el Z0 sigue sin escribir abajo de 74° y entra suave
+    // entre 74°-82°, así que no invade la zona donde H45 es la fuente
+    // correcta. Por encima de 82° el Z0 ahora puede dominar totalmente.
+    //
+    // No se tocan los H45 ni el path projectBitmapToAtlas.
+    private const val ZENITH_MAX_WEIGHT = 1.0f
 
     // Fade por altitud. Debajo de 74deg el Z0 no escribe nada; entre 74
     // y 82 entra suave; arriba de 82 escribe con peso pleno.
