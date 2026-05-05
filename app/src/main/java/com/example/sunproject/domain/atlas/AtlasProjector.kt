@@ -100,6 +100,16 @@ private const val ZENITH_ERP_FADE_START_ALT_DEG = 74f
 private const val ZENITH_ERP_FADE_FULL_ALT_DEG = 82f
 private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 
+// Cambio A (anti-blanqueamiento polo): fade-out de H0/H45 hacia el polo.
+// Razón: en altitudes >80° el remap inverso replica el top-edge de cada H45
+// sobre muchos pixels del atlas (zona equirectangular comprimida en y).
+// Esos pixels deformados, sumados entre 2-3 H45 vecinos, contaminan la cap
+// polar donde el Z0 debería dominar. Apagamos H45 a partir de 80°
+// (Z0 ya tiene ~84% de peso ahí por su smoothstep 74→82) y llegamos a 0
+// a 88°, dejando el polo limpio para el Z0.
+private const val H45_POLAR_FADE_START_ALT_DEG = 80f
+private const val H45_POLAR_FADE_FULL_ALT_DEG = 88f
+
 
 
 private data class RgbGain(
@@ -1275,7 +1285,21 @@ object AtlasProjector {
                         1f
                     }
 
-                    val finalWeight = rawWeight * zenithAltitudeAlpha * baseSuppression
+                    // Cambio A: para frames no-zenithLike (H0/H45), atenuar al
+                    // acercarse al polo. Z0 va por ZenithMatrixProjector con su
+                    // propio fade, así que zenithPose==null marca exactamente
+                    // los frames que tenemos que apagar acá.
+                    val polarFadeForNonZenith = if (zenithPose == null) {
+                        1f - smoothstep(
+                            H45_POLAR_FADE_START_ALT_DEG,
+                            H45_POLAR_FADE_FULL_ALT_DEG,
+                            altDeg
+                        )
+                    } else {
+                        1f
+                    }
+
+                    val finalWeight = rawWeight * zenithAltitudeAlpha * baseSuppression * polarFadeForNonZenith
                     if (finalWeight <= 0f) continue
 
                     atlas.blendPixel(x, y, color, finalWeight)
