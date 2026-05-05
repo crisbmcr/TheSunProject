@@ -216,20 +216,26 @@ object ZenithMatrixProjector {
         val srcW = src.width
         val srcH = src.height
 
-        // Cuando el Z0 viene de gyro transport (Fase 7), su matriz ya
-        // está en el frame del cluster H0/H45 — el transporte por gyro
-        // hereda la pose del último H45 sin pasar por el magnetómetro.
-        // Aplicar yawCorrection (Fase 3) acá lo desalinearía respecto
-        // al cluster.
+        // Coherencia con projectBitmapToAtlas: los H0/H45 se proyectan
+        // vía baseYawDeg() que SUMA cachedGyroToTrueNorthCorrectionDeg
+        // a measuredAzimuthDeg para llevarlos al frame true-N. La matriz
+        // del Z0 viene de gyro transport y por lo tanto vive en el mismo
+        // frame rotvec/mag-N que las matrices de los H45 — pero los H45,
+        // al proyectarse, se rotan a true-N. El Z0 tiene que aplicar la
+        // misma rotación o queda desalineado del cluster por exactamente
+        // cachedGyroToTrueNorthCorrectionDeg.
         //
-        // Si en el futuro queremos alinear todo el atlas a true-N,
-        // la corrección debe aplicarse a TODOS los frames (H0 + H45 + Z0)
-        // por igual al exportar el atlas, NO solo al Z0 al renderizarlo.
-        val correctionDeg = 0f
+        // El comentario anterior decía "el Z0 ya está en frame cluster
+        // por gyro transport, no aplicar corrección". Estaba mal razonado:
+        // el frame del cluster en el ATLAS FINAL es true-N, no mag-N. Sin
+        // este fix, el Z0 quedaba rotado respecto a los H45 vecinos por
+        // 5-10° (declinación + ruido del anchor inicial), produciendo
+        // ghost visible de cables/objetos en el borde de la cap polar.
+        val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
         Log.d(
             "ZenithMatrix",
             "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}° " +
-                    "(disabled because gyro transport keeps Z0 in cluster frame)"
+                    "(matching projectBitmapToAtlas baseYawDeg behavior)"
         )
 
         val (lut, mask) = buildEquirectLut(
