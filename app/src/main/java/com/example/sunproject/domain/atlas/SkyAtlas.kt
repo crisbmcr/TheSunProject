@@ -46,6 +46,27 @@ class SkyAtlas(val config: AtlasConfig) {
         pixels[idx] = Color.argb(255, r, g, b)
         weightSums[idx] = total
     }
+
+    /**
+     * Sobreescribe el pixel y reemplaza el peso acumulado, descartando
+     * lo escrito previamente en esa posición. Usado por el Z0 en la cap
+     * polar absoluta (altitud >= ZENITH_FADE_FULL_ALT_DEG) donde el Z0
+     * es la única fuente correcta y la mezcla con H45 sólo introduce
+     * ruido de las esquinas pinhole estiradas.
+     *
+     * Cualquier blendPixel posterior va a promediar contra este color
+     * como si overwritePixel hubiera sido el primer escritor con ese
+     * peso. En el pipeline actual el Z0 es el último frame, así que no
+     * hay writes posteriores.
+     */
+    fun overwritePixel(x: Int, y: Int, color: Int, weight: Float) {
+        if (x !in 0 until width || y !in 0 until height) return
+        if (weight <= 0f) return
+        val idx = index(x, y)
+        pixels[idx] = color
+        weightSums[idx] = weight
+    }
+
     fun hasCoverageAt(x: Int, y: Int): Boolean {
         if (x !in 0 until width || y !in 0 until height) return false
         return weightSums[index(x, y)] > 0f

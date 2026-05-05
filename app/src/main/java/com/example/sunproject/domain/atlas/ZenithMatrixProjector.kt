@@ -264,6 +264,16 @@ object ZenithMatrixProjector {
             val clampedFrameWeight = frameWeight.coerceAtMost(ZENITH_MAX_WEIGHT)
             var written = 0
 
+            // Cap polar absoluta: en altitud >= ZENITH_FADE_FULL_ALT_DEG
+            // el Z0 sobreescribe en lugar de blendear. Razón: aunque el
+            // peso del Z0 (~0.7-1.0) domina en magnitud al peso de cualquier
+            // H45 que llegó por overshoot pinhole (~0.01-0.05), el blend
+            // canal-por-canal mezcla los tonos del H45 estirado y "tira" el
+            // resultado hacia más blanco/frío. Para preservar el color
+            // natural del Z0 sin retoques, usamos overwritePixel ahí.
+            //
+            // En la banda de fade (74°-82°) seguimos blendeando para no
+            // crear un seam visible al borde del cap.
             for (y in 0 until h) {
                 val altDeg = AtlasMath.yToAltitude(y, atlas.config)
                 val altAlpha = smoothstep(
@@ -276,6 +286,8 @@ object ZenithMatrixProjector {
                 val rowWeight = clampedFrameWeight * altAlpha
                 if (rowWeight <= 0f) continue
 
+                val isHardZenithCap = altDeg >= ZENITH_FADE_FULL_ALT_DEG
+
                 val rowBase = y * w
                 for (x in 0 until w) {
                     if (maskBytes[rowBase + x] == 0.toByte()) continue
@@ -284,7 +296,11 @@ object ZenithMatrixProjector {
                     val g = rgba[i + 1].toInt() and 0xFF
                     val b = rgba[i + 2].toInt() and 0xFF
                     val argb = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                    atlas.blendPixel(x, y, argb, rowWeight)
+                    if (isHardZenithCap) {
+                        atlas.overwritePixel(x, y, argb, rowWeight)
+                    } else {
+                        atlas.blendPixel(x, y, argb, rowWeight)
+                    }
                     written++
                 }
             }
