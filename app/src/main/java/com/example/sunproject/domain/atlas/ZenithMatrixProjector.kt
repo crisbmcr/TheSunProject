@@ -216,26 +216,23 @@ object ZenithMatrixProjector {
         val srcW = src.width
         val srcH = src.height
 
-        // Coherencia con projectBitmapToAtlas: los H0/H45 se proyectan
-        // vía baseYawDeg() que SUMA cachedGyroToTrueNorthCorrectionDeg
-        // a measuredAzimuthDeg para llevarlos al frame true-N. La matriz
-        // del Z0 viene de gyro transport y por lo tanto vive en el mismo
-        // frame rotvec/mag-N que las matrices de los H45 — pero los H45,
-        // al proyectarse, se rotan a true-N. El Z0 tiene que aplicar la
-        // misma rotación o queda desalineado del cluster por exactamente
-        // cachedGyroToTrueNorthCorrectionDeg.
+        // Atlas vive en mag-N puro (estado de Fase 7). La matriz
+        // rWorldDevice del Z0 viene del gyro transport heredando del
+        // último H45, y vive en el mismo frame rotvec/mag-N que las
+        // matrices de los H45. Como baseYawDeg de los H0/H45 también
+        // proyecta en mag-N (sin sumar correctionDeg), los tres rings
+        // quedan alineados automáticamente sin necesidad de aplicar
+        // ninguna corrección acá.
         //
-        // El comentario anterior decía "el Z0 ya está en frame cluster
-        // por gyro transport, no aplicar corrección". Estaba mal razonado:
-        // el frame del cluster en el ATLAS FINAL es true-N, no mag-N. Sin
-        // este fix, el Z0 quedaba rotado respecto a los H45 vecinos por
-        // 5-10° (declinación + ruido del anchor inicial), produciendo
-        // ghost visible de cables/objetos en el borde de la cap polar.
-        val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
+        // GyroCameraController de la vista 3D consume
+        // cachedGyroToTrueNorthCorrectionDeg para llevar la cámara
+        // virtual a true-N — eso afecta dónde caen los overlays solares
+        // pero no toca el atlas en sí.
+        val correctionDeg = 0f
         Log.d(
             "ZenithMatrix",
             "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}° " +
-                    "(matching projectBitmapToAtlas baseYawDeg behavior)"
+                    "(disabled: atlas vive en mag-N como en Fase 7)"
         )
 
         val (lut, mask) = buildEquirectLut(

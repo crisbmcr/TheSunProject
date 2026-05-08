@@ -313,16 +313,15 @@ object AtlasProjector {
         )
     }
     private fun baseYawDeg(frame: FrameRecord): Float {
-        val correctionDeg = cachedGyroToTrueNorthCorrectionDeg ?: 0f
-        // Para H0/H45: gyro + correción = true-N
-        // Para Z0: absAzimuthDeg (si existe) ya lleva declinación por applyDeclination;
-        //         si cae al fallback measuredAzimuthDeg, sumamos la corrección.
-        val baseDeg = if (frame.ringId.equals("Z0", ignoreCase = true)) {
-            frame.absAzimuthDeg ?: (frame.measuredAzimuthDeg + correctionDeg)
-        } else {
-            frame.measuredAzimuthDeg + correctionDeg
-        }
-        return normalizeTwistDeg(baseDeg)
+        // Atlas vive en mag-N puro (estado documentado de Fase 7).
+        // La corrección mag→true-N (cachedGyroToTrueNorthCorrectionDeg)
+        // se sigue computando pero NO se aplica acá — la consume solo
+        // GyroCameraController para rotar la viewMatrix de la vista 3D.
+        // De esa forma atlas y cámara virtual quedan en frames consistentes
+        // (ambos mag-N a nivel del atlas; la cámara aplica la corrección
+        // adicional para que los overlays solares calculados en true-N
+        // caigan donde corresponde).
+        return normalizeTwistDeg(frame.measuredAzimuthDeg)
     }
 
 
