@@ -79,6 +79,8 @@ configurations.all {
 dependencies {
     // --- DEPENDENCIA AL MÓDULO DE OPENCV ---
     implementation("org.opencv:opencv:4.10.0")
+
+    implementation("org.apache.commons:commons-math3:3.6.1")
     // --- DEPENDENCIAS EXISTENTES ---
     implementation(libs.androidx.core.ktx)
     implementation("androidx.appcompat:appcompat:1.6.1")

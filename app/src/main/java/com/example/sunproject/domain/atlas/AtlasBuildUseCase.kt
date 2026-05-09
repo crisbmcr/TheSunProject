@@ -1,11 +1,21 @@
 package com.example.sunproject.domain.atlas
 
+import android.util.Log
 import com.example.sunproject.data.storage.JsonSessionStore
 import java.io.File
 
 class AtlasBuildUseCase(
     private val store: JsonSessionStore = JsonSessionStore()
 ) {
+    companion object {
+        /**
+         * Activa el refinamiento global de poses H0/H45 con bundle adjustment
+         * antes de proyectar al atlas. Para A/B comparativo: poner false
+         * deja el comportamiento original (seed IMU sin refinar).
+         */
+        const val USE_BUNDLE_ADJUSTMENT_H0_H45 = true
+    }
+
     private fun newAtlas(): SkyAtlas =
         SkyAtlas(
             AtlasConfig(
@@ -47,9 +57,26 @@ class AtlasBuildUseCase(
 
     fun buildProjectedAtlas(sessionDir: File): File {
         val paths = store.createSessionPaths(sessionDir)
-        val frames = store.loadFrames(paths).sortedBy { it.shotIndex }
+        val rawFrames = store.loadFrames(paths).sortedBy { it.shotIndex }
 
-        require(frames.isNotEmpty()) { "No hay frames en la sesión." }
+        require(rawFrames.isNotEmpty()) { "No hay frames en la sesión." }
+
+        // Refinamiento global de poses H0/H45 via bundle adjustment.
+        // Si está deshabilitado o el BA no converge, refineOrFallback devuelve
+        // los frames sin tocar. La geometría absoluta del atlas (azimut/altitud
+        // respecto del norte verdadero) está protegida por la regularización
+        // al seed IMU dentro del BA — ver AtlasBundleAdjuster.kt.
+        val frames = if (USE_BUNDLE_ADJUSTMENT_H0_H45) {
+            val tStart = System.currentTimeMillis()
+            val refined = AtlasBundleAdjuster.refineOrFallback(rawFrames)
+            Log.i(
+                "AtlasBuildUseCase",
+                "BA total elapsed=${System.currentTimeMillis() - tStart}ms"
+            )
+            refined
+        } else {
+            rawFrames
+        }
 
         val atlas = newAtlas()
         AtlasProjector.projectFramesToAtlas(frames, atlas)
