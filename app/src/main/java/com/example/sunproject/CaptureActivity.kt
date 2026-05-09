@@ -42,6 +42,7 @@ import com.example.sunproject.data.storage.JsonSessionStore
 import com.example.sunproject.data.storage.SessionPaths
 import android.content.Intent
 import com.example.sunproject.domain.atlas.AtlasBuildUseCase
+import com.example.sunproject.domain.camera.CameraIntrinsicsProbe
 import kotlin.math.acos
 import kotlin.math.cos
 import kotlin.math.sin
@@ -1519,6 +1520,27 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 "PanoramaCAP",
                 "CameraId=$currentCameraId HFOV=${currentHfovDeg} VFOV=${currentVfovDeg}"
             )
+
+            // PROBE Camera2 calibration metadata (Fase 1: solo diagnóstico).
+            // Si el OEM expone LENS_DISTORTION y LENS_INTRINSIC_CALIBRATION, se
+            // loggean los k1..k3, p1, p2, fx, fy, cx, cy reales y un veredicto
+            // sobre la magnitud de la distorsión radial. NO se integran todavía
+            // al pipeline — eso es Fase 2, condicional a este resultado.
+            val probe = CameraIntrinsicsProbe.probe(
+                currentCameraId ?: "unknown",
+                characteristics
+            )
+            val verdictMsg = when (probe.verdict) {
+                CameraIntrinsicsProbe.Verdict.NOT_AVAILABLE ->
+                    "Cámara: no expone calibración Camera2"
+                CameraIntrinsicsProbe.Verdict.LOW ->
+                    "Cámara: distorsión leve <0.5°"
+                CameraIntrinsicsProbe.Verdict.MODERATE ->
+                    "Cámara: distorsión moderada ~${"%.1f".format(probe.distortionAt100PctEdgeDeg)}°"
+                CameraIntrinsicsProbe.Verdict.HIGH ->
+                    "Cámara: distorsión alta ~${"%.1f".format(probe.distortionAt100PctEdgeDeg)}°"
+            }
+            Toast.makeText(this, verdictMsg, Toast.LENGTH_LONG).show()
         }
     }
 
