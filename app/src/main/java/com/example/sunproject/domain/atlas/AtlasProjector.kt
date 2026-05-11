@@ -110,7 +110,12 @@ private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 private const val H45_POLAR_FADE_START_ALT_DEG = 80f
 private const val H45_POLAR_FADE_FULL_ALT_DEG = 88f
 
-
+// FASE 2: usar cv::detail::MultiBandBlender para H0/H45.
+// Cuando true, reemplaza el path píxel-a-píxel del blending con
+// multi-band sobre el atlas completo. Z0 sigue por su path.
+// Si falla por OOM u otro error, hace fallback automático al path
+// píxel-a-píxel.
+private const val USE_MULTIBAND_BLENDER_H0_H45 = true
 
 private data class RgbGain(
     val r: Float,
@@ -967,35 +972,55 @@ object AtlasProjector {
                     "hasPersisted=${persistedMountBasis != null}"
         )
 
-        nonZenithFrames.forEach { frame ->
-            val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
-                Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
-                return@forEach
-            }
+        val multiBandSucceeded = if (USE_MULTIBAND_BLENDER_H0_H45) {
+            MultiBandAtlasBlender.blendH0H45Frames(nonZenithFrames, atlas)
+        } else {
+            false
+        }
 
-            try {
-                val frameWeight = qualityWeightForFrame(frame)
-
-                Log.d(
+        if (multiBandSucceeded) {
+            Log.i(
+                "AtlasProjector",
+                "Multi-band blending succeeded for H0/H45 (${nonZenithFrames.size} frames); " +
+                        "skipping per-pixel projection"
+            )
+        } else {
+            if (USE_MULTIBAND_BLENDER_H0_H45) {
+                Log.w(
                     "AtlasProjector",
-                    "frame=${frame.frameId} ring=${frame.ringId} " +
-                            "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
-                            "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
-                            "weight=${"%.3f".format(frameWeight)}"
+                    "Multi-band blending failed; falling back to per-pixel projection"
                 )
+            }
+            nonZenithFrames.forEach { frame ->
+                val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
+                    Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
+                    return@forEach
+                }
 
-                projectBitmapToAtlas(
-                    frame = frame,
-                    src = src,
-                    atlas = atlas,
-                    frameWeight = frameWeight,
-                    zenithTwistDegOverride = null,
-                    zenithPitchOffsetDegOverride = null,
-                    zenithRollOffsetDegOverride = null,
-                    emitLogs = true
-                )
-            } finally {
-                src.recycle()
+                try {
+                    val frameWeight = qualityWeightForFrame(frame)
+
+                    Log.d(
+                        "AtlasProjector",
+                        "frame=${frame.frameId} ring=${frame.ringId} " +
+                                "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                                "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                                "weight=${"%.3f".format(frameWeight)}"
+                    )
+
+                    projectBitmapToAtlas(
+                        frame = frame,
+                        src = src,
+                        atlas = atlas,
+                        frameWeight = frameWeight,
+                        zenithTwistDegOverride = null,
+                        zenithPitchOffsetDegOverride = null,
+                        zenithRollOffsetDegOverride = null,
+                        emitLogs = true
+                    )
+                } finally {
+                    src.recycle()
+                }
             }
         }
 
