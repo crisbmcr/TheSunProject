@@ -258,12 +258,12 @@ object MultiBandAtlasBlender {
         // Release G pyramid of image
         gImg.forEach { it.release() }
 
-        // 5. Accumulate per band
+        // 5. Accumulate per band. lImg[b] viene de la pirámide de
+        //    img*mask, así que la máscara ya está "pesada" en cada
+        //    banda. NO se multiplica de nuevo por gMask[b] acá —
+        //    eso sería doble premultiplicación y oscurece el atlas.
         for (b in 0..numBands) {
-            val weighted = multiplyImage3CByMask1C(lImg[b], gMask[b])
-            Core.add(accumImg[b], weighted, accumImg[b])
-            weighted.release()
-
+            Core.add(accumImg[b], lImg[b], accumImg[b])
             Core.add(accumMask[b], gMask[b], accumMask[b])
         }
 
