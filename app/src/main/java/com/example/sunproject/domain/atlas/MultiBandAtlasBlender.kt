@@ -6,12 +6,12 @@ import android.graphics.Color
 import android.util.Log
 import com.example.sunproject.SunProjectApp
 import com.example.sunproject.data.model.FrameRecord
+import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.Point
-import org.opencv.core.Rect
 import org.opencv.core.Scalar
-import org.opencv.stitching.Detail_MultiBandBlender
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
@@ -21,63 +21,64 @@ import kotlin.math.tan
 /**
  * Fase 2: Multi-band blending sobre el atlas equirectangular.
  *
- * ============================================================
- * QUÉ HACE
- * ============================================================
- * Reemplaza el path píxel-a-píxel para H0/H45 con un blending tipo
- * Burt-Adelson via cv::detail::MultiBandBlender de OpenCV:
- *
- *   1. Para cada frame, warpea la imagen al espacio del atlas
- *      equirectangular (proyección directa, no inversa).
- *   2. Genera máscara de peso por píxel con feathering radial lineal
- *      modulado por el quality weight del frame.
- *   3. Alimenta al blender con (imagen 16SC3, máscara 8UC1, top_left).
- *   4. Blend final → escribe al atlas.pixels.
- *
- * El blender descompone cada frame en una pirámide laplaciana y la
- * máscara en una pirámide gaussiana. Las bandas bajas se mezclan
- * con feathering amplio; las altas con feathering estrecho. Resultado:
- * los detalles de altas frecuencias vienen mayoritariamente de UN
- * frame por zona, en vez de promediarse → esconde geometric ghost.
+ * Implementación manual de Burt-Adelson (1983) porque el módulo
+ * cv::detail::MultiBandBlender no está expuesto en los bindings Java
+ * del AAR de OpenCV Android.
  *
  * ============================================================
- * QUÉ NO HACE
+ * ALGORITMO
  * ============================================================
- * - No toca el Z0 (lo escribe ZenithMatrixProjector después del blend).
- * - No corrige geometría real: si dos frames están misalineados 2°,
- *   el contenido sigue en lugares distintos, pero el seam visible es
- *   menos abrupto que con weighted average puro.
- * - No corrige white balance ni exposure global entre frames (eso lo
- *   sigue haciendo estimateFrameRgbGain en AtlasProjector si querés
- *   integrarlo después). El blender opera sobre los colores ya como
- *   vienen del frame.
+ * Para cada frame H0/H45:
+ *   1. Warpear al espacio del atlas equirectangular completo
+ *   2. Construir pirámide gaussiana de la máscara de peso
+ *   3. Construir pirámide laplaciana de la imagen (premultiplicada
+ *      por la máscara para que pyrDown no sangre desde el background
+ *      negro)
+ *   4. Acumular incremental en buffers globales banda por banda:
+ *        accumImg[b]  += L_img[b] * G_mask[b]   (channel-wise)
+ *        accumMask[b] += G_mask[b]
+ *
+ * Al final de todos los frames:
+ *   5. Normalizar cada banda: blended[b] = accumImg[b] / accumMask[b]
+ *   6. Reconstruir desde la cima:
+ *        result = blended[N] + pyrUp(blended[N-1] + pyrUp(... + blended[0]))
+ *   7. Copiar al atlas.pixels donde coverage > epsilon
+ *
+ * Resultado: detalles de altas frecuencias vienen mayoritariamente
+ * de UN frame por zona (en vez de promediarse) → esconde ghost
+ * geométrico residual.
+ *
+ * No toca el Z0 (esos quedan para ZenithMatrixProjector después).
  *
  * ============================================================
- * MEMORIA
+ * MEMORIA / TIEMPO
  * ============================================================
- * Pico estimado para atlas 3600x900 con 20 frames y 5 bandas:
- *   - Warp por frame: 19.4 MB (CV_16SC3) + 3.2 MB (mask) = 22.6 MB
- *   - Pirámides internas del blender: ~30 MB (5 bandas, CV_16SC3)
- *   - Total pico: ~75 MB durante el blend
- * Aceptable en devices ≥ 4 GB RAM. Si OOM en devices low-end, hay
- * que optimizar usando bounding rects en lugar de atlas completo.
+ * Pico estimado para atlas 3600x900, 20 frames, 4 bandas:
+ *   - Acumuladores globales: ~67 MB persistentes
+ *   - Pirámides por frame procesado: ~80 MB temp
+ *   - Mat warped y multiplicaciones: ~60 MB temp
+ *   Total pico: ~200 MB durante procesamiento.
+ *
+ * Si OOM, bajar DEFAULT_NUM_BANDS a 3.
+ *
+ * Tiempo estimado: 60-120s para 20 frames en Android moderno.
  */
 object MultiBandAtlasBlender {
 
     private const val TAG = "MultiBandAtlasBlender"
 
-    private const val DEFAULT_NUM_BANDS = 5
-    private const val MIN_QUALITY_WEIGHT_TO_FEED = 0.05f
+    // Menos bandas = menos memoria + menos detalle en suavizado de seams.
+    // 4 es un compromiso razonable.
+    private const val DEFAULT_NUM_BANDS = 4
 
-    // Quality weight constants — mismo criterio H0/H45 que AtlasProjector
+    private const val MIN_QUALITY_WEIGHT_TO_FEED = 0.05f
+    private const val MIN_COVERAGE_FOR_OUTPUT = 1e-5f
+
+    // Quality weight constants (mismo criterio H0/H45 que AtlasProjector)
     private const val QW_MAX_AZ_ERR = 8f
     private const val QW_MAX_PITCH_ERR = 6f
     private const val QW_MAX_ROLL_ERR = 8f
 
-    /**
-     * Renderiza los frames H0/H45 al atlas usando multi-band blending.
-     * Retorna true si tuvo éxito; false para fallback al path píxel-a-píxel.
-     */
     fun blendH0H45Frames(
         frames: List<FrameRecord>,
         atlas: SkyAtlas,
@@ -98,100 +99,225 @@ object MultiBandAtlasBlender {
                 return false
             }
 
+            val effectiveBands = computeMaxBands(atlas.width, atlas.height, numBands)
+
             Log.i(
                 TAG,
-                "starting multi-band: frames=${validFrames.size} bands=$numBands " +
+                "starting: frames=${validFrames.size} bands=$effectiveBands " +
                         "atlas=${atlas.width}x${atlas.height}"
             )
 
             val tStart = System.currentTimeMillis()
-            val fedCount = doBlend(validFrames, atlas, numBands)
+            val fedCount = doBlend(validFrames, atlas, effectiveBands)
             val elapsedMs = System.currentTimeMillis() - tStart
 
-            Log.i(TAG, "multi-band finished: fedFrames=$fedCount elapsedMs=$elapsedMs")
+            Log.i(TAG, "finished: fedFrames=$fedCount elapsedMs=$elapsedMs")
             fedCount > 0
         } catch (t: Throwable) {
-            Log.e(TAG, "multi-band blending crashed, falling back", t)
+            Log.e(TAG, "multi-band crashed, falling back", t)
             false
         }
+    }
+
+    private fun computeMaxBands(w: Int, h: Int, requested: Int): Int {
+        // Each pyrDown halves dimensions; stop when smaller side < 8 px
+        var bands = requested
+        var ww = w
+        var hh = h
+        for (i in 1..requested) {
+            ww = (ww + 1) / 2
+            hh = (hh + 1) / 2
+            if (ww < 8 || hh < 8) {
+                bands = i - 1
+                break
+            }
+        }
+        return bands.coerceAtLeast(1)
     }
 
     private fun doBlend(frames: List<FrameRecord>, atlas: SkyAtlas, numBands: Int): Int {
         val atlasW = atlas.width
         val atlasH = atlas.height
 
-        // tryGpu=0, weight_type=CV_16S (más rápido y menos memoria que CV_32F)
-        val blender = Detail_MultiBandBlender(0, numBands, CvType.CV_16S)
-        blender.prepare(Rect(0, 0, atlasW, atlasH))
+        // Precompute pyramid sizes
+        val pyramidSizes = mutableListOf<Size>()
+        var pw = atlasW
+        var ph = atlasH
+        pyramidSizes.add(Size(pw.toDouble(), ph.toDouble()))
+        for (i in 1..numBands) {
+            pw = (pw + 1) / 2
+            ph = (ph + 1) / 2
+            pyramidSizes.add(Size(pw.toDouble(), ph.toDouble()))
+        }
+
+        // Allocate global accumulators (numBands+1 levels)
+        val accumImg = Array(numBands + 1) { i ->
+            val s = pyramidSizes[i]
+            Mat.zeros(s.height.toInt(), s.width.toInt(), CvType.CV_32FC3)
+        }
+        val accumMask = Array(numBands + 1) { i ->
+            val s = pyramidSizes[i]
+            Mat.zeros(s.height.toInt(), s.width.toInt(), CvType.CV_32FC1)
+        }
 
         var fedCount = 0
 
-        for (frame in frames) {
-            val qw = qualityWeightForFrame(frame)
-            if (qw < MIN_QUALITY_WEIGHT_TO_FEED) {
-                Log.d(TAG, "skip frame=${frame.frameId} qw=${"%.3f".format(qw)} below threshold")
-                continue
-            }
-
-            val srcBitmap = BitmapFactory.decodeFile(frame.originalPath)
-            if (srcBitmap == null) {
-                Log.w(TAG, "decode failed: ${frame.originalPath}")
-                continue
-            }
-
-            try {
-                val warped = warpFrameToAtlas(frame, srcBitmap, atlas, qw)
-                if (warped == null) {
-                    Log.w(TAG, "warp produced no coverage for frame=${frame.frameId}")
+        try {
+            for (frame in frames) {
+                val qw = qualityWeightForFrame(frame)
+                if (qw < MIN_QUALITY_WEIGHT_TO_FEED) {
+                    Log.d(TAG, "skip frame=${frame.frameId} qw=${"%.3f".format(qw)}")
                     continue
                 }
+
+                val srcBitmap = BitmapFactory.decodeFile(frame.originalPath) ?: continue
                 try {
-                    blender.feed(warped.img16S, warped.mask8U, warped.topLeft)
-                    fedCount++
-                    Log.d(
-                        TAG,
-                        "fed frame=${frame.frameId} ring=${frame.ringId} " +
-                                "qw=${"%.3f".format(qw)} covered=${warped.coveredPx}px"
-                    )
+                    val warp = warpFrameToAtlas(frame, srcBitmap, atlas, qw)
+                    if (warp == null) continue
+                    try {
+                        accumulateFrame(warp.imgF, warp.maskF, accumImg, accumMask, numBands)
+                        fedCount++
+                        Log.d(TAG, "fed frame=${frame.frameId} qw=${"%.3f".format(qw)}")
+                    } finally {
+                        warp.imgF.release()
+                        warp.maskF.release()
+                    }
                 } finally {
-                    warped.img16S.release()
-                    warped.mask8U.release()
+                    srcBitmap.recycle()
                 }
-            } finally {
-                srcBitmap.recycle()
             }
-        }
 
-        if (fedCount == 0) {
-            Log.w(TAG, "no frames fed to blender; aborting")
-            return 0
-        }
+            if (fedCount == 0) {
+                Log.w(TAG, "no frames fed")
+                return 0
+            }
 
-        val result16S = Mat()
-        val resultMask = Mat()
-        try {
-            blender.blend(result16S, resultMask)
-            val result8U = Mat()
+            // Save final coverage (level 0 mask) before normalizing
+            val coverageMask = Mat()
+            accumMask[0].copyTo(coverageMask)
+
+            // Normalize each band
+            val blended = Array(numBands + 1) { b ->
+                normalizeBand(accumImg[b], accumMask[b])
+            }
+
+            // Reconstruct from top
+            val result = reconstructFromPyramid(blended)
+
+            blended.forEach { it.release() }
+
             try {
-                result16S.convertTo(result8U, CvType.CV_8U)
-                copyBlendResultToAtlas(result8U, resultMask, atlas)
+                copyResultToAtlas(result, coverageMask, atlas)
             } finally {
-                result8U.release()
+                result.release()
+                coverageMask.release()
             }
-        } finally {
-            result16S.release()
-            resultMask.release()
-        }
 
-        return fedCount
+            return fedCount
+        } finally {
+            accumImg.forEach { it.release() }
+            accumMask.forEach { it.release() }
+        }
     }
 
-    private data class WarpResult(
-        val img16S: Mat,
-        val mask8U: Mat,
-        val topLeft: Point,
-        val coveredPx: Long
-    )
+    private fun accumulateFrame(
+        imgF: Mat,
+        maskF: Mat,
+        accumImg: Array<Mat>,
+        accumMask: Array<Mat>,
+        numBands: Int
+    ) {
+        // 1. Premultiply image by mask
+        val premult = multiplyImage3CByMask1C(imgF, maskF)
+
+        // 2. Gaussian pyramid of mask
+        val gMask = Array(numBands + 1) { Mat() }
+        maskF.copyTo(gMask[0])
+        for (k in 1..numBands) {
+            Imgproc.pyrDown(gMask[k - 1], gMask[k])
+        }
+
+        // 3. Gaussian pyramid of premultiplied image
+        val gImg = Array(numBands + 1) { Mat() }
+        premult.copyTo(gImg[0])
+        premult.release()
+        for (k in 1..numBands) {
+            Imgproc.pyrDown(gImg[k - 1], gImg[k])
+        }
+
+        // 4. Laplacian pyramid: L[k] = G[k] - pyrUp(G[k+1]) for k<N, L[N]=G[N]
+        val lImg = Array(numBands + 1) { Mat() }
+        for (k in 0 until numBands) {
+            val up = Mat()
+            Imgproc.pyrUp(gImg[k + 1], up, gImg[k].size())
+            Core.subtract(gImg[k], up, lImg[k])
+            up.release()
+        }
+        gImg[numBands].copyTo(lImg[numBands])
+
+        // Release G pyramid of image
+        gImg.forEach { it.release() }
+
+        // 5. Accumulate per band
+        for (b in 0..numBands) {
+            val weighted = multiplyImage3CByMask1C(lImg[b], gMask[b])
+            Core.add(accumImg[b], weighted, accumImg[b])
+            weighted.release()
+
+            Core.add(accumMask[b], gMask[b], accumMask[b])
+        }
+
+        // Release frame's pyramids
+        lImg.forEach { it.release() }
+        gMask.forEach { it.release() }
+    }
+
+    private fun normalizeBand(accumImg: Mat, accumMask: Mat): Mat {
+        // Add small epsilon to mask to avoid division by zero
+        val safeMask = Mat()
+        Core.add(accumMask, Scalar(1e-6), safeMask)
+
+        val result = Mat()
+        divideImage3CByMask1C(accumImg, safeMask, result)
+        safeMask.release()
+        return result
+    }
+
+    private fun reconstructFromPyramid(blended: Array<Mat>): Mat {
+        var current = Mat()
+        blended[blended.size - 1].copyTo(current)
+
+        for (b in blended.size - 2 downTo 0) {
+            val up = Mat()
+            Imgproc.pyrUp(current, up, blended[b].size())
+            current.release()
+            current = Mat()
+            Core.add(blended[b], up, current)
+            up.release()
+        }
+
+        return current
+    }
+
+    private fun multiplyImage3CByMask1C(img3c: Mat, mask1c: Mat): Mat {
+        val mask3c = Mat()
+        val channels = listOf(mask1c, mask1c, mask1c)
+        Core.merge(channels, mask3c)
+        val result = Mat()
+        Core.multiply(img3c, mask3c, result)
+        mask3c.release()
+        return result
+    }
+
+    private fun divideImage3CByMask1C(img3c: Mat, mask1c: Mat, dst: Mat) {
+        val mask3c = Mat()
+        val channels = listOf(mask1c, mask1c, mask1c)
+        Core.merge(channels, mask3c)
+        Core.divide(img3c, mask3c, dst)
+        mask3c.release()
+    }
+
+    private data class WarpResult(val imgF: Mat, val maskF: Mat)
 
     private fun warpFrameToAtlas(
         frame: FrameRecord,
@@ -206,7 +332,6 @@ object MultiBandAtlasBlender {
         val srcPixels = IntArray(srcW * srcH)
         srcBitmap.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
 
-        // Misma convención de poses que AtlasProjector: yaw=measured, pitch/roll=abs
         val yawDeg = frame.measuredAzimuthDeg.toDouble()
         val pitchDeg = (frame.absPitchDeg ?: frame.measuredPitchDeg).toDouble()
         val rollDeg = (frame.absRollDeg ?: frame.measuredRollDeg).toDouble()
@@ -221,19 +346,17 @@ object MultiBandAtlasBlender {
         val tanHalfH = tan(Math.toRadians(hfovDeg / 2.0))
         val tanHalfV = tan(Math.toRadians(vfovDeg / 2.0))
 
-        val warpedImg8U = Mat(atlasH, atlasW, CvType.CV_8UC3, Scalar(0.0, 0.0, 0.0))
-        val mask8U = Mat(atlasH, atlasW, CvType.CV_8UC1, Scalar(0.0))
+        val imgF = Mat.zeros(atlasH, atlasW, CvType.CV_32FC3)
+        val maskF = Mat.zeros(atlasH, atlasW, CvType.CV_32FC1)
 
-        val rowBytes = atlasW * 3
-        val imgBuffer = ByteArray(rowBytes)
-        val maskBuffer = ByteArray(atlasW)
+        val imgRow = FloatArray(atlasW * 3)
+        val maskRow = FloatArray(atlasW)
 
         var coveredPx = 0L
 
         for (y in 0 until atlasH) {
-            // reset row buffers
-            for (i in imgBuffer.indices) imgBuffer[i] = 0
-            for (i in maskBuffer.indices) maskBuffer[i] = 0
+            for (i in imgRow.indices) imgRow[i] = 0f
+            for (i in maskRow.indices) maskRow[i] = 0f
 
             val altDeg = AtlasMath.yToAltitude(y, atlas.config)
             val altRad = Math.toRadians(altDeg.toDouble())
@@ -244,7 +367,6 @@ object MultiBandAtlasBlender {
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
                 val azRad = Math.toRadians(azDeg.toDouble())
 
-                // World direction (ENU): same as AtlasProjector.worldDirectionRad
                 val dirX = cosAlt * sin(azRad)
                 val dirY = cosAlt * cos(azRad)
                 val dirZ = sinAlt
@@ -265,82 +387,73 @@ object MultiBandAtlasBlender {
 
                 val color = bilinearSample(srcPixels, srcW, srcH, u.toFloat(), v.toFloat())
 
-                val r = Color.red(color)
-                val g = Color.green(color)
-                val b = Color.blue(color)
+                val r = Color.red(color) / 255f
+                val g = Color.green(color) / 255f
+                val b = Color.blue(color) / 255f
 
-                // OpenCV native order is BGR for CV_8UC3
-                imgBuffer[x * 3] = b.toByte()
-                imgBuffer[x * 3 + 1] = g.toByte()
-                imgBuffer[x * 3 + 2] = r.toByte()
+                // OpenCV native order is BGR
+                imgRow[x * 3] = b
+                imgRow[x * 3 + 1] = g
+                imgRow[x * 3 + 2] = r
 
-                // Feathering radial LINEAL (no cuadrático). El blender va
-                // a propagar la máscara via pirámide gaussiana, así que el
-                // perfil exacto importa menos — pero lineal da más zona
-                // de overlap útil que cuadrático.
                 val wx = (1.0 - abs(nx)).coerceIn(0.0, 1.0)
                 val wy = (1.0 - abs(ny)).coerceIn(0.0, 1.0)
                 val localWeight = wx * wy
 
-                val maskVal = (localWeight * qualityWeight.toDouble() * 255.0)
-                    .toInt().coerceIn(1, 255)
-                maskBuffer[x] = maskVal.toByte()
-
+                maskRow[x] = (localWeight * qualityWeight.toDouble()).toFloat().coerceIn(0f, 1f)
                 coveredPx++
             }
 
-            warpedImg8U.put(y, 0, imgBuffer)
-            mask8U.put(y, 0, maskBuffer)
+            imgF.put(y, 0, imgRow)
+            maskF.put(y, 0, maskRow)
         }
 
         if (coveredPx == 0L) {
-            warpedImg8U.release()
-            mask8U.release()
+            imgF.release()
+            maskF.release()
             return null
         }
 
-        val img16S = Mat()
-        warpedImg8U.convertTo(img16S, CvType.CV_16S)
-        warpedImg8U.release()
-
-        return WarpResult(img16S, mask8U, Point(0.0, 0.0), coveredPx)
+        return WarpResult(imgF, maskF)
     }
 
-    private fun copyBlendResultToAtlas(result8U: Mat, mask: Mat, atlas: SkyAtlas) {
+    private fun copyResultToAtlas(result: Mat, coverageMask: Mat, atlas: SkyAtlas) {
         val w = atlas.width
         val h = atlas.height
 
-        val imgBuffer = ByteArray(w * 3)
-        val maskBuffer = ByteArray(w)
+        // Convert result CV_32FC3 (range [0,1]) to CV_8UC3
+        val result8U = Mat()
+        result.convertTo(result8U, CvType.CV_8U, 255.0)
+
+        val imgRow = ByteArray(w * 3)
+        val maskRow = FloatArray(w)
 
         var written = 0L
 
         for (y in 0 until h) {
-            result8U.get(y, 0, imgBuffer)
-            mask.get(y, 0, maskBuffer)
+            result8U.get(y, 0, imgRow)
+            coverageMask.get(y, 0, maskRow)
 
             for (x in 0 until w) {
-                val maskV = maskBuffer[x].toInt() and 0xFF
-                if (maskV == 0) continue
+                if (maskRow[x] < MIN_COVERAGE_FOR_OUTPUT) continue
 
-                val b = imgBuffer[x * 3].toInt() and 0xFF
-                val g = imgBuffer[x * 3 + 1].toInt() and 0xFF
-                val r = imgBuffer[x * 3 + 2].toInt() and 0xFF
+                val b = imgRow[x * 3].toInt() and 0xFF
+                val g = imgRow[x * 3 + 1].toInt() and 0xFF
+                val r = imgRow[x * 3 + 2].toInt() and 0xFF
 
                 val color = Color.argb(255, r, g, b)
-                // Como el atlas todavía no tiene cobertura (weightSums=0),
-                // blendPixel setea directamente pixel + weight=1.0.
+                // Atlas weightSums=0 inicialmente → blendPixel setea directo
                 atlas.blendPixel(x, y, color, 1.0f)
                 written++
             }
         }
 
-        Log.d(TAG, "copied result to atlas: writtenPx=$written")
+        result8U.release()
+        Log.d(TAG, "copied result: writtenPx=$written")
     }
 
     // ============================================================
-    // GEOMETRÍA — réplica exacta de AtlasProjector.buildProjectionBasisFromAngles
-    // (branch zenithLike=false, sin hard zenith)
+    // GEOMETRÍA — réplica de AtlasProjector.buildProjectionBasisFromAngles
     // ============================================================
 
     private fun buildBasis(
@@ -352,11 +465,7 @@ object MultiBandAtlasBlender {
 
         val cp = cos(pitchRad)
         val sp = sin(pitchRad)
-        val forward = doubleArrayOf(
-            cp * sin(yawRad),
-            cp * cos(yawRad),
-            sp
-        )
+        val forward = doubleArrayOf(cp * sin(yawRad), cp * cos(yawRad), sp)
 
         var rx = forward[1]
         var ry = -forward[0]
