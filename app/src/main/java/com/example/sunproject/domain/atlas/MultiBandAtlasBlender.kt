@@ -64,7 +64,9 @@ import kotlin.math.tan
  * Tiempo estimado: 60-120s para 20 frames en Android moderno.
  */
 object MultiBandAtlasBlender {
-
+    // (al inicio del object MultiBandAtlasBlender)
+    private const val H45_POLAR_FADE_START_ALT_DEG = 80.0
+    private const val H45_POLAR_FADE_FULL_ALT_DEG = 88.0
     private const val TAG = "MultiBandAtlasBlender"
 
     // Menos bandas = menos memoria + menos detalle en suavizado de seams.
@@ -362,6 +364,17 @@ object MultiBandAtlasBlender {
             val altRad = Math.toRadians(altDeg.toDouble())
             val cosAlt = cos(altRad)
             val sinAlt = sin(altRad)
+
+// Polar fade idéntico al path píxel-a-píxel (Cambio A en AtlasProjector).
+// Apaga H45 al acercarse al polo para no contaminar la cap donde Z0 debe dominar.
+            val polarFade: Double = run {
+                val t = ((altDeg.toDouble() - H45_POLAR_FADE_START_ALT_DEG) /
+                        (H45_POLAR_FADE_FULL_ALT_DEG - H45_POLAR_FADE_START_ALT_DEG))
+                    .coerceIn(0.0, 1.0)
+                // smoothstep inverso: peso=1 abajo de 80°, peso=0 arriba de 88°
+                1.0 - (t * t * (3.0 - 2.0 * t))
+            }
+            if (polarFade <= 0.0) continue  // saltea la fila entera arriba de 88°
 
             for (x in 0 until atlasW) {
                 val azDeg = AtlasMath.xToAzimuth(x, atlas.config)
