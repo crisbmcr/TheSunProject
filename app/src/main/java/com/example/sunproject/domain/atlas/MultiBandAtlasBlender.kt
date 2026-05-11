@@ -74,7 +74,11 @@ object MultiBandAtlasBlender {
     private const val DEFAULT_NUM_BANDS = 4
 
     private const val MIN_QUALITY_WEIGHT_TO_FEED = 0.05f
-    private const val MIN_COVERAGE_FOR_OUTPUT = 1e-5f
+    // 0.05 ≈ 5% de cobertura efectiva. Píxeles abajo de esto son típicamente
+    // propagación gaussiana desde bordes de frames vecinos (sin info real
+    // del frame), no deben escribirse al atlas porque contaminan la franja
+    // de transición H45→Z0 con datos warpeados deformados.
+    private const val MIN_COVERAGE_FOR_OUTPUT = 0.05f
 
     // Quality weight constants (mismo criterio H0/H45 que AtlasProjector)
     private const val QW_MAX_AZ_ERR = 8f
@@ -365,8 +369,8 @@ object MultiBandAtlasBlender {
             val cosAlt = cos(altRad)
             val sinAlt = sin(altRad)
 
-// Polar fade idéntico al path píxel-a-píxel (Cambio A en AtlasProjector).
-// Apaga H45 al acercarse al polo para no contaminar la cap donde Z0 debe dominar.
+            // Polar fade idéntico al path píxel-a-píxel (Cambio A en AtlasProjector).
+            // Apaga H45 al acercarse al polo para no contaminar la cap donde Z0 debe dominar.
             val polarFade: Double = run {
                 val t = ((altDeg.toDouble() - H45_POLAR_FADE_START_ALT_DEG) /
                         (H45_POLAR_FADE_FULL_ALT_DEG - H45_POLAR_FADE_START_ALT_DEG))
@@ -413,7 +417,10 @@ object MultiBandAtlasBlender {
                 val wy = (1.0 - abs(ny)).coerceIn(0.0, 1.0)
                 val localWeight = wx * wy
 
-                maskRow[x] = (localWeight * qualityWeight.toDouble()).toFloat().coerceIn(0f, 1f)
+                val maskValue = (localWeight * qualityWeight.toDouble() * polarFade)
+                    .toFloat().coerceIn(0f, 1f)
+                if (maskValue <= 0f) continue
+                maskRow[x] = maskValue
                 coveredPx++
             }
 
