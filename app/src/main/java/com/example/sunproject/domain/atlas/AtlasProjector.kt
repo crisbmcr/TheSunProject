@@ -115,7 +115,7 @@ private const val H45_POLAR_FADE_FULL_ALT_DEG = 88f
 // multi-band sobre el atlas completo. Z0 sigue por su path.
 // Si falla por OOM u otro error, hace fallback automático al path
 // píxel-a-píxel.
-private const val USE_MULTIBAND_BLENDER_H0_H45 = true
+private const val USE_MULTIBAND_BLENDER_H0_H45 = false
 
 private data class RgbGain(
     val r: Float,
