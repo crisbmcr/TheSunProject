@@ -110,12 +110,6 @@ private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 private const val H45_POLAR_FADE_START_ALT_DEG = 80f
 private const val H45_POLAR_FADE_FULL_ALT_DEG = 88f
 
-// FASE 2: usar cv::detail::MultiBandBlender para H0/H45.
-// Cuando true, reemplaza el path píxel-a-píxel del blending con
-// multi-band sobre el atlas completo. Z0 sigue por su path.
-// Si falla por OOM u otro error, hace fallback automático al path
-// píxel-a-píxel.
-private const val USE_MULTIBAND_BLENDER_H0_H45 = false
 
 private data class RgbGain(
     val r: Float,
@@ -972,30 +966,18 @@ object AtlasProjector {
                     "hasPersisted=${persistedMountBasis != null}"
         )
 
-        val multiBandSucceeded = if (USE_MULTIBAND_BLENDER_H0_H45) {
-            MultiBandAtlasBlender.blendH0H45Frames(nonZenithFrames, atlas)
-        } else {
-            false
-        }
-
-        if (multiBandSucceeded) {
-            Log.i(
-                "AtlasProjector",
-                "Multi-band blending succeeded for H0/H45 (${nonZenithFrames.size} frames); " +
-                        "skipping per-pixel projection"
-            )
-        } else {
-            if (USE_MULTIBAND_BLENDER_H0_H45) {
-                Log.w(
-                    "AtlasProjector",
-                    "Multi-band blending failed; falling back to per-pixel projection"
-                )
+        // NOTA: Fase 2 (multi-band blending via Burt-Adelson manual) fue
+        // implementada y descartada en sesión 2026-05-11 tras A/B contra
+        // este path. Veredicto: el multi-band convierte el misalignment
+        // estructural del rotvec (~1-2°) en ghost extendido en lugar de
+        // esconder seams. Ver MultiBandAtlasBlender.kt en commit anterior
+        // si se necesita reactivar para escenarios distintos (ej. exterior
+        // con gain compensation, que sería un módulo distinto, no este).
+        nonZenithFrames.forEach { frame ->
+            val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
+                Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
+                return@forEach
             }
-            nonZenithFrames.forEach { frame ->
-                val src = BitmapFactory.decodeFile(frame.originalPath) ?: run {
-                    Log.w("AtlasProjector", "No se pudo decodificar ${frame.originalPath}")
-                    return@forEach
-                }
 
                 try {
                     val frameWeight = qualityWeightForFrame(frame)
