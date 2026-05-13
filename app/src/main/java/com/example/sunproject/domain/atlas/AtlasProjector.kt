@@ -979,30 +979,29 @@ object AtlasProjector {
                 return@forEach
             }
 
-                try {
-                    val frameWeight = qualityWeightForFrame(frame)
+            try {
+                val frameWeight = qualityWeightForFrame(frame)
 
-                    Log.d(
-                        "AtlasProjector",
-                        "frame=${frame.frameId} ring=${frame.ringId} " +
-                                "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
-                                "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
-                                "weight=${"%.3f".format(frameWeight)}"
-                    )
+                Log.d(
+                    "AtlasProjector",
+                    "frame=${frame.frameId} ring=${frame.ringId} " +
+                            "target=${"%.2f".format(frame.targetAzimuthDeg)}/${"%.2f".format(frame.targetPitchDeg)} " +
+                            "measured=${"%.2f".format(frame.measuredAzimuthDeg)}/${"%.2f".format(frame.measuredPitchDeg)}/${"%.2f".format(frame.measuredRollDeg)} " +
+                            "weight=${"%.3f".format(frameWeight)}"
+                )
 
-                    projectBitmapToAtlas(
-                        frame = frame,
-                        src = src,
-                        atlas = atlas,
-                        frameWeight = frameWeight,
-                        zenithTwistDegOverride = null,
-                        zenithPitchOffsetDegOverride = null,
-                        zenithRollOffsetDegOverride = null,
-                        emitLogs = true
-                    )
-                } finally {
-                    src.recycle()
-                }
+                projectBitmapToAtlas(
+                    frame = frame,
+                    src = src,
+                    atlas = atlas,
+                    frameWeight = frameWeight,
+                    zenithTwistDegOverride = null,
+                    zenithPitchOffsetDegOverride = null,
+                    zenithRollOffsetDegOverride = null,
+                    emitLogs = true
+                )
+            } finally {
+                src.recycle()
             }
         }
 

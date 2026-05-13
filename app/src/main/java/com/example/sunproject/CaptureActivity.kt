@@ -85,6 +85,28 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var zenithPoseBufferIndex = 0
     private var zenithPoseBufferFilled = false
 
+    // ============================================================
+    // STABILITY GATE para H0/H45 (Palanca A)
+    // ============================================================
+    // Ring buffer de samples del display pose durante el holdMs.
+    // Usado para verificar peak-to-peak antes de disparar: el código
+    // viejo solo chequea "está dentro de la caja de tolerancia"; éste
+    // chequea "ESTUVO QUIETO dentro de la caja durante todo el hold".
+    //
+    // Tamaño 64: a 60Hz de SENSOR_DELAY_GAME cubre ~1.07s, suficiente
+    // para holdMs=800ms con margen.
+    private val holdBufferSize = 64
+    private val holdYawBuffer = FloatArray(holdBufferSize)
+    private val holdPitchBuffer = FloatArray(holdBufferSize)
+    private val holdRollBuffer = FloatArray(holdBufferSize)
+    private var holdBufferCount = 0
+    private var holdBufferIndex = 0
+
+    // Peak-to-peak máximo permitido durante el hold para considerar la
+    // pose "quieta". Si excede esto, se resetea el counter (forzar
+    // re-estabilización). Punto de partida: 0.8°. Subir si rechaza
+    // demasiado, bajar si sigue habiendo ghost.
+    private val holdStabilityPeakToPeakDeg = 0.8f
     // Last absolute yaw captured while the phone was far from the Euler
     // singularity (pitch < 65°). Near pitch=90° the AXIS_X/AXIS_Z remap
     // used to compute absoluteYawDeg is gimbal-locked: yaw gets
@@ -890,18 +912,101 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         if (!aligned) {
             alignmentStartMs = 0L
+            resetHoldBuffer()
             return
         }
 
-        if (alignmentStartMs == 0L) alignmentStartMs = now
+        if (alignmentStartMs == 0L) {
+            alignmentStartMs = now
+            resetHoldBuffer()
+        }
+
+        // Acumular sample para el stability gate.
+        pushHoldSample(displayAzimuth, displayPitchDeg, displayRollDeg)
+
+        // Stability gate: chequear peak-to-peak SOLO con suficientes
+        // samples (>= 12 ≈ 200ms). Antes de eso no hay datos
+        // estadísticamente significativos.
+        if (holdBufferCount >= 12) {
+            val (ptpYaw, ptpPitch, ptpRoll) = computeHoldPeakToPeak()
+            val maxPtP = maxOf(ptpYaw, ptpPitch, ptpRoll)
+            if (maxPtP > holdStabilityPeakToPeakDeg) {
+                Log.d(
+                    "SunAutoCaptureStability",
+                    "REJECT target=${target.azimuth}/${target.pitch} " +
+                            "ptpYaw=${"%.2f".format(ptpYaw)} " +
+                            "ptpPitch=${"%.2f".format(ptpPitch)} " +
+                            "ptpRoll=${"%.2f".format(ptpRoll)} " +
+                            "limit=${holdStabilityPeakToPeakDeg} " +
+                            "samples=${holdBufferCount}"
+                )
+                // El celular se movió demasiado durante el hold. Reset
+                // del counter: esperar holdMs continuos de pose quieta.
+                alignmentStartMs = now
+                resetHoldBuffer()
+                pushHoldSample(displayAzimuth, displayPitchDeg, displayRollDeg)
+                return
+            }
+        }
 
         val held = (now - alignmentStartMs) >= holdMs
         val cooled = (now - lastShotMs) >= cooldownMs
 
         if (held && cooled) {
+            Log.d(
+                "SunAutoCaptureStability",
+                "FIRE target=${target.azimuth}/${target.pitch} " +
+                        "samples=${holdBufferCount} " +
+                        "heldMs=${now - alignmentStartMs}"
+            )
             takePhotoForTarget(target, reason = "AUTO")
             alignmentStartMs = 0L
         }
+    }
+
+    private fun resetHoldBuffer() {
+        holdBufferCount = 0
+        holdBufferIndex = 0
+    }
+
+    private fun pushHoldSample(yaw: Float, pitch: Float, roll: Float) {
+        holdYawBuffer[holdBufferIndex] = yaw
+        holdPitchBuffer[holdBufferIndex] = pitch
+        holdRollBuffer[holdBufferIndex] = roll
+        holdBufferIndex = (holdBufferIndex + 1) % holdBufferSize
+        if (holdBufferCount < holdBufferSize) holdBufferCount++
+    }
+
+    /**
+     * Peak-to-peak (max - min) en cada eje sobre los samples acumulados.
+     * Para yaw maneja el wrap 0/360 calculando el arco máximo entre
+     * pares de samples (O(N²), pero N≤64 → 4096 ops, despreciable).
+     */
+    private fun computeHoldPeakToPeak(): Triple<Float, Float, Float> {
+        if (holdBufferCount == 0) return Triple(0f, 0f, 0f)
+
+        var pitchMin = Float.POSITIVE_INFINITY
+        var pitchMax = Float.NEGATIVE_INFINITY
+        var rollMin = Float.POSITIVE_INFINITY
+        var rollMax = Float.NEGATIVE_INFINITY
+        for (i in 0 until holdBufferCount) {
+            val p = holdPitchBuffer[i]
+            val r = holdRollBuffer[i]
+            if (p < pitchMin) pitchMin = p
+            if (p > pitchMax) pitchMax = p
+            if (r < rollMin) rollMin = r
+            if (r > rollMax) rollMax = r
+        }
+
+        var yawMaxArc = 0f
+        for (i in 0 until holdBufferCount) {
+            for (j in i + 1 until holdBufferCount) {
+                val d = absAngleDiff(holdYawBuffer[i], holdYawBuffer[j])
+                if (d > yawMaxArc) yawMaxArc = d
+            }
+        }
+
+        return Triple(yawMaxArc, pitchMax - pitchMin, rollMax - rollMin)
     }
     private fun absAngleDiff(a: Float, b: Float): Float {
         var d = (a - b) % 360f
