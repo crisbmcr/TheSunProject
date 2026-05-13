@@ -955,7 +955,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 // del counter: esperar holdMs continuos de pose quieta.
                 alignmentStartMs = now
                 resetHoldBuffer()
-                pushHoldSample(displayAzimuth, displayPitchDeg, displayRollDeg)
+                pushHoldSample(
+                    displayAzimuth, displayPitchDeg, displayRollDeg,
+                    absoluteYawDeg, absolutePitchDeg, absoluteRollDeg
+                )
                 return
             }
         }
