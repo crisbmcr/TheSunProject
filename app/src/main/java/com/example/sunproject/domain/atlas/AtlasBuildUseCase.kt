@@ -12,8 +12,21 @@ class AtlasBuildUseCase(
          * Activa el refinamiento global de poses H0/H45 con bundle adjustment
          * antes de proyectar al atlas. Para A/B comparativo: poner false
          * deja el comportamiento original (seed IMU sin refinar).
+         *
+         * Sesión 2026-05-13: desactivado para evaluación. Con palancas A+B
+         * (stability gate + pose averaging) y técnica de roll cuidadoso, la
+         * pose IMU tiene precisión sub-0.1° y el BA está sobre-refinando
+         * sobre datos que ya son buenos. Sospecha: BA introduce seams
+         * verticales por convergencia a matches ORB ruidosos entre frames
+         * H0↔H45 (contenido visual cambia mucho entre pitches, matches
+         * espurios pasan el threshold MIN_MATCHES_PER_PAIR=8). Pendiente
+         * confirmar con A/B: con true vs false sobre misma sesión.
+         *
+         * Si A/B confirma que false es mejor, dejar así por defecto.
+         * El código del BA se mantiene en AtlasBundleAdjuster.kt como
+         * dead code disponible para revisitar.
          */
-        const val USE_BUNDLE_ADJUSTMENT_H0_H45 = true
+        const val USE_BUNDLE_ADJUSTMENT_H0_H45 = false
     }
 
     private fun newAtlas(): SkyAtlas =

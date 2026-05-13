@@ -244,6 +244,24 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val pitchTolDeg = 2.5f
     private val rollTolDeg = 3f
 
+    // Tolerancia de roll específica para H45. Validada empíricamente
+    // en sesión "roll-cuidadoso": cuando el usuario mantiene roll cerca
+    // de 0° también en los H45 (no solo en H0), el ghost de torres y
+    // postes altos en zona de solape H0↔H45 se reduce significativamente.
+    //
+    // Hipótesis activa: la descomposición de la matriz IMU en yaw/pitch/roll
+    // con pitch=45° amplifica pequeños sesgos cuando roll es grande en
+    // magnitud. Con roll cerca de 0° la fórmula se vuelve trivial
+    // (cos(0)=1, sin(0)=0) y el sesgo desaparece o se hace despreciable.
+    //
+    // Mantenemos rollTolDeg=3° para H0 porque empíricamente los H0
+    // capturados ya entran naturalmente en [0, 1.3°] sin esfuerzo
+    // extra del usuario. Endurecer H0 no aporta y solo agregaría
+    // rejects innecesarios.
+    //
+    // Si en una sesión el usuario ve muchos rejects en H45 y no logra
+    // capturar, se puede aflojar a 2.0f o 2.5f temporalmente.
+    private val h45RollTolDeg = 1.5f
     // Zenith tolerances — tightened 2026-04. The Z0 frame is the hardest
     // to place correctly because it sits at the pole of the equirectangular
     // projection where small pose errors become large angular errors on
@@ -914,10 +932,19 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val pitchErr = abs(displayPitchDeg - target.pitch)
         val rollErr = abs(displayRollDeg)
 
+        // Roll más estricto para H45 que para H0. Ver comentario en
+        // h45RollTolDeg. Los Z0 tienen su propio bloque arriba con
+        // zenithRollTolDeg, así que acá solo decidimos entre H0 y H45.
+        val effectiveRollTolDeg = if (target.pitch >= 30f) {
+            h45RollTolDeg
+        } else {
+            rollTolDeg
+        }
+
         val aligned =
             azErr <= azTolDeg &&
                     pitchErr <= pitchTolDeg &&
-                    rollErr <= rollTolDeg
+                    rollErr <= effectiveRollTolDeg
 
         if (!aligned) {
             alignmentStartMs = 0L
