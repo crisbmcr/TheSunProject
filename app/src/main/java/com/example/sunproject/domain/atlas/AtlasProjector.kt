@@ -156,14 +156,42 @@ private data class CameraMountBasis(
 object AtlasProjector {
     private var cachedGyroToTrueNorthCorrectionDeg: Float? = null
 
+    // FIX TRUE-NORTH (2026-05-13): declinación magnética de la sesión,
+    // computada con GeomagneticField al iniciar la captura y persistida
+    // en session.json. AtlasBuildUseCase la inyecta acá antes de projectar
+    // para que esté disponible cuando ZenithMatrixProjector la consulte.
+    // PanoramaViewActivity también la setea al abrir un atlas, leyendo
+    // directo del session.json. Es la fuente única de verdad.
+    private var cachedSessionDeclinationDeg: Float? = null
+
+    fun setSessionDeclinationDeg(deg: Float?) {
+        cachedSessionDeclinationDeg = deg
+        Log.i(
+            "AtlasDeclCorrection",
+            "setSessionDeclinationDeg=${deg?.let { "%.2f".format(it) } ?: "null"}°"
+        )
+    }
+
     /**
-     * Corrección entre el gyro-North del atlas y el true-North.
-     * Incluye declinación magnética (vía applyDeclination en CaptureActivity)
-     * y ruido del anchor gyro inicial. Se setea una vez por sesión en
-     * projectFramesToAtlas. ZenithMatrixProjector la consulta para
-     * rotar el rayo mundo y mantener Z0 alineado con H0/H45.
+     * Corrección angular para llevar yaw mag-N → true-N (declinación
+     * magnética local de la sesión).
+     *
+     * Convención del atlas: vive en true-N (ENU geográfico). Los H0/H45
+     * caen ahí naturalmente porque measuredAzimuthDeg hereda del anchor
+     * inicial que tiene applyDeclination aplicado. El Z0 NO: usa la
+     * matriz rotationM** cruda, que está en mag-N. Por eso
+     * ZenithMatrixProjector le suma este valor al rayo mundo.
+     *
+     * La vista 3D consume el mismo valor: el rotvec sensor en runtime
+     * también está en mag-N, GyroCameraController lo lleva a true-N
+     * pre-multiplicando por esta rotación.
+     *
+     * Devuelve 0 si no hay GPS — el atlas queda en mag-N puro y el ábaco
+     * cae desplazado por declinación, pero internamente consistente
+     * entre H0/H45/Z0 y vista 3D (todos quedan en mag-N).
      */
-    fun gyroToTrueNorthCorrectionDeg(): Float = cachedGyroToTrueNorthCorrectionDeg ?: 0f
+    fun gyroToTrueNorthCorrectionDeg(): Float =
+        cachedSessionDeclinationDeg ?: cachedGyroToTrueNorthCorrectionDeg ?: 0f
 
     // ============================================================
     // BIAS ROTVEC ↔ GRAV+MAG (Fase 6)

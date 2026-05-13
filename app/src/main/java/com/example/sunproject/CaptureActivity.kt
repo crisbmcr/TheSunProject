@@ -1154,13 +1154,33 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // null anchors initially. The anchors are persisted in JSON when
         // the first frame is saved — see persistSessionAnchors().
 
+        // FIX TRUE-NORTH (2026-05-13): declinación magnética computada una
+        // sola vez por sesión usando GeomagneticField (modelo WMM, preciso
+        // a ~0.5°). Es la única fuente de verdad para llevar mag-N a true-N.
+        // La consumen:
+        //   - ZenithMatrixProjector → lleva el Z0 (que vive en mag-N porque
+        //     rotationM** viene crudo de getRotationMatrixFromVector) al
+        //     mismo true-N en que ya viven los H0/H45 vía el anchor inicial.
+        //   - GyroCameraController de la vista 3D → lleva la cámara virtual
+        //     de mag-N a true-N, alineándola con el atlas y con el ábaco.
+        // Si no hay GPS, queda null → AtlasProjector y GyroCameraController
+        // caen a corrección=0 (atlas se ve en mag-N, ábaco desplazado).
+        val sessionDeclinationDeg: Float? = computeCurrentDeclinationDeg()
+        Log.i(
+            "SunDeclination",
+            "SESSION_DECLINATION sessionId=${dir.name} " +
+                    "declination=${sessionDeclinationDeg?.let { "%.2f".format(it) } ?: "null (sin GPS)"}° " +
+                    "lat=${loc?.latitude?.let { "%.4f".format(it) } ?: "null"} " +
+                    "lon=${loc?.longitude?.let { "%.4f".format(it) } ?: "null"}"
+        )
+
         val session = SessionRecord(
             sessionId = dir.name,
             startedAtUtcMs = System.currentTimeMillis(),
             latitudeDeg = loc?.latitude,
             longitudeDeg = loc?.longitude,
             altitudeM = loc?.altitude,
-            declinationDeg = null,
+            declinationDeg = sessionDeclinationDeg,
             cameraId = currentCameraId ?: "widest_back_camera",
             sensorMode = "rotation_vector",
             sessionYawAnchorDeg = sessionYawAnchorDeg,
@@ -2067,13 +2087,18 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val paths = sessionPaths ?: return
         val loc = lastLocation
 
+        // Re-computamos declinación. Si el fix GPS llegó después de
+        // ensureSessionDir, ahora sí queda persistida. Si ya estaba bien,
+        // este recálculo confirma el valor (estable a escala de segundos).
+        val sessionDeclinationDeg: Float? = computeCurrentDeclinationDeg()
+
         val session = SessionRecord(
             sessionId = currentSessionId ?: dir.name,
             startedAtUtcMs = System.currentTimeMillis(),
             latitudeDeg = loc?.latitude,
             longitudeDeg = loc?.longitude,
             altitudeM = loc?.altitude,
-            declinationDeg = null,
+            declinationDeg = sessionDeclinationDeg,
             cameraId = currentCameraId ?: "widest_back_camera",
             sensorMode = "rotation_vector",
             sessionYawAnchorDeg = sessionYawAnchorDeg,
@@ -2617,6 +2642,24 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         )
 
         return R
+    }
+
+    /**
+     * Calcula la declinación magnética para la ubicación actual usando
+     * GeomagneticField (modelo WMM de Android). Devuelve null si no hay
+     * GPS fix todavía. La declinación es la diferencia angular entre
+     * norte magnético y norte verdadero — positiva al este, negativa
+     * al oeste. En BA es ~−5°, en Cauchari ~−1°.
+     */
+    private fun computeCurrentDeclinationDeg(): Float? {
+        val loc = lastLocation ?: return null
+        val gmf = GeomagneticField(
+            loc.latitude.toFloat(),
+            loc.longitude.toFloat(),
+            loc.altitude.toFloat(),
+            System.currentTimeMillis()
+        )
+        return gmf.declination
     }
 
     private fun applyDeclination(azimuthDeg: Float): Float {

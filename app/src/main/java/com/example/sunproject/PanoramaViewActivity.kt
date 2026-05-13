@@ -51,8 +51,30 @@ class PanoramaViewActivity : AppCompatActivity() {
         // bitmap, leer session.json, etc.) se hace después y se inyecta al renderer vía setters.
         glView.setEGLContextClientVersion(2)
 
-        val yawCorrectionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
-        Log.i(TAG, "Corrección yaw Fase 3: $yawCorrectionDeg°")
+        // FIX TRUE-NORTH (2026-05-13): leemos declinación del session.json
+        // asociado al atlas. Convención: panorama vive en
+        // <sessionDir>/atlas/atlas_projected_all.png, igual que AnalysisActivity.
+        // GyroCameraController la usa para llevar el rotvec sensor (mag-N)
+        // a true-N, alineando la cámara virtual con el atlas.
+        val yawCorrectionDeg: Float = runCatching {
+            val panoramaFile = java.io.File(panoramaPath)
+            val sessionDir = panoramaFile.parentFile?.parentFile
+            if (sessionDir != null) {
+                val store = com.example.sunproject.data.storage.JsonSessionStore()
+                val paths = store.createSessionPaths(sessionDir)
+                val session = store.loadSession(paths)
+                // Sincronizamos también el cache global de AtlasProjector por
+                // si otros consumidores lo necesitan en la misma instancia.
+                AtlasProjector.setSessionDeclinationDeg(session?.declinationDeg)
+                session?.declinationDeg ?: 0f
+            } else {
+                0f
+            }
+        }.getOrElse {
+            Log.w(TAG, "No pude leer declinación de session.json", it)
+            0f
+        }
+        Log.i(TAG, "Corrección yaw (true-N): ${"%.2f".format(yawCorrectionDeg)}°")
 
         val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         val newRenderer = PanoramaRenderer()

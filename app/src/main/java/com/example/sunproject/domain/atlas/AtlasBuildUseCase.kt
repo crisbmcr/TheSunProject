@@ -91,6 +91,16 @@ class AtlasBuildUseCase(
             rawFrames
         }
 
+        // FIX TRUE-NORTH: inyectar declinación de la sesión antes de proyectar.
+        // ZenithMatrixProjector la consume para alinear el Z0 (mag-N) con
+        // los H0/H45 (true-N anclado al inicio).
+        val session = store.loadSession(paths)
+        AtlasProjector.setSessionDeclinationDeg(session?.declinationDeg)
+        Log.i(
+            "AtlasBuildUseCase",
+            "sessionDeclination=${session?.declinationDeg?.let { "%.2f".format(it) } ?: "null"}°"
+        )
+
         val atlas = newAtlas()
         AtlasProjector.projectFramesToAtlas(frames, atlas)
 

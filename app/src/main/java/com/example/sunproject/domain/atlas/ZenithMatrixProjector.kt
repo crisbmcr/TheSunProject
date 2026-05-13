@@ -216,23 +216,18 @@ object ZenithMatrixProjector {
         val srcW = src.width
         val srcH = src.height
 
-        // Atlas vive en mag-N puro (estado de Fase 7). La matriz
-        // rWorldDevice del Z0 viene del gyro transport heredando del
-        // último H45, y vive en el mismo frame rotvec/mag-N que las
-        // matrices de los H45. Como baseYawDeg de los H0/H45 también
-        // proyecta en mag-N (sin sumar correctionDeg), los tres rings
-        // quedan alineados automáticamente sin necesidad de aplicar
-        // ninguna corrección acá.
-        //
-        // GyroCameraController de la vista 3D consume
-        // cachedGyroToTrueNorthCorrectionDeg para llevar la cámara
-        // virtual a true-N — eso afecta dónde caen los overlays solares
-        // pero no toca el atlas en sí.
-        val correctionDeg = 0f
+        // FIX TRUE-NORTH (2026-05-13): el comentario anterior era incorrecto.
+        // El atlas NO vive en mag-N puro — los H0/H45 viven en true-N porque
+        // measuredAzimuthDeg hereda del anchor inicial que pasó por
+        // applyDeclination. Solo el Z0 vive en mag-N porque usa la matriz
+        // rotationM** cruda de getRotationMatrixFromVector. Por eso aplicamos
+        // la declinación de sesión acá para alinear el Z0 con H0/H45 y con
+        // el ábaco solar (que vive en true-N puro).
+        val correctionDeg = AtlasProjector.gyroToTrueNorthCorrectionDeg()
         Log.d(
             "ZenithMatrix",
             "frame=${frame.frameId} applyingYawCorrection=${"%.2f".format(correctionDeg)}° " +
-                    "(disabled: atlas vive en mag-N como en Fase 7)"
+                    "(declination → mag-N to true-N)"
         )
 
         val (lut, mask) = buildEquirectLut(
