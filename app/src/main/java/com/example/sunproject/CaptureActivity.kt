@@ -99,6 +99,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private val holdYawBuffer = FloatArray(holdBufferSize)
     private val holdPitchBuffer = FloatArray(holdBufferSize)
     private val holdRollBuffer = FloatArray(holdBufferSize)
+
+    // Paralelos a los display* pero con los valores absolutos del IMU
+    // (rotation_vector remapeado a Euler global). Usados para promediar
+    // absAzimuthDeg/PitchDeg/RollDeg al disparar — Palanca B.
+    private val holdAbsYawBuffer = FloatArray(holdBufferSize)
+    private val holdAbsPitchBuffer = FloatArray(holdBufferSize)
+    private val holdAbsRollBuffer = FloatArray(holdBufferSize)
+
     private var holdBufferCount = 0
     private var holdBufferIndex = 0
 
@@ -922,7 +930,10 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         // Acumular sample para el stability gate.
-        pushHoldSample(displayAzimuth, displayPitchDeg, displayRollDeg)
+        pushHoldSample(
+            displayAzimuth, displayPitchDeg, displayRollDeg,
+            absoluteYawDeg, absolutePitchDeg, absoluteRollDeg
+        )
 
         // Stability gate: chequear peak-to-peak SOLO con suficientes
         // samples (>= 12 ≈ 200ms). Antes de eso no hay datos
@@ -969,10 +980,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         holdBufferIndex = 0
     }
 
-    private fun pushHoldSample(yaw: Float, pitch: Float, roll: Float) {
+    private fun pushHoldSample(
+        yaw: Float, pitch: Float, roll: Float,
+        absYaw: Float, absPitch: Float, absRoll: Float
+    ) {
         holdYawBuffer[holdBufferIndex] = yaw
         holdPitchBuffer[holdBufferIndex] = pitch
         holdRollBuffer[holdBufferIndex] = roll
+        holdAbsYawBuffer[holdBufferIndex] = absYaw
+        holdAbsPitchBuffer[holdBufferIndex] = absPitch
+        holdAbsRollBuffer[holdBufferIndex] = absRoll
         holdBufferIndex = (holdBufferIndex + 1) % holdBufferSize
         if (holdBufferCount < holdBufferSize) holdBufferCount++
     }
@@ -1007,6 +1024,60 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         return Triple(yawMaxArc, pitchMax - pitchMin, rollMax - rollMin)
+    }
+
+    /**
+     * Promedio de los samples acumulados en el hold buffer. Devuelve
+     * null si hay < 12 samples (consistente con el threshold del
+     * stability gate). Yaw circular vía sin/cos para manejar wrap
+     * 0/360°. Pitch/roll aritmético.
+     *
+     * Returns FloatArray de 6 elementos:
+     *   [0]=display yaw   [1]=display pitch   [2]=display roll
+     *   [3]=abs yaw       [4]=abs pitch       [5]=abs roll
+     */
+    private fun computeHoldAveragePose(): FloatArray? {
+        if (holdBufferCount < 12) return null
+
+        var dispSinSum = 0.0
+        var dispCosSum = 0.0
+        var dispPitchSum = 0f
+        var dispRollSum = 0f
+        var absSinSum = 0.0
+        var absCosSum = 0.0
+        var absPitchSum = 0f
+        var absRollSum = 0f
+
+        for (i in 0 until holdBufferCount) {
+            val dy = Math.toRadians(holdYawBuffer[i].toDouble())
+            dispSinSum += kotlin.math.sin(dy)
+            dispCosSum += kotlin.math.cos(dy)
+            dispPitchSum += holdPitchBuffer[i]
+            dispRollSum += holdRollBuffer[i]
+
+            val ay = Math.toRadians(holdAbsYawBuffer[i].toDouble())
+            absSinSum += kotlin.math.sin(ay)
+            absCosSum += kotlin.math.cos(ay)
+            absPitchSum += holdAbsPitchBuffer[i]
+            absRollSum += holdAbsRollBuffer[i]
+        }
+
+        val n = holdBufferCount.toFloat()
+        val dispYawAvg = normalize360(
+            Math.toDegrees(kotlin.math.atan2(dispSinSum, dispCosSum)).toFloat()
+        )
+        val absYawAvg = normalize360(
+            Math.toDegrees(kotlin.math.atan2(absSinSum, absCosSum)).toFloat()
+        )
+
+        return floatArrayOf(
+            dispYawAvg,
+            dispPitchSum / n,
+            dispRollSum / n,
+            absYawAvg,
+            absPitchSum / n,
+            absRollSum / n
+        )
     }
     private fun absAngleDiff(a: Float, b: Float): Float {
         var d = (a - b) % 360f
@@ -1137,7 +1208,28 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         // on the most error-sensitive capture of the session.
         val isZenithCapture = target.pitch >= 80f
         val averagedZenith = if (isZenithCapture) computeAveragedZenithPose() else null
+        // Palanca B: para H0/H45, promediar los samples acumulados durante
+        // el holdMs en lugar de tomar snapshot instantáneo. Reduce el
+        // jitter residual dentro de la ventana garantizada por el
+        // stability gate (Palanca A) por √N adicional.
+        val averagedHold: FloatArray? = if (!isZenithCapture) computeHoldAveragePose() else null
+        val poseYawForFrame = averagedHold?.get(0) ?: displayAzimuth
+        val posePitchForFrame = averagedHold?.get(1) ?: displayPitchDeg
+        val poseRollForFrame = averagedHold?.get(2) ?: displayRollDeg
 
+        if (averagedHold != null) {
+            Log.d(
+                "SunAutoCaptureStability",
+                "AVERAGED_POSE target=${target.azimuth}/${target.pitch} " +
+                        "displayYawAvg=${"%.2f".format(averagedHold[0])} (snap=${"%.2f".format(displayAzimuth)}) " +
+                        "displayPitchAvg=${"%.2f".format(averagedHold[1])} (snap=${"%.2f".format(displayPitchDeg)}) " +
+                        "displayRollAvg=${"%.2f".format(averagedHold[2])} (snap=${"%.2f".format(displayRollDeg)}) " +
+                        "absYawAvg=${"%.2f".format(averagedHold[3])} (snap=${"%.2f".format(absoluteYawDeg)}) " +
+                        "absPitchAvg=${"%.2f".format(averagedHold[4])} (snap=${"%.2f".format(absolutePitchDeg)}) " +
+                        "absRollAvg=${"%.2f".format(averagedHold[5])} (snap=${"%.2f".format(absoluteRollDeg)}) " +
+                        "samples=${holdBufferCount}"
+            )
+        }
         // For Z0, yaw requires special treatment. The averaged yaw from
         // computeAveragedZenithPose is corrupted by gimbal lock at
         // pitch≈88°: the IMU's Euler decomposition redistributes yaw
@@ -1160,16 +1252,19 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         val absYawForFrame = when {
             hasUsableSnapshotYaw -> snapshotYaw
             averagedZenith != null -> averagedZenith.first
+            averagedHold != null -> averagedHold[3]
             hasLastAbsRotationMatrix -> absoluteYawDeg
             else -> null
         }
         val absPitchForFrame = when {
             averagedZenith != null -> averagedZenith.second
+            averagedHold != null -> averagedHold[4]
             hasLastAbsRotationMatrix -> absolutePitchDeg
             else -> null
         }
         val absRollForFrame = when {
             averagedZenith != null -> averagedZenith.third
+            averagedHold != null -> averagedHold[5]
             hasLastAbsRotationMatrix -> absoluteRollDeg
             else -> null
         }
@@ -1351,11 +1446,11 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val frozenPose = CapturedPose(
 
-            azimuthDeg = displayAzimuth,
+            azimuthDeg = poseYawForFrame,
 
-            pitchDeg = displayPitchDeg,
+            pitchDeg = posePitchForFrame,
 
-            rollDeg = displayRollDeg,
+            rollDeg = poseRollForFrame,
 
             absAzimuthDeg = absYawForFrame,
             absPitchDeg = absPitchForFrame,
