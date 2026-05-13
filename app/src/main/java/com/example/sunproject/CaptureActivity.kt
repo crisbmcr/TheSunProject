@@ -48,6 +48,9 @@ import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+import android.hardware.camera2.CaptureRequest
+import androidx.camera.camera2.interop.Camera2Interop
+
 class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
     // UI
@@ -1677,10 +1680,40 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
 
         val cameraSelector = selectWidestBackCameraSelector(cameraProvider)
 
-        val cap = ImageCapture.Builder()
+        val capBuilder = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .setTargetRotation(rotation)
-            .build()
+
+        // Desactivar OIS (Optical Image Stabilization) y EIS (Electronic
+        // Image Stabilization) para captura panorámica.
+        //
+        // OIS mueve físicamente el módulo de cámara para compensar shake
+        // durante la exposición, con compensación gravity-aware (aplica
+        // corrección distinta según el pitch del celular). Eso desplaza
+        // el centro óptico relativo al "nominal" que asume la proyección.
+        // En pitch=0 (H0) aplica una corrección, en pitch=45 (H45) aplica
+        // otra distinta → offset sistemático H0↔H45 en el atlas. Es la
+        // sospecha principal del ghost de 3-4° en exterior.
+        //
+        // EIS warpea la imagen post-captura en software (típicamente para
+        // video). Incompatible con proyección rígida basada en pose IMU
+        // porque el contenido de la imagen no coincide con la pose
+        // medida en el shutter.
+        //
+        // Sesión 2026-05-13: agregado para diagnosticar ghost H0↔H45 en
+        // sesiones exteriores. Si el atlas mejora notoriamente, OIS era
+        // el bottleneck.
+        Camera2Interop.Extender(capBuilder)
+            .setCaptureRequestOption(
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
+            )
+            .setCaptureRequestOption(
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+            )
+
+        val cap = capBuilder.build()
         imageCapture = cap
 
         preview.setSurfaceProvider(cameraPreview.surfaceProvider)
@@ -1691,7 +1724,22 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         try { camera.cameraControl.setLinearZoom(0f) } catch (_: Throwable) {}
 
         val characteristics = camera.cameraInfo.getCameraCharacteristics()
-
+        // Loguear qué modos de stabilization soporta este celular. Si OIS
+        // está disponible (modes incluye 1), el cambio en el builder de
+        // arriba sí tiene efecto. Si modes es null o solo [0], el cambio
+        // no aporta (no había OIS para empezar) y hay que buscar otra
+        // causa del ghost.
+        val oisModes = characteristics.get(
+            CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION
+        )
+        val videoStabModes = characteristics.get(
+            CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES
+        )
+        Log.i(
+            "SunOISCheck",
+            "OIS modes available: ${oisModes?.joinToString() ?: "null (no OIS support)"} " +
+                    "Video stab modes: ${videoStabModes?.joinToString() ?: "null"}"
+        )
         currentCameraId = try {
             Camera2CameraInfo.from(camera.cameraInfo).cameraId
         } catch (_: Throwable) {
