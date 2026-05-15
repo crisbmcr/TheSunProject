@@ -39,7 +39,9 @@ object FileLogger {
     private val CAPTURED_TAGS = listOf(
         "SunDeclination",
         "AtlasBuildUseCase",
-        "ZenithMatrix"
+        "ZenithMatrix",
+        "AtlasPose",            // yaws crudos de cada H0/H45 proyectado
+        "AtlasDeclCorrection"   // setSessionDeclinationDeg del projector
     )
 
     @Volatile private var logcatProcess: Process? = null

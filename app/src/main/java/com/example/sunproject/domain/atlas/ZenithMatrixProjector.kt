@@ -131,10 +131,15 @@ object ZenithMatrixProjector {
                 val dwyRaw = cosAlt * cosAz[x]
                 val dwz = sinAlt
 
-// FIX DECLINACIÓN: rotar el rayo por -yawCorrection alrededor del eje Z
-// para que coincida con H0/H45. Preserva altitud.
-                val dwx =  dwxRaw * cosCorr + dwyRaw * sinCorr
-                val dwy = -dwxRaw * sinCorr + dwyRaw * cosCorr
+// FIX TRUE-NORTH (2026-05-15): signo de la rotación corregido. La fórmula
+// anterior aplicaba R(-yawCorrection) = R(+|decl|) al rayo, lo que rotaba en
+// el sentido contrario y dejaba el Z0 con un offset de 2×|decl|. La fórmula
+// correcta para llevar dwRaw (en true-N) a mag-N (donde vive la matriz
+// rotationM**) es R(declination) = R(yawCorrection), con yawCorrection = decl
+// (negativo si W). Verificado: para V=(0,1,0) y decl=-8.5° (W), la fórmula
+// da (+0.148, 0.989, 0) que coincide con la posición de TN en frame mag-N.
+                val dwx =  dwxRaw * cosCorr - dwyRaw * sinCorr
+                val dwy =  dwxRaw * sinCorr + dwyRaw * cosCorr
 
 // d_device = M^T * d_world.
                 val ddx = m00 * dwx + m10 * dwy + m20 * dwz

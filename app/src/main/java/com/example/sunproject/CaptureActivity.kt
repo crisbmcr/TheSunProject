@@ -749,9 +749,22 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 gamePitchDeg = displayAngles[1]
                 gameRollDeg = displayAngles[2]
 
-                if (!displayOffsetInitialized && absoluteYawDeg != 0f) {
+                // FIX TRUE-NORTH (2026-05-15): el anchor capture la declinación
+                // requiere que applyDeclination(raw[0]) ya tenga lastLocation
+                // disponible. Si la GPS fix llega después del primer rotvec,
+                // sin este gate displayNorthOffsetDeg quedaba en mag-N puro
+                // y todos los H0/H45 se proyectaban desplazados por declinación.
+                if (!displayOffsetInitialized && absoluteYawDeg != 0f && lastLocation != null) {
                     displayNorthOffsetDeg = normalize360(absoluteYawDeg - gameYawDeg)
                     displayOffsetInitialized = true
+                    Log.i(
+                        "SunDeclination",
+                        "ANCHOR_INIT lat=${"%.4f".format(lastLocation!!.latitude)} " +
+                                "lon=${"%.4f".format(lastLocation!!.longitude)} " +
+                                "absYaw_trueN=${"%.2f".format(absoluteYawDeg)}° " +
+                                "gameYaw=${"%.2f".format(gameYawDeg)}° " +
+                                "offset_includes_declination=${"%.2f".format(displayNorthOffsetDeg)}°"
+                    )
                 }
 
                 val zenithTargetActive =
@@ -850,6 +863,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private fun checkAutoCapture() {
         if (!autoCaptureEnabled) {
             alignmentStartMs = 0L
+            return
+        }
+
+        // FIX TRUE-NORTH (2026-05-15): no disparar hasta que el anchor capture
+        // la declinación. Sin esto, los frames quedan en mag-N y el ábaco
+        // aparece desplazado ~declinación° respecto al sol real.
+        if (!displayOffsetInitialized) {
+            if (lastLocation == null) {
+                Log.d("SunDeclination", "AUTOCAP_BLOCKED waiting for GPS fix")
+            }
             return
         }
 
