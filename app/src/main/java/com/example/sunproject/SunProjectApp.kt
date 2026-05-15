@@ -3,6 +3,7 @@ package com.example.sunproject
 import android.app.Application
 import android.content.Context
 import android.util.Log
+import com.example.sunproject.diagnostics.FileLogger
 import org.opencv.android.OpenCVLoader
 
 class SunProjectApp : Application() {
@@ -11,6 +12,9 @@ class SunProjectApp : Application() {
         super.onCreate()
         appInstance = this
         ensureOpenCvReady()
+        // Captura SunDeclination/AtlasBuildUseCase/ZenithMatrix a archivo
+        // para validar afuera sin depuración wifi/USB conectada.
+        //FileLogger.start(this)
     }
 
     companion object {

@@ -1138,7 +1138,14 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         sessionDir = dir
         currentSessionId = dir.name
         sessionPaths = sessionStore.createSessionPaths(dir)
+        // Captura los tags SunDeclination/AtlasBuildUseCase/ZenithMatrix
+        // a <sessionDir>/logs/sun_log_<ts>.txt. Tiene que arrancar ANTES
+        // del próximo Log.i para que capture la línea de SESSION_DECLINATION.
+        com.example.sunproject.diagnostics.FileLogger.start(dir)
 
+        // FIX TRUE-NORTH (2026-05-13): declinación magnética computada una
+        // sola vez por sesión usando GeomagneticField (modelo WMM, preciso
+        // a ~0.5°). Es la única fuente de verdad para llevar mag-N a true-N
         Log.i("PanoramaCAP", "Session dir: ${dir.absolutePath}")
         runOnUiThread { Toast.makeText(this, "Sesión: ${dir.name}", Toast.LENGTH_SHORT).show() }
 
