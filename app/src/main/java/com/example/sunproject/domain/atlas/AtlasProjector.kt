@@ -110,6 +110,36 @@ private const val ZENITH_ERP_BASE_WEIGHT_DAMP = 1.25f
 private const val H45_POLAR_FADE_START_ALT_DEG = 80f
 private const val H45_POLAR_FADE_FULL_ALT_DEG = 88f
 
+// ============================================================
+// FIX TRUE-NORTH (2026-05-16): corrección de yaw per-frame adaptativa
+// ============================================================
+// Reemplaza el "correction global" (mean de deltas absAzimuth - measured)
+// que rotaba todo el atlas como un sólido rígido. El nuevo enfoque:
+//
+//   1. Compute delta_i = (absAzimuth_i - measured_i) wrapped a (-180, 180]
+//      por cada frame H0/H45.
+//   2. Compute la mediana y la MAD (Median Absolute Deviation) del lote.
+//   3. Threshold adaptativo: max(3 × MAD, PER_FRAME_YAW_SENSOR_NOISE_FLOOR_DEG).
+//      El piso impide que MAD muy chica (sitios super limpios) clasifique
+//      el ruido normal del sensor como outlier.
+//   4. Por cada frame:
+//        - Si |delta_i - mediana| <= threshold → INLIER → yawUsed = absAzimuth_i
+//        - Si excede → OUTLIER → yawUsed = measured_i + mediana_inliers
+//
+// Resultado: en cada dirección física donde el mag es confiable, el atlas
+// usa el mag exacto (cada frame su propia corrección). En direcciones
+// donde el mag está distorsionado por estructura metálica local, el frame
+// cae al gyro + corrección global de los inliers. Esto reproduce lo que
+// Sunshine Compass hace implícitamente con su lectura mag continua.
+//
+// Adaptativo: el piso de 2° representa ruido intrínseco del sensor
+// (TYPE_ROTATION_VECTOR específica typical ~1° jitter + holgura). NO es
+// un valor específico del sitio. El threshold real se escala con la
+// dispersión observada del lote vía MAD.
+private const val USE_PER_FRAME_YAW_CORRECTION = true
+private const val PER_FRAME_YAW_SENSOR_NOISE_FLOOR_DEG = 2.0f
+private const val PER_FRAME_YAW_MAD_MULTIPLIER = 3.0f
+
 
 private data class RgbGain(
     val r: Float,
@@ -155,6 +185,12 @@ private data class CameraMountBasis(
 
 object AtlasProjector {
     private var cachedGyroToTrueNorthCorrectionDeg: Float? = null
+
+    // FIX TRUE-NORTH (2026-05-16): override per-frame del yaw para
+    // proyección. Map<frameId, yawDeg>. Se setea en projectFramesToAtlas
+    // si USE_PER_FRAME_YAW_CORRECTION está activo. baseYawDeg lo consulta
+    // y, si hay override para el frame, lo usa en lugar de measuredAzimuthDeg.
+    private var perFrameYawOverrides: Map<String, Float>? = null
 
     // FIX TRUE-NORTH (2026-05-13): declinación magnética de la sesión,
     // computada con GeomagneticField al iniciar la captura y persistida
@@ -340,15 +376,26 @@ object AtlasProjector {
         )
     }
     private fun baseYawDeg(frame: FrameRecord): Float {
-        // Atlas vive en mag-N puro (estado documentado de Fase 7).
-        // La corrección mag→true-N (cachedGyroToTrueNorthCorrectionDeg)
-        // se sigue computando pero NO se aplica acá — la consume solo
-        // GyroCameraController para rotar la viewMatrix de la vista 3D.
-        // De esa forma atlas y cámara virtual quedan en frames consistentes
-        // (ambos mag-N a nivel del atlas; la cámara aplica la corrección
-        // adicional para que los overlays solares calculados en true-N
-        // caigan donde corresponde).
-        return normalizeTwistDeg(frame.measuredAzimuthDeg)
+        // FIX TRUE-NORTH (2026-05-16): consultar override per-frame
+        // antes de caer a measuredAzimuthDeg.
+        //
+        // Si el algoritmo MAD-adaptativo (computePerFrameYawOverrides)
+        // determinó que el mag de este frame es confiable (INLIER), el
+        // override es el absAzimuth_i del frame (mag exacto para esa
+        // dirección física, ya con declinación y distorsiones locales
+        // de esa dirección incluidas).
+        //
+        // Si el mag de este frame fue clasificado como OUTLIER (distorsión
+        // local rara, por ej. una torre cercana en esa dirección), el
+        // override es measured_i + mediana_inliers (gyro + corrección
+        // global aprendida del resto de las direcciones).
+        //
+        // Si el flag está apagado o el cómputo falló (faltan frames con
+        // absAzimuth), se cae al comportamiento legacy: measuredAzimuthDeg
+        // puro (atlas vive en true-N vía el anchor inicial del game frame).
+        val override = perFrameYawOverrides?.get(frame.frameId)
+        val yaw = override ?: frame.measuredAzimuthDeg
+        return normalizeTwistDeg(yaw)
     }
 
 
@@ -967,6 +1014,19 @@ object AtlasProjector {
             "AtlasDeclCorrection",
             "correction=${cachedGyroToTrueNorthCorrectionDeg?.let { "%.2f".format(it) } ?: "null"}° " +
                     "(positivo = rotar atlas al este para llegar a true-N)"
+        )
+
+        // FIX TRUE-NORTH (2026-05-16): cómputo per-frame adaptativo.
+        // Si está activo, sobrescribe baseYawDeg() en lugar de aplicar
+        // el correction global heredado (que ya no se usaba para H0/H45
+        // de todos modos, solo se loguea para diagnóstico).
+        perFrameYawOverrides = if (USE_PER_FRAME_YAW_CORRECTION) {
+            computePerFrameYawOverrides(nonZenithFrames)
+        } else null
+        Log.i(
+            "PerFrameYaw",
+            "active=${USE_PER_FRAME_YAW_CORRECTION} " +
+                    "overrides=${perFrameYawOverrides?.size ?: 0} frames"
         )
 
         // FIX BIAS ROTVEC↔GRAV+MAG (Fase 6): estimar la rotación que lleva
@@ -2640,5 +2700,145 @@ object AtlasProjector {
         }
 
         return meanDeg
+    }
+
+    /**
+     * Cómputo per-frame adaptativo del yaw final (true-N) para H0/H45.
+     *
+     * Algoritmo MAD (Median Absolute Deviation), robusto a outliers:
+     *   1. Compute delta_i = abs_i - measured_i por frame (con wrap signed).
+     *   2. Mediana m de todos los deltas.
+     *   3. MAD = mediana(|delta_i - m|).
+     *   4. threshold = max(MAD_MULTIPLIER × MAD, SENSOR_NOISE_FLOOR_DEG).
+     *   5. Clasificar: INLIER si |delta_i - m| ≤ threshold; OUTLIER si no.
+     *   6. medianInliers = mediana de deltas de los INLIERs.
+     *   7. Por cada frame:
+     *        - INLIER → yawFinal = absAzimuthDeg_i
+     *        - OUTLIER → yawFinal = measuredAzimuthDeg_i + medianInliers
+     *
+     * Sitio limpio (todos los deltas similares): MAD chica, threshold ~= piso.
+     * Todos quedan INLIER, todos usan abs propio. Atlas ajusta cada
+     * frame a su mag exacto.
+     *
+     * Sitio mixto (mayoría buenos, algunos malos): MAD razonable.
+     * Mayoría INLIER, minoría OUTLIER. Atlas usa mag bueno donde lo hay
+     * y gyro+correction donde el mag está distorsionado.
+     *
+     * Sitio terrible (deltas dispersos sin clara moda): MAD alta, threshold
+     * grande, casi todo queda INLIER. Resultado degradado pero los frames
+     * peores quedan recortados. La precisión final está limitada por el
+     * hardware, no por el algoritmo.
+     *
+     * Devuelve null si menos de 3 frames tienen absAzimuthDeg (no se
+     * puede computar estadística confiable).
+     */
+    private fun computePerFrameYawOverrides(
+        frames: List<FrameRecord>
+    ): Map<String, Float>? {
+        val withAbs = frames.filter { it.absAzimuthDeg != null }
+        if (withAbs.size < 3) {
+            Log.w(
+                "PerFrameYaw",
+                "skip: solo ${withAbs.size} frames con absAzimuth (mínimo 3)"
+            )
+            return null
+        }
+
+        data class Sample(
+            val frame: FrameRecord,
+            val deltaDeg: Float   // wrapped signed
+        )
+
+        val samples = withAbs.map { f ->
+            var d = (f.absAzimuthDeg!!) - f.measuredAzimuthDeg
+            while (d > 180f) d -= 360f
+            while (d <= -180f) d += 360f
+            Sample(f, d)
+        }
+
+        val deltas = samples.map { it.deltaDeg }
+        val medianDelta = circularMedianSigned(deltas)
+        val absDeviations = deltas.map { kotlin.math.abs(it - medianDelta) }
+        val mad = circularMedianSigned(absDeviations.map { it })  // mediana de valores positivos
+
+        val threshold = kotlin.math.max(
+            PER_FRAME_YAW_MAD_MULTIPLIER * mad,
+            PER_FRAME_YAW_SENSOR_NOISE_FLOOR_DEG
+        )
+
+        // Pasada 1: clasificar.
+        val inliers = mutableListOf<Sample>()
+        val outliers = mutableListOf<Sample>()
+        samples.forEach { s ->
+            val dev = kotlin.math.abs(s.deltaDeg - medianDelta)
+            if (dev <= threshold) inliers.add(s) else outliers.add(s)
+        }
+
+        if (inliers.isEmpty()) {
+            Log.w(
+                "PerFrameYaw",
+                "skip: 0 inliers tras MAD (médian=${"%.2f".format(medianDelta)}, " +
+                        "MAD=${"%.2f".format(mad)}, threshold=${"%.2f".format(threshold)})"
+            )
+            return null
+        }
+
+        val medianInliers = circularMedianSigned(inliers.map { it.deltaDeg })
+
+        Log.i(
+            "PerFrameYaw",
+            "stats: n=${samples.size} medianDelta=${"%.2f".format(medianDelta)}° " +
+                    "MAD=${"%.2f".format(mad)}° " +
+                    "threshold=${"%.2f".format(threshold)}° " +
+                    "inliers=${inliers.size} outliers=${outliers.size} " +
+                    "medianInliers=${"%.2f".format(medianInliers)}°"
+        )
+
+        // Pasada 2: construir mapa de overrides.
+        val map = mutableMapOf<String, Float>()
+        inliers.forEach { s ->
+            val yawFinal = s.frame.absAzimuthDeg!!
+            map[s.frame.frameId] = yawFinal
+            Log.d(
+                "PerFrameYaw",
+                "frame=${s.frame.frameId} INLIER " +
+                        "delta=${"%.2f".format(s.deltaDeg)}° " +
+                        "devFromMedian=${"%.2f".format(kotlin.math.abs(s.deltaDeg - medianDelta))}° " +
+                        "yawFinal=${"%.2f".format(yawFinal)}° (=absAzimuth)"
+            )
+        }
+        outliers.forEach { s ->
+            val yawFinal = s.frame.measuredAzimuthDeg + medianInliers
+            map[s.frame.frameId] = yawFinal
+            Log.d(
+                "PerFrameYaw",
+                "frame=${s.frame.frameId} OUTLIER " +
+                        "delta=${"%.2f".format(s.deltaDeg)}° " +
+                        "devFromMedian=${"%.2f".format(kotlin.math.abs(s.deltaDeg - medianDelta))}° " +
+                        "yawFinal=${"%.2f".format(yawFinal)}° " +
+                        "(=measured ${"%.2f".format(s.frame.measuredAzimuthDeg)} + ${"%.2f".format(medianInliers)})"
+            )
+        }
+
+        return map.toMap()
+    }
+
+    /**
+     * Mediana circular signed (en grados, lista en [-180, 180]).
+     * Para listas pequeñas (<100), simple sort.
+     *
+     * NOTA: la "mediana circular" estricta requiere optimizar sobre el
+     * círculo. Para el rango angular típico de los deltas (~30° max
+     * en sesiones reales), la mediana aritmética sobre valores wrapped
+     * es indistinguible de la mediana circular. Si en el futuro aparecen
+     * deltas que cruzan ±180°, este método requiere reemplazo por
+     * mediana circular vía búsqueda en el círculo.
+     */
+    private fun circularMedianSigned(values: List<Float>): Float {
+        if (values.isEmpty()) return 0f
+        val sorted = values.sorted()
+        val n = sorted.size
+        return if (n % 2 == 1) sorted[n / 2]
+        else (sorted[n / 2 - 1] + sorted[n / 2]) / 2f
     }
 }
