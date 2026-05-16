@@ -42,7 +42,7 @@ object FileLogger {
         "ZenithMatrix",
         "AtlasPose",            // yaws crudos de cada H0/H45 proyectado
         "AtlasDeclCorrection",   // setSessionDeclinationDeg del projector
-        "AtlasDeclCorrection"
+        "AnchorCalibrator",
     )
 
     @Volatile private var logcatProcess: Process? = null
