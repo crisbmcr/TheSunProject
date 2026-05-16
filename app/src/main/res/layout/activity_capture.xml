@@ -11,6 +11,13 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <com.example.sunproject.ui.CalibrationOverlayView
+        android:id="@+id/calibrationOverlay"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:elevation="6dp"
+        android:visibility="visible" />
+
     <com.example.sunproject.GuideView
         android:id="@+id/guideView"
         android:layout_width="match_parent"

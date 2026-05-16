@@ -213,6 +213,16 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
     private var displayNorthOffsetDeg = 0f
     private var displayOffsetInitialized = false
 
+    // FIX TRUE-NORTH (2026-05-15): calibrador del anchor true-N por
+    // estabilidad del lote en lugar de single-sample. Es lo que Sunshine
+    // Compass logra implícitamente con su lectura continua del mag.
+    // El anchor solo se inicializa cuando el spread del lote (absYaw -
+    // gameYaw) es estable ≤2° durante 2s consecutivos, o tras 30s con
+    // warning de precisión degradada.
+    private val anchorCalibrator = com.example.sunproject.domain.sensor.AnchorCalibrator()
+    private lateinit var calibrationOverlay: com.example.sunproject.ui.CalibrationOverlayView
+    private val calibrationHideHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     private var lastAbsTsNs: Long = 0L
     private var lastGameTsNs: Long = 0L
 
@@ -447,6 +457,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         debugLocation = findViewById(R.id.debugLocation)
         debugCaptureCount = findViewById(R.id.debugCaptureCount)
         btnCapture = findViewById(R.id.btnCapture)
+        calibrationOverlay = findViewById(R.id.calibrationOverlay)
         btnAuto = findViewById(R.id.btnAuto)
         maxShots = guideView.getCapturePlanSize()
         updateCaptureCountUi()
@@ -749,21 +760,42 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                 gamePitchDeg = displayAngles[1]
                 gameRollDeg = displayAngles[2]
 
-                // FIX TRUE-NORTH (2026-05-15): el anchor capture la declinación
-                // requiere que applyDeclination(raw[0]) ya tenga lastLocation
-                // disponible. Si la GPS fix llega después del primer rotvec,
-                // sin este gate displayNorthOffsetDeg quedaba en mag-N puro
-                // y todos los H0/H45 se proyectaban desplazados por declinación.
-                if (!displayOffsetInitialized && absoluteYawDeg != 0f && lastLocation != null) {
-                    displayNorthOffsetDeg = normalize360(absoluteYawDeg - gameYawDeg)
+                // FIX TRUE-NORTH (2026-05-15): el anchor ahora se decide
+                // por estabilidad del lote, no por single-sample. Ver
+                // AnchorCalibrator. Solo se acumula con GPS disponible
+                // y magAccuracy > UNRELIABLE.
+                val anchorReady = anchorCalibrator.push(
+                    absYawDeg = absoluteYawDeg,
+                    gameYawDeg = gameYawDeg,
+                    magAccuracy = magneticAccuracy,
+                    hasLocation = lastLocation != null,
+                    nowMs = android.os.SystemClock.elapsedRealtime()
+                )
+
+                if (anchorReady && !displayOffsetInitialized) {
+                    displayNorthOffsetDeg = anchorCalibrator.anchorOrNull() ?: 0f
                     displayOffsetInitialized = true
+                    val degraded = anchorCalibrator.isDegraded()
                     Log.i(
                         "SunDeclination",
-                        "ANCHOR_INIT lat=${"%.4f".format(lastLocation!!.latitude)} " +
+                        "ANCHOR_INIT (calibrated) " +
+                                "lat=${"%.4f".format(lastLocation!!.latitude)} " +
                                 "lon=${"%.4f".format(lastLocation!!.longitude)} " +
-                                "absYaw_trueN=${"%.2f".format(absoluteYawDeg)}° " +
-                                "gameYaw=${"%.2f".format(gameYawDeg)}° " +
-                                "offset_includes_declination=${"%.2f".format(displayNorthOffsetDeg)}°"
+                                "offsetDeg=${"%.2f".format(displayNorthOffsetDeg)}° " +
+                                "degraded=$degraded"
+                    )
+                    // El overlay sigue 2s mostrando el estado "READY",
+                    // después se oculta para no estorbar.
+                    calibrationHideHandler.postDelayed({
+                        calibrationOverlay.visibility = android.view.View.GONE
+                    }, 2000L)
+                }
+
+                // Refrescar el overlay con el estado actual del calibrador,
+                // hasta que se oculte (post anchor ready).
+                if (calibrationOverlay.visibility == android.view.View.VISIBLE) {
+                    calibrationOverlay.setStatus(
+                        anchorCalibrator.status(android.os.SystemClock.elapsedRealtime())
                     )
                 }
 
