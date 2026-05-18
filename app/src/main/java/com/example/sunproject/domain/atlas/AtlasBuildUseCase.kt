@@ -68,11 +68,27 @@ class AtlasBuildUseCase(
         return out
     }
 
-    fun buildProjectedAtlas(sessionDir: File): File {
+    /**
+     * Proyecta todos los frames de una sesión a un atlas equirectangular.
+     *
+     * @param sessionDir directorio de la sesión.
+     * @param forcePerFrameYawCorrection override runtime del flag
+     *   USE_PER_FRAME_YAW_CORRECTION de AtlasProjector. null = usar
+     *   el valor del archivo (default). true/false = forzar A/B sobre
+     *   sesiones históricas sin recompilar.
+     */
+    fun buildProjectedAtlas(
+        sessionDir: File,
+        forcePerFrameYawCorrection: Boolean? = null
+    ): File {
         val paths = store.createSessionPaths(sessionDir)
         val rawFrames = store.loadFrames(paths).sortedBy { it.shotIndex }
 
         require(rawFrames.isNotEmpty()) { "No hay frames en la sesión." }
+
+        // FIX BUG #5 (2026-05-16): inyectar el override runtime ANTES de
+        // proyectar para que projectFramesToAtlas lo consuma.
+        AtlasProjector.setPerFrameYawCorrectionOverride(forcePerFrameYawCorrection)
 
         // Refinamiento global de poses H0/H45 via bundle adjustment.
         // Si está deshabilitado o el BA no converge, refineOrFallback devuelve

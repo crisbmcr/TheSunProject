@@ -503,11 +503,7 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
         }
 
         btnAuto.setOnLongClickListener {
-            if (capturedFiles.isEmpty()) {
-                Toast.makeText(this, "Captura al menos una foto primero", Toast.LENGTH_SHORT).show()
-            } else {
-                openProjectedAtlasAll()
-            }
+            showAtlasActionsDialog()
             true
         }
 
@@ -2197,6 +2193,162 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
                     Toast.makeText(
                         this,
                         "Error generando atlas multi-frame: ${t.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+        }
+    }
+
+    /**
+     * FIX BUG #5 (2026-05-16): diálogo unificado del long-press de btnAuto.
+     *
+     * Reemplaza el comportamiento previo (que invocaba openProjectedAtlasAll
+     * directamente) por un menú con dos opciones:
+     *   1. Generar atlas de la sesión actual (comportamiento legacy).
+     *   2. Reproyectar una sesión existente con flag MAD on/off (para A/B
+     *      sin recompilar y sin recapturar).
+     *
+     * La opción 2 abre un sub-diálogo que lista las sesiones disponibles
+     * bajo el directorio raíz.
+     */
+    private fun showAtlasActionsDialog() {
+        val options = arrayOf(
+            "Generar atlas (sesión actual)",
+            "Reproyectar sesión existente…"
+        )
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Atlas")
+            .setItems(options) { _, which ->
+                when (which) {
+                    0 -> {
+                        if (capturedFiles.isEmpty()) {
+                            Toast.makeText(
+                                this,
+                                "Captura al menos una foto primero",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        } else {
+                            openProjectedAtlasAll()
+                        }
+                    }
+                    1 -> showReprojectSessionDialog()
+                }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    /**
+     * Lista las sesiones existentes bajo el directorio raíz y deja al
+     * usuario elegir una para reproyectar. Después pasa al sub-diálogo
+     * de selección de flag MAD.
+     */
+    private fun showReprojectSessionDialog() {
+        // El directorio raíz de sesiones es <externalFilesDir>/sessions/,
+        // construido en ensureSessionDir(). Si sessionDir aún no se creó
+        // en esta vida de la activity, levantamos el path directamente.
+        val sessionsRoot = sessionDir?.parentFile
+            ?: File(getExternalFilesDir(null), "sessions")
+        if (!sessionsRoot.exists()) {
+            Toast.makeText(
+                this,
+                "No hay directorio de sesiones todavía",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        val candidates = sessionsRoot.listFiles { f -> f.isDirectory } ?: emptyArray()
+        if (candidates.isEmpty()) {
+            Toast.makeText(
+                this,
+                "No hay sesiones existentes para reproyectar",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+        // Más reciente primero (los nombres son timestamped: session_yyyyMMdd_HHmmss).
+        val sorted = candidates.sortedByDescending { it.name }
+        val names = sorted.map { it.name }.toTypedArray()
+
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Reproyectar sesión")
+            .setItems(names) { _, which ->
+                val selected = sorted[which]
+                showReprojectFlagDialog(selected)
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    /**
+     * Sub-diálogo: elegir si MAD per-frame está ON, OFF, o usar el default
+     * de la constante USE_PER_FRAME_YAW_CORRECTION del archivo.
+     */
+    private fun showReprojectFlagDialog(targetSessionDir: File) {
+        val options = arrayOf(
+            "MAD per-frame ON",
+            "MAD per-frame OFF",
+            "Default (constante del archivo)"
+        )
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Modo MAD para ${targetSessionDir.name}")
+            .setItems(options) { _, which ->
+                val flag: Boolean? = when (which) {
+                    0 -> true
+                    1 -> false
+                    else -> null
+                }
+                runReproject(targetSessionDir, flag)
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+
+    /**
+     * Ejecuta la reproyección en el cameraExecutor (mismo thread pool
+     * que openProjectedAtlasAll), abre AnalysisActivity al terminar.
+     *
+     * El atlas resultante SOBRESCRIBE atlas_projected_all.png del sessionDir.
+     * Para A/B el usuario debería screenshotear la vista de Analysis antes
+     * de generar el segundo (o renombrar el archivo manualmente vía
+     * explorador de archivos).
+     */
+    private fun runReproject(targetSessionDir: File, forcePerFrameYaw: Boolean?) {
+        val label = when (forcePerFrameYaw) {
+            true -> "MAD=ON"
+            false -> "MAD=OFF"
+            null -> "MAD=default"
+        }
+        Toast.makeText(
+            this,
+            "Reproyectando ${targetSessionDir.name} con $label…",
+            Toast.LENGTH_SHORT
+        ).show()
+        cameraExecutor.execute {
+            try {
+                val atlasFile = atlasBuildUseCase.buildProjectedAtlas(
+                    sessionDir = targetSessionDir,
+                    forcePerFrameYawCorrection = forcePerFrameYaw
+                )
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Reproyección OK ($label)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                    startActivity(
+                        Intent(this, AnalysisActivity::class.java).apply {
+                            putExtra("panorama_path", atlasFile.absolutePath)
+                        }
+                    )
+                }
+            } catch (t: Throwable) {
+                Log.e("ReprojectSession", "fail", t)
+                runOnUiThread {
+                    Toast.makeText(
+                        this,
+                        "Error reproyectando: ${t.message}",
                         Toast.LENGTH_LONG
                     ).show()
                 }

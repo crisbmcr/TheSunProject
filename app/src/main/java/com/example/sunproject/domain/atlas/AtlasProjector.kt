@@ -192,6 +192,26 @@ object AtlasProjector {
     // y, si hay override para el frame, lo usa en lugar de measuredAzimuthDeg.
     private var perFrameYawOverrides: Map<String, Float>? = null
 
+    // FIX BUG #5 (2026-05-16): override runtime del feature flag. Permite
+    // a CaptureActivity (vía AtlasBuildUseCase) forzar on/off al reproyectar
+    // sesiones existentes, sin recompilar. Null = usar el valor de la
+    // constante USE_PER_FRAME_YAW_CORRECTION del archivo.
+    @Volatile private var perFrameYawCorrectionOverride: Boolean? = null
+
+    /**
+     * Setea un override runtime del feature flag de MAD per-frame. Pasar
+     * null para volver al valor por defecto del archivo. AtlasBuildUseCase
+     * lo invoca antes de projectar para soportar A/B sobre sesiones
+     * históricas sin recompilar.
+     */
+    fun setPerFrameYawCorrectionOverride(value: Boolean?) {
+        perFrameYawCorrectionOverride = value
+        Log.i(
+            "PerFrameYaw",
+            "setOverride=${value ?: "null (use default ${USE_PER_FRAME_YAW_CORRECTION})"}"
+        )
+    }
+
     // FIX TRUE-NORTH (2026-05-13): declinación magnética de la sesión,
     // computada con GeomagneticField al iniciar la captura y persistida
     // en session.json. AtlasBuildUseCase la inyecta acá antes de projectar
@@ -1018,14 +1038,20 @@ object AtlasProjector {
 
         // FIX TRUE-NORTH (2026-05-16): cómputo per-frame adaptativo.
         // Si está activo, sobrescribe baseYawDeg() en lugar de aplicar
-        // el correction global heredado (que ya no se usaba para H0/H45
-        // de todos modos, solo se loguea para diagnóstico).
-        perFrameYawOverrides = if (USE_PER_FRAME_YAW_CORRECTION) {
+        // el correction global heredado.
+        // FIX BUG #5 (2026-05-16): el flag efectivo combina el override
+        // runtime (si presente) con la constante del archivo. Esto permite
+        // a AtlasBuildUseCase forzar on/off para A/B sobre sesiones
+        // históricas sin recompilar.
+        val perFrameActive = perFrameYawCorrectionOverride ?: USE_PER_FRAME_YAW_CORRECTION
+        perFrameYawOverrides = if (perFrameActive) {
             computePerFrameYawOverrides(nonZenithFrames)
         } else null
         Log.i(
             "PerFrameYaw",
-            "active=${USE_PER_FRAME_YAW_CORRECTION} " +
+            "active=${perFrameActive} " +
+                    "(override=${perFrameYawCorrectionOverride ?: "null"}, " +
+                    "default=${USE_PER_FRAME_YAW_CORRECTION}) " +
                     "overrides=${perFrameYawOverrides?.size ?: 0} frames"
         )
 
@@ -2759,7 +2785,12 @@ object AtlasProjector {
         val deltas = samples.map { it.deltaDeg }
         val medianDelta = circularMedianSigned(deltas)
         val absDeviations = deltas.map { kotlin.math.abs(it - medianDelta) }
-        val mad = circularMedianSigned(absDeviations.map { it })  // mediana de valores positivos
+        // FIX BUG #4 (2026-05-16): los absDeviations viven en [0, ∞), no en
+        // [-180, 180]. Usar linearMedian (mediana aritmética simple) en lugar
+        // de circularMedianSigned. La implementación es idéntica hoy, pero
+        // si circularMedianSigned se refactorea a futuro para hacer mediana
+        // circular real con búsqueda en el círculo, este sitio no se rompe.
+        val mad = linearMedian(absDeviations)
 
         val threshold = kotlin.math.max(
             PER_FRAME_YAW_MAD_MULTIPLIER * mad,
@@ -2835,6 +2866,25 @@ object AtlasProjector {
      * mediana circular vía búsqueda en el círculo.
      */
     private fun circularMedianSigned(values: List<Float>): Float {
+        if (values.isEmpty()) return 0f
+        val sorted = values.sorted()
+        val n = sorted.size
+        return if (n % 2 == 1) sorted[n / 2]
+        else (sorted[n / 2 - 1] + sorted[n / 2]) / 2f
+    }
+
+    /**
+     * Mediana aritmética simple sobre valores no-angulares como los
+     * absDeviations de la MAD. Funcionalmente idéntica a
+     * circularMedianSigned hoy, pero con nombre/contrato honestos:
+     * dominio = valores reales (típicamente positivos), no ángulos
+     * en (-180, 180].
+     *
+     * Si en el futuro se reemplaza circularMedianSigned por mediana
+     * circular real (con búsqueda óptima en el círculo), este helper
+     * permanece estable.
+     */
+    private fun linearMedian(values: List<Float>): Float {
         if (values.isEmpty()) return 0f
         val sorted = values.sorted()
         val n = sorted.size
