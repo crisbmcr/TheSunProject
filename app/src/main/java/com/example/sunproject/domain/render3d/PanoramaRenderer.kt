@@ -30,7 +30,12 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
         atlasMaxAltitudeDeg = 90f
     )
 
+    // Overlay del ábaco solar 3D. Se inicializa lazy adentro y maneja su propio
+    // shader program y VBOs. Si nunca le seteamos un mesh, draw() es no-op.
+    private val solarOverlay = com.example.sunproject.domain.render3d.abacus.SolarChartOverlay3D()
+
     private var program = 0
+
     private var aPositionLoc = -1
     private var aTexCoordLoc = -1
     private var uMvpMatrixLoc = -1
@@ -102,6 +107,10 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
 
         Matrix.setIdentityM(modelMatrix, 0)
 
+        // El overlay tiene que reinicializar sus recursos GL: la Surface se
+        // recreó y los handles viejos (program, VBOs) son inválidos.
+        solarOverlay.onSurfaceCreated()
+
         Log.i(TAG, "onSurfaceCreated OK — program=$program")
     }
 
@@ -165,6 +174,11 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
 
         GLES20.glDisableVertexAttribArray(aPositionLoc)
         GLES20.glDisableVertexAttribArray(aTexCoordLoc)
+
+        // Ábaco solar 3D superpuesto. Hace su propio glUseProgram y maneja
+        // su estado de depth/blend internamente — restaura al state que
+        // asumimos acá entre frames (depth ON, blend OFF).
+        solarOverlay.draw(mvpMatrix)
     }
 
     /**
@@ -183,6 +197,17 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
     fun setAtlasBitmap(bitmap: Bitmap) {
         pendingBitmap = bitmap
         bitmapUploaded = false
+    }
+
+    /**
+     * Inyecta el mesh 3D del ábaco solar para que se dibuje superpuesto a la
+     * esfera. Puede llamarse desde cualquier thread; el upload GL ocurre en
+     * el render thread durante el siguiente onDrawFrame.
+     *
+     * Pasar null elimina el ábaco — no implementado en v1, no hace falta.
+     */
+    fun setSolarChartMesh(mesh: com.example.sunproject.domain.render3d.abacus.SolarChartMesh3D) {
+        solarOverlay.setMesh(mesh)
     }
 
     private fun updateProjection() {

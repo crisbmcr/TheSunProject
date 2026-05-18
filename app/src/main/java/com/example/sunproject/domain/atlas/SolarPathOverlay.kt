@@ -6,6 +6,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import com.example.sunproject.domain.solar.SolarChart
+import com.example.sunproject.domain.solar.SolarChartPalette
 import com.example.sunproject.domain.solar.SolarPath
 import com.example.sunproject.domain.solar.SolarPosition
 import kotlin.math.abs
@@ -34,16 +35,16 @@ object SolarPathOverlay {
 
         chart.dailyPaths.forEach { path ->
             path.monthIndex?.let { month ->
-                drawPath(canvas, atlasConfig, path, colorForMonth(month), strokePx = 2.4f)
+                drawPath(canvas, atlasConfig, path, SolarChartPalette.colorForMonth(month), strokePx = 2.4f)
             }
         }
         chart.hourlyPaths.forEach { path ->
-            drawPath(canvas, atlasConfig, path, HOUR_LINE_COLOR, strokePx = 1.4f)
+            drawPath(canvas, atlasConfig, path, SolarChartPalette.HOUR_LINE_COLOR, strokePx = 1.4f)
             labelHour(canvas, atlasConfig, path)
         }
 
         chart.captureDayPath?.let { path ->
-            drawPath(canvas, atlasConfig, path, CAPTURE_DAY_COLOR, strokePx = 4.5f)
+            drawPath(canvas, atlasConfig, path, SolarChartPalette.CAPTURE_DAY_COLOR, strokePx = 4.5f)
             labelCaptureDay(canvas, atlasConfig, path)
         }
 
@@ -104,7 +105,7 @@ object SolarPathOverlay {
         val y = altToY(top.altitudeDeg, cfg).toFloat()
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = HOUR_LABEL_COLOR
+            color = SolarChartPalette.HOUR_LABEL_COLOR
             textSize = 22f
             setShadowLayer(3f, 1f, 1f, Color.BLACK)
         }
@@ -201,7 +202,7 @@ object SolarPathOverlay {
         val y = altToY(top.altitudeDeg, cfg).toFloat()
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = CAPTURE_DAY_COLOR
+            color = SolarChartPalette.CAPTURE_DAY_COLOR
             textSize = 26f
             isFakeBoldText = true
             setShadowLayer(4f, 1f, 1f, Color.BLACK)
@@ -215,10 +216,10 @@ object SolarPathOverlay {
         val y = altToY(pos.altitudeDeg, cfg).toFloat()
 
         val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(249, 203, 66); style = Paint.Style.FILL
+            color = SolarChartPalette.SUN_FILL_COLOR; style = Paint.Style.FILL
         }
         val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.rgb(133, 79, 11); style = Paint.Style.STROKE; strokeWidth = 3f
+            color = SolarChartPalette.SUN_RING_COLOR; style = Paint.Style.STROKE; strokeWidth = 3f
         }
         canvas.drawCircle(x, y, 11f, fill)
         canvas.drawCircle(x, y, 11f, ring)
@@ -251,16 +252,7 @@ object SolarPathOverlay {
     //
     // Hemisferio Sur: diciembre = verano (rojo/cálido), junio = invierno (azul).
 
-    private fun colorForMonth(month: Int): Int = when (month) {
-        12 -> Color.rgb(226, 75, 74)
-        1, 11 -> Color.rgb(232, 93, 36)
-        2, 10 -> Color.rgb(239, 159, 39)
-        3, 9 -> Color.rgb(186, 117, 23)
-        4, 8 -> Color.rgb(151, 196, 89)
-        5, 7 -> Color.rgb(29, 158, 117)
-        6 -> Color.rgb(55, 138, 221)
-        else -> Color.GRAY
-    }
+
     /**
      * Renderiza el chart sobre una copia del atlas y guarda el PNG resultante
      * como "atlas_projected_all_abaco.png" en el mismo directorio que el
@@ -301,7 +293,4 @@ object SolarPathOverlay {
     }
 
 
-    private val HOUR_LINE_COLOR = Color.argb(140, 250, 199, 117)
-    private val HOUR_LABEL_COLOR = Color.rgb(250, 199, 117)
-    private val CAPTURE_DAY_COLOR = Color.rgb(255, 255, 255)  // blanco, se destaca sobre todo
 }
