@@ -128,7 +128,7 @@ object SolarPathOverlay {
             val x = azToX(noon.azimuthDeg, cfg).toFloat()
             val y = altToY(noon.altitudeDeg, cfg).toFloat()
 
-            paint.color = colorForMonth(month)
+            paint.color = SolarChartPalette.colorForMonth(month)
             canvas.drawText("21 ${path.label}", x + 8f, y - 10f, paint)
         }
     }
@@ -248,18 +248,6 @@ object SolarPathOverlay {
         return d
     }
 
-    // ---- Paleta ----------------------------------------------------------
-    //
-    // Hemisferio Sur: diciembre = verano (rojo/cálido), junio = invierno (azul).
-
-
-    /**
-     * Renderiza el chart sobre una copia del atlas y guarda el PNG resultante
-     * como "atlas_projected_all_abaco.png" en el mismo directorio que el
-     * atlas original. Devuelve el File escrito, o null si falló la escritura.
-     *
-     * No modifica el bitmap original ni el archivo original.
-     */
     fun exportWithChart(
         atlasFile: File,
         atlasConfig: AtlasConfig,

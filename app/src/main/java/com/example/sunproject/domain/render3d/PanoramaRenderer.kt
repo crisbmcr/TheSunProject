@@ -11,16 +11,7 @@ import javax.microedition.khronos.opengles.GL10
 
 private const val TAG = "PanoramaRenderer"
 
-/**
- * Renderer del skybox esférico con atlas equirectangular.
- *
- * Pipeline v1 (esta tanda):
- *  - Skybox solo. Cámara estática mirando al Norte (+Y ENU) con pitch 0, FOV 75°.
- *  - Sin giroscopio, sin gestos, sin ábaco. Esos vienen en tandas siguientes.
- *
- * El Bitmap del atlas se sube como textura GL_TEXTURE_2D en onSurfaceCreated.
- * Importante: el Bitmap debe estar en config ARGB_8888 y no reciclado al momento del upload.
- */
+
 class PanoramaRenderer : GLSurfaceView.Renderer {
 
     private val sphere = SphereMesh(
@@ -33,6 +24,11 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
     // Overlay del ábaco solar 3D. Se inicializa lazy adentro y maneja su propio
     // shader program y VBOs. Si nunca le seteamos un mesh, draw() es no-op.
     private val solarOverlay = com.example.sunproject.domain.render3d.abacus.SolarChartOverlay3D()
+
+    // Overlay de referencias del mundo: línea de horizonte (altitud 0°) y
+    // etiquetas de azimut cada 10°. Se renderea siempre (no requiere data
+    // externa, los recursos se generan adentro en el primer draw).
+    private val worldGrid = com.example.sunproject.domain.render3d.grid.WorldGridOverlay3D()
 
     private var program = 0
 
@@ -107,9 +103,10 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
 
         Matrix.setIdentityM(modelMatrix, 0)
 
-        // El overlay tiene que reinicializar sus recursos GL: la Surface se
-        // recreó y los handles viejos (program, VBOs) son inválidos.
+        // Los overlays tienen que reinicializar sus recursos GL: la Surface se
+        // recreó y los handles viejos (program, VBOs, texturas) son inválidos.
         solarOverlay.onSurfaceCreated()
+        worldGrid.onSurfaceCreated()
 
         Log.i(TAG, "onSurfaceCreated OK — program=$program")
     }
@@ -179,6 +176,11 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
         // su estado de depth/blend internamente — restaura al state que
         // asumimos acá entre frames (depth ON, blend OFF).
         solarOverlay.draw(mvpMatrix)
+
+        // Referencias del mundo (horizonte + etiquetas azimut). Se dibuja
+        // al final para que las etiquetas queden encima de cualquier otra
+        // capa.
+        worldGrid.draw(mvpMatrix)
     }
 
     /**
