@@ -10,7 +10,9 @@ android {
     namespace = "com.example.sunproject"
     compileSdk = 35
     sourceSets["main"].jniLibs.srcDirs("$opencvSdk/native/libs")
-
+    androidResources {
+        noCompress.add("tflite")
+    }
     defaultConfig {
         applicationId = "com.example.sunproject"
         minSdk = 24
@@ -79,6 +81,12 @@ configurations.all {
 dependencies {
     // --- DEPENDENCIA AL MÓDULO DE OPENCV ---
     implementation("org.opencv:opencv:4.10.0")
+
+    // LiteRT (TensorFlow Lite rebrand) — segmentación semántica del cielo
+    implementation("com.google.ai.edge.litert:litert:1.4.1")
+    implementation("com.google.ai.edge.litert:litert-gpu:1.4.1")
+    implementation("com.google.ai.edge.litert:litert-gpu-api:1.4.1")
+    implementation("com.google.ai.edge.litert:litert-support:1.4.1")
 
     implementation("org.apache.commons:commons-math3:3.6.1")
     // --- DEPENDENCIAS EXISTENTES ---

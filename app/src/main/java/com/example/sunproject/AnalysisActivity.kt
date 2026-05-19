@@ -95,6 +95,27 @@ class AnalysisActivity : AppCompatActivity() {
             }
             startActivity(intent)
         }
+
+        /// TEMPORAL: smoke test del SkySegmenter. Quitar después de validar Fase A.
+        Thread {
+            try {
+                SkySegmenterTFLite(applicationContext).use { segmenter ->
+                    val base = baseBitmap ?: return@Thread
+                    val cropSize = SkySegmenterTFLite.INPUT_SIZE
+                    if (base.width < cropSize || base.height < cropSize) {
+                        Log.w("SmokeTest", "Atlas ${base.width}×${base.height} muy chico para crop $cropSize")
+                        return@Thread
+                    }
+                    val cx = (base.width - cropSize) / 2
+                    val cy = (base.height - cropSize) / 2
+                    val crop = Bitmap.createBitmap(base, cx, cy, cropSize, cropSize)
+                    val mask = segmenter.segmentSky(crop)
+                    Log.i("SmokeTest", "Segmentación completada, mask=${mask.size}×${mask[0].size}")
+                }
+            } catch (t: Throwable) {
+                Log.e("SmokeTest", "Falló el smoke test del SkySegmenter", t)
+            }
+        }.start()
     }
 
     /**
