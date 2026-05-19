@@ -43,10 +43,6 @@ data class HorizonProfile(
      *
      * El azimut se normaliza a [0, 360). Soporta tanto el rango NOAA [0, 360)
      * como el rango AtlasMath [-180, 180].
-     *
-     * Pensado para integrar contra trayectorias solares: para cada SolarPosition,
-     * comparar su altitudeDeg con altAtAzimuthDeg(azimuthDeg) y si la altitud
-     * del sol es menor, el sol está obstruido.
      */
     fun altAtAzimuthDeg(azimuthDeg: Float): Float {
         var az = azimuthDeg % 360f
@@ -76,14 +72,14 @@ data class DetectionParams(
      * recibe varias columnas del atlas (típicamente 10 columnas si atlas=3600
      * y buckets=360). Esta estrategia decide cómo combinarlas.
      *
-     * MEDIAN: robusta a outliers, descarta estructuras delgadas (cables, postes).
-     * P75/P90: percentiles, intermedio entre mediana y máximo.
-     * MAX: conservador para sombreado, sobreestima por cualquier columna ruidosa.
-     *
-     * Default MEDIAN para v1. Si en validación se ve que se pierden
-     * obstrucciones reales pero finas (mástil, antena), subir a P75 o P90.
+     * P75 (default): captura estructuras presentes en >=25% de las columnas
+     *   del bucket (postes, mástiles delgados, antenas). Equilibra robustez
+     *   ante outliers con sensibilidad a estructuras finas reales.
+     * MEDIAN: descarta estructuras delgadas como outliers — útil si hay
+     *   mucho ruido columna a columna.
+     * P90 / MAX: progresivamente más conservadores (sobreestiman obstrucción).
      */
-    val aggregationStrategy: AggregationStrategy = AggregationStrategy.MEDIAN,
+    val aggregationStrategy: AggregationStrategy = AggregationStrategy.P75,
 
     /**
      * Cantidad de bandas verticales para calibración adaptativa de Otsu.
@@ -112,11 +108,18 @@ data class DetectionParams(
 
     /**
      * Tamaño del kernel de cierre morfológico aplicado a la máscara binaria
-     * cielo/suelo antes de buscar la frontera. Kernel vertical más alto que
-     * ancho para preservar estructuras delgadas (postes) y rellenar huecos
-     * pequeños del cielo (nubes ralas, ruido).
+     * cielo/suelo antes del análisis de componentes conectados.
+     *
+     * Kernel asimétrico (más alto que ancho) para tapar huecos pequeños
+     * dentro de estructuras (espacio entre travesaños, entre los brazos
+     * de una torre, entre cables paralelos) y unirlos en una sola
+     * componente conectada al suelo. Eso permite que el filtro CCA
+     * aguas abajo reconozca toda la estructura como un único obstáculo.
+     *
+     * 1×9 por default. Más chico (1×3) dejaba pasar huecos entre travesaños
+     * de torres metálicas.
      */
-    val morphCloseKernelHeight: Int = 3,
+    val morphCloseKernelHeight: Int = 9,
     val morphCloseKernelWidth: Int = 1
 ) {
     init {

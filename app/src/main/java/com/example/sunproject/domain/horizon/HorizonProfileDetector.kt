@@ -20,27 +20,26 @@ import org.opencv.imgproc.Imgproc
  * Detector de perfil de obstrucción sobre un atlas equirectangular.
  *
  * Pipeline:
- *   1. Bitmap → Mat RGBA → Mat RGB → Mat HSV → canal V (luminancia)
+ *   1. Bitmap → Mat RGBA → Mat RGB → Mat HSV → canal V (luminancia).
  *   2. Otsu adaptativo por bandas verticales de 30° de azimut:
- *        - Threshold CALIBRADO sobre filas con alt < calibrationMaxAltitudeDeg
- *          (evita el cielo cenital muy oscuro que sesga la distribución bimodal
- *          que Otsu necesita; en Cauchari a 4024m esto importa).
+ *        - Threshold CALIBRADO sobre filas con alt < calibrationMaxAltitudeDeg.
  *        - Threshold APLICADO a toda la altura del atlas.
- *   3. Máscara binaria global: V >= threshold(banda) → cielo (255), si no → suelo (0).
- *   4. Cierre morfológico vertical: rellena huecos chicos en el cielo (nubes ralas,
- *      ruido). Kernel asimétrico (más alto que ancho) para preservar estructuras
- *      verticales delgadas como postes y antenas.
- *   5. Búsqueda del horizonte por columna, ARRANCANDO DESDE ABAJO (alt=0°) HACIA
- *      ARRIBA: encontrar el primer pixel de cielo. Esa elección es robusta al
- *      problema conocido del cielo cenital oscuro. Si en validación se ve que
- *      el piso pulido/asfalto al sol genera falsos cielos abajo, evaluamos
- *      cambiar a búsqueda desde arriba o requerir que las K filas superiores
- *      sean también cielo (consistencia local).
- *   6. Agregación a buckets de azimut con la estrategia configurada (mediana
+ *   3. Máscara binaria global: V >= threshold(banda) → cielo (255), else suelo (0).
+ *   4. Cierre morfológico vertical: rellena huecos chicos en estructuras para
+ *      que el CCA aguas abajo las agrupe como una sola componente.
+ *   5. Análisis de componentes conectados (CCA) sobre el no-cielo: nos
+ *      quedamos solo con las componentes que tocan el borde inferior del
+ *      atlas. Esto descarta nubes oscuras, ruido y manchas aisladas en el
+ *      cielo (no llegan al suelo), y trata torres caladas como un solo
+ *      obstáculo (cielo entre brazos no está conectado al cielo principal).
+ *   6. Búsqueda del horizonte por columna DESDE ARRIBA sobre la máscara
+ *      filtrada: el primer pixel marcado como obstáculo define la cima del
+ *      obstáculo más alto en esa columna.
+ *   7. Agregación a buckets de azimut con la estrategia configurada (P75
  *      por default), y suavizado circular con ventana smoothingWindowDeg.
  *
- * Costo: ~30M ops sobre atlas 3600×900. Estimado 100-300ms en teléfono moderno.
- * Llamar SIEMPRE desde background thread; nunca desde UI.
+ * Costo: ~30M ops sobre atlas 3600×900. Estimado 200-400ms en teléfono
+ * moderno. Llamar SIEMPRE desde background thread; nunca desde UI.
  *
  * Convención de salida: HorizonProfile.altByAzimuthDeg[0]=N, índices CW (NOAA).
  */
@@ -55,8 +54,8 @@ object HorizonProfileDetector {
     )
 
     /**
-     * Diagnóstico de una corrida del detector. Útil para inspeccionar visualmente
-     * qué pasó cuando un perfil sale raro.
+     * Diagnóstico de una corrida del detector. Útil para inspeccionar
+     * visualmente qué pasó cuando un perfil sale raro.
      */
     data class DebugInfo(
         /** Threshold Otsu calculado en cada banda vertical [0, 255]. */
@@ -65,7 +64,7 @@ object HorizonProfileDetector {
         val perBandSampleCounts: List<Int>,
         /**
          * Atlas + máscara de cielo en azul + polilínea verde del horizonte +
-         * líneas de borde de banda. Pesa ~12MB. No retener más de lo necesario.
+         * líneas de borde de banda. Pesa ~12MB.
          */
         val overlayBitmap: Bitmap,
         /** Altitud por columna del atlas (pre-agregación a buckets). */
@@ -136,51 +135,63 @@ object HorizonProfileDetector {
                     mask, params.morphCloseKernelWidth, params.morphCloseKernelHeight
                 )
                 try {
-                    val altByColumnDeg = findHorizonByColumn(closedMask, atlasConfig)
-                    val altByBucketRaw = aggregateColumnsToBuckets(
-                        altByColumnDeg, atlasConfig, numBuckets, params.aggregationStrategy
-                    )
-                    val altSmoothed = if (params.smoothingWindowDeg > 0) {
-                        smoothCircularProfile(altByBucketRaw, params.smoothingWindowDeg, numBuckets)
-                    } else {
-                        altByBucketRaw
+                    // Filtrar componentes no-cielo por conectividad al borde
+                    // inferior. Solo sobreviven los obstáculos físicos anclados
+                    // al suelo. Nubes, ruido y huecos internos de estructuras
+                    // se eliminan o se absorben en la estructura padre.
+                    val obstacleMask = filterObstaclesConnectedToBottom(closedMask)
+                    try {
+                        val altByColumnDeg = findHorizonByColumn(obstacleMask, atlasConfig)
+                        val altByBucketRaw = aggregateColumnsToBuckets(
+                            altByColumnDeg, atlasConfig, numBuckets, params.aggregationStrategy
+                        )
+                        val altSmoothed = if (params.smoothingWindowDeg > 0) {
+                            smoothCircularProfile(altByBucketRaw, params.smoothingWindowDeg, numBuckets)
+                        } else {
+                            altByBucketRaw
+                        }
+
+                        val profile = HorizonProfile(
+                            schemaVersion = HorizonProfile.CURRENT_SCHEMA_VERSION,
+                            sessionId = sessionId,
+                            createdAtUtcMs = System.currentTimeMillis(),
+                            sourceAtlasName = sourceAtlasName,
+                            azimuthBuckets = numBuckets,
+                            altByAzimuthDeg = altSmoothed.toList(),
+                            detectionParams = params
+                        )
+
+                        val debugInfo = if (generateDebugInfo) {
+                            // Debug overlay usa la máscara filtrada por CCA
+                            // para que se vea la silueta final de obstáculos
+                            // (en lugar de la máscara intermedia de cielo).
+                            val overlay = buildDebugOverlay(
+                                atlasBitmap, obstacleMask, altByColumnDeg,
+                                atlasConfig, params.azimuthBands, bandWidth
+                            )
+                            DebugInfo(
+                                perBandThresholds = perBandThresholds.toList(),
+                                perBandSampleCounts = perBandSampleCounts.toList(),
+                                overlayBitmap = overlay,
+                                altByColumnDeg = altByColumnDeg,
+                                totalElapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                            )
+                        } else null
+
+                        val (minV, maxV, meanV) = stats(altSmoothed)
+                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                        Log.i(
+                            TAG,
+                            "Profile detected: $numBuckets buckets, " +
+                                    "min=${"%.1f".format(minV)}° max=${"%.1f".format(maxV)}° " +
+                                    "mean=${"%.1f".format(meanV)}° elapsed=${elapsedMs}ms " +
+                                    "strategy=${params.aggregationStrategy}"
+                        )
+
+                        return Result(profile, debugInfo)
+                    } finally {
+                        obstacleMask.release()
                     }
-
-                    val profile = HorizonProfile(
-                        schemaVersion = HorizonProfile.CURRENT_SCHEMA_VERSION,
-                        sessionId = sessionId,
-                        createdAtUtcMs = System.currentTimeMillis(),
-                        sourceAtlasName = sourceAtlasName,
-                        azimuthBuckets = numBuckets,
-                        altByAzimuthDeg = altSmoothed.toList(),
-                        detectionParams = params
-                    )
-
-                    val debugInfo = if (generateDebugInfo) {
-                        val overlay = buildDebugOverlay(
-                            atlasBitmap, closedMask, altByColumnDeg,
-                            atlasConfig, params.azimuthBands, bandWidth
-                        )
-                        DebugInfo(
-                            perBandThresholds = perBandThresholds.toList(),
-                            perBandSampleCounts = perBandSampleCounts.toList(),
-                            overlayBitmap = overlay,
-                            altByColumnDeg = altByColumnDeg,
-                            totalElapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                        )
-                    } else null
-
-                    val (minV, maxV, meanV) = stats(altSmoothed)
-                    val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                    Log.i(
-                        TAG,
-                        "Profile detected: $numBuckets buckets, " +
-                                "min=${"%.1f".format(minV)}° max=${"%.1f".format(maxV)}° " +
-                                "mean=${"%.1f".format(meanV)}° elapsed=${elapsedMs}ms " +
-                                "strategy=${params.aggregationStrategy}"
-                    )
-
-                    return Result(profile, debugInfo)
                 } finally {
                     closedMask.release()
                 }
@@ -208,8 +219,6 @@ object HorizonProfileDetector {
                     val channels = mutableListOf<Mat>()
                     Core.split(hsv, channels)
                     try {
-                        // V = canal 2 (H=0, S=1, V=2). clone() para que sobreviva
-                        // al release() del Mat parent dentro del split.
                         return channels[2].clone()
                     } finally {
                         channels.forEach { it.release() }
@@ -244,7 +253,6 @@ object HorizonProfileDetector {
         try {
             val dst = Mat()
             try {
-                // El 2do arg (val=0.0) lo ignora Otsu; calcula su propio threshold.
                 val thr = Imgproc.threshold(
                     roi, dst, 0.0, 255.0,
                     Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU
@@ -302,27 +310,107 @@ object HorizonProfileDetector {
     }
 
     /**
-     * Para cada columna, busca desde abajo (alt=0°) hacia arriba el primer
-     * pixel de cielo. Devuelve altMin en grados por columna.
+     * Toma la máscara de cielo (255=cielo, 0=no-cielo) y devuelve una nueva
+     * máscara donde solo permanecen los píxeles de no-cielo que pertenecen a
+     * una componente conectada que toca la fila inferior (y = h-1).
+     *
+     * Resultado: 255 = obstáculo verdadero (anclado al suelo),
+     *              0 = cielo o artefacto no-cielo aislado (nube, ruido).
+     *
+     * Justificación:
+     *   Los obstáculos físicos (montañas, edificios, torres, vegetación)
+     *   parten desde el suelo y forman componentes conectadas al borde
+     *   inferior del atlas. Una nube oscura dentro del cielo es una
+     *   componente aislada sin contacto con el suelo. Filtrar por
+     *   conectividad al borde inferior nos deja la silueta de obstáculos
+     *   físicos sin contaminar con artefactos atmosféricos.
+     *
+     *   Edge case asumido: si una nube se extiende verticalmente hasta tocar
+     *   el horizonte real (niebla envolviendo montañas), se tratará como
+     *   parte del obstáculo. Consistente con la percepción visual del observador.
+     */
+    private fun filterObstaclesConnectedToBottom(skyMask: Mat): Mat {
+        val nonSky = Mat()
+        Core.bitwise_not(skyMask, nonSky)
+        try {
+            // CCA: cada componente blanca recibe un label entero único > 0.
+            // 8-conectividad para tolerar conexiones diagonales (cables finos).
+            val labels = Mat()
+            Imgproc.connectedComponents(nonSky, labels, 8, CvType.CV_32S)
+            try {
+                val w = labels.cols()
+                val h = labels.rows()
+
+                // Identificar qué labels tocan la fila inferior.
+                val bottomRow = IntArray(w)
+                labels.get(h - 1, 0, bottomRow)
+                val bottomLabels = HashSet<Int>(16)
+                for (label in bottomRow) {
+                    if (label != 0) bottomLabels.add(label)
+                }
+
+                if (bottomLabels.isEmpty()) {
+                    Log.w(
+                        TAG,
+                        "filterObstaclesConnectedToBottom: 0 componentes tocan el borde inferior. " +
+                                "Atlas posiblemente sin suelo visible (todo cielo o todo ruido)."
+                    )
+                    return Mat.zeros(h, w, CvType.CV_8UC1)
+                }
+
+                val labelsBuf = IntArray(w * h)
+                labels.get(0, 0, labelsBuf)
+
+                val outBytes = ByteArray(w * h)
+                for (i in 0 until w * h) {
+                    if (labelsBuf[i] in bottomLabels) {
+                        outBytes[i] = 255.toByte()
+                    }
+                }
+
+                val result = Mat(h, w, CvType.CV_8UC1)
+                result.put(0, 0, outBytes)
+                Log.d(
+                    TAG,
+                    "CCA: kept ${bottomLabels.size} component(s) connected to bottom row"
+                )
+                return result
+            } finally {
+                labels.release()
+            }
+        } finally {
+            nonSky.release()
+        }
+    }
+
+    /**
+     * Para cada columna, busca DESDE ARRIBA el primer pixel de obstáculo
+     * sobre la máscara ya filtrada por CCA. La altitud de ese pixel define
+     * el horizonte.
      *
      * Convenciones de salida:
-     *  - Columna toda suelo:  altMin = 90° (degenerado, no debería pasar)
-     *  - Columna toda cielo:  altMin = 0°  (horizonte libre)
-     *  - Caso normal:         altMin = altitud del primer cielo desde abajo
+     *  - Columna sin obstáculo:  altMin = 0°  (horizonte libre)
+     *  - Caso normal:            altMin = altitud del primer obstáculo
+     *
+     * Por qué desde arriba es robusto ahora: la máscara ya pasó por CCA, solo
+     * quedan componentes ancladas al borde inferior. Nubes y manchas aisladas
+     * ya fueron eliminadas. Estructuras caladas (torres, mástiles) están
+     * marcadas como obstáculo "completo" incluyendo sus huecos internos.
+     * Buscar desde arriba el primer pixel marcado da la cima real del
+     * obstáculo más alto en cada columna.
      */
-    private fun findHorizonByColumn(mask: Mat, cfg: AtlasConfig): FloatArray {
-        val w = mask.cols()
-        val h = mask.rows()
+    private fun findHorizonByColumn(obstacleMask: Mat, cfg: AtlasConfig): FloatArray {
+        val w = obstacleMask.cols()
+        val h = obstacleMask.rows()
         val result = FloatArray(w)
 
         // Bulk-read: leer toda la máscara a un ByteArray en una sola llamada JNI.
-        // mask.get(0, 0, buf) píxel a píxel es órdenes de magnitud más lento.
         val maskBytes = ByteArray(w * h)
-        mask.get(0, 0, maskBytes)
+        obstacleMask.get(0, 0, maskBytes)
 
         for (x in 0 until w) {
             var horizonY = -1
-            for (y in (h - 1) downTo 0) {
+            for (y in 0 until h) {
                 val v = maskBytes[y * w + x].toInt() and 0xFF
                 if (v >= 128) {
                     horizonY = y
@@ -330,7 +418,7 @@ object HorizonProfileDetector {
                 }
             }
             result[x] = if (horizonY < 0) {
-                90f
+                0f
             } else {
                 AtlasMath.yToAltitude(horizonY, cfg)
             }
@@ -352,9 +440,9 @@ object HorizonProfileDetector {
         val bucketWidth = 360f / numBuckets
 
         for (x in altByColumn.indices) {
-            val azAtlas = AtlasMath.xToAzimuth(x, cfg)  // rango atlas: [-180, 180]
+            val azAtlas = AtlasMath.xToAzimuth(x, cfg)
             var azNoaa = azAtlas
-            if (azNoaa < 0f) azNoaa += 360f             // rango bucket: [0, 360)
+            if (azNoaa < 0f) azNoaa += 360f
             val bucketIdx = (azNoaa / bucketWidth).toInt().coerceIn(0, numBuckets - 1)
             bucketLists[bucketIdx].add(altByColumn[x])
         }
@@ -415,13 +503,17 @@ object HorizonProfileDetector {
     /**
      * Genera un bitmap de inspección para debugging del detector.
      *  - Capa 0: atlas original.
-     *  - Capa 1: tinte azul translúcido en zonas de cielo (mask=255).
+     *  - Capa 1: tinte rojo translúcido en zonas de obstáculo (máscara post-CCA).
      *  - Capa 2: polilínea verde con la altitud detectada por columna.
      *  - Capa 3: líneas verticales blancas en los bordes de bandas Otsu.
+     *
+     * Nota: tinta los obstáculos (no el cielo) porque sobre la máscara
+     * post-CCA es más útil ver qué se consideró obstáculo final que ver el
+     * cielo de calibración (que ya pasó por dos pasos de transformación).
      */
     private fun buildDebugOverlay(
         atlasBitmap: Bitmap,
-        mask: Mat,
+        obstacleMask: Mat,
         altByColumnDeg: FloatArray,
         cfg: AtlasConfig,
         numBands: Int,
@@ -432,21 +524,21 @@ object HorizonProfileDetector {
         val h = out.height
         val canvas = Canvas(out)
 
-        // Capa 1: tinte azul translúcido en cielo. Mezclamos 70% original + 30% azul.
+        // Capa 1: tinte rojo translúcido en obstáculos. 70% original + 30% rojo.
         val maskBytes = ByteArray(w * h)
-        mask.get(0, 0, maskBytes)
+        obstacleMask.get(0, 0, maskBytes)
         val pixels = IntArray(w * h)
         out.getPixels(pixels, 0, w, 0, 0, w, h)
         for (i in pixels.indices) {
-            val isSky = (maskBytes[i].toInt() and 0xFF) >= 128
-            if (isSky) {
+            val isObstacle = (maskBytes[i].toInt() and 0xFF) >= 128
+            if (isObstacle) {
                 val orig = pixels[i]
                 val r = Color.red(orig)
                 val g = Color.green(orig)
                 val b = Color.blue(orig)
-                val newR = (r * 0.7f).toInt().coerceIn(0, 255)
+                val newR = (r * 0.7f + 255 * 0.3f).toInt().coerceIn(0, 255)
                 val newG = (g * 0.7f).toInt().coerceIn(0, 255)
-                val newB = (b * 0.7f + 255 * 0.3f).toInt().coerceIn(0, 255)
+                val newB = (b * 0.7f).toInt().coerceIn(0, 255)
                 pixels[i] = Color.argb(255, newR, newG, newB)
             }
         }
@@ -455,7 +547,7 @@ object HorizonProfileDetector {
         // Capa 2: polilínea verde del horizonte por columna (pre-agregación).
         val horizonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(255, 0, 255, 0)
-            style = Paint.Style.STROKE
+            this.style = Paint.Style.STROKE
             strokeWidth = 2.5f
         }
         val path = Path()
@@ -471,7 +563,7 @@ object HorizonProfileDetector {
         // Capa 3: bordes de banda Otsu (líneas verticales blancas finas).
         val bandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(170, 255, 255, 255)
-            style = Paint.Style.STROKE
+            this.style = Paint.Style.STROKE
             strokeWidth = 1f
         }
         for (b in 1 until numBands) {
