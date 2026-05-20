@@ -1,5 +1,6 @@
 package com.example.sunproject.domain.horizon
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
@@ -9,34 +10,27 @@ import android.util.Log
 import com.example.sunproject.SunProjectApp
 import com.example.sunproject.domain.atlas.AtlasConfig
 import com.example.sunproject.domain.atlas.AtlasMath
-import org.opencv.android.Utils
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
-import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
 
 /**
  * Detector de perfil de obstrucción sobre un atlas equirectangular.
  *
- * Pipeline:
- *   1. Bitmap → HSV → canales V (luminancia) y S (saturación).
- *   2. Otsu adaptativo por bandas verticales sobre V (calibración).
- *   3. Sanity check: si una banda termina con fracción de cielo absurda
- *      (< 20% o > 97%), reemplazar su threshold por la mediana de las
- *      bandas sanas. Maneja el caso donde Otsu particiona el cielo
- *      gradiente en lugar de separar cielo de suelo.
- *   4. Máscara binaria combinando V y S:
- *        is_sky = (V >= T_banda AND S >= S_min) OR (V >= V_alto)
- *      - Cláusula AND: cielo azul saturado (caso típico).
- *      - Cláusula OR: sol, halo, nubes muy brillantes (V≈255, S bajo).
- *      Esto descarta correctamente metal/concreto brillante (V alto, S bajo).
- *   5. Cierre morfológico vertical.
- *   6. CCA: conservar solo componentes no-cielo conectadas al borde inferior.
- *   7. Búsqueda por columna desde arriba del primer obstáculo.
- *   8. Agregación a buckets de azimut + suavizado circular.
+ * Pipeline (v2 — segmentación semántica con TFLite):
+ *   1. Bitmap del atlas → SkyAtlasSegmenter (tiling 513×513 + CNN DeepLab v3
+ *      MobileNet V2 + stitching) → máscara binaria cielo/no-cielo Mat CV_8UC1.
+ *   2. Filtro CCA sobre la máscara invertida: solo conservar componentes
+ *      no-cielo conectadas al borde inferior. Defensivo contra artefactos
+ *      del CNN (nubes mal clasificadas como obstáculo, ruido aislado).
+ *   3. Búsqueda del horizonte por columna desde arriba sobre la máscara
+ *      filtrada: primer pixel obstáculo define la cima.
+ *   4. Agregación a buckets de azimut con la estrategia configurada (P75
+ *      por default) y suavizado circular.
  *
- * Costo: ~30M ops sobre atlas 3600×900. ~300-500ms en teléfono moderno.
+ * Costo: ~4-5s con GPU delegate, ~25-30s en CPU fallback.
+ * Llamar SIEMPRE desde background thread.
  */
 object HorizonProfileDetector {
 
@@ -48,15 +42,17 @@ object HorizonProfileDetector {
     )
 
     data class DebugInfo(
-        val perBandThresholds: List<Double>,
-        val perBandSampleCounts: List<Int>,
-        val perBandSkyFractions: List<Float>,
         val overlayBitmap: Bitmap,
         val altByColumnDeg: FloatArray,
-        val totalElapsedMs: Long
+        val totalElapsedMs: Long,
+        val segmentationElapsedMs: Long
     )
 
+    /**
+     * Detecta el perfil de obstrucción del atlas. Llamar siempre desde background.
+     */
     fun detect(
+        context: Context,
         atlasBitmap: Bitmap,
         atlasConfig: AtlasConfig,
         sessionId: String,
@@ -72,314 +68,80 @@ object HorizonProfileDetector {
                     "config (${atlasConfig.widthPx}×${atlasConfig.heightPx})"
         }
 
-        val w = atlasConfig.widthPx
-        val h = atlasConfig.heightPx
         val numBuckets = HorizonProfile.DEFAULT_AZIMUTH_BUCKETS
 
-        val (vChannel, sChannel) = extractVAndSChannels(atlasBitmap)
+        // Paso 1: segmentación de cielo vía CNN.
+        val segStartNs = System.nanoTime()
+        val skyMask = SkyAtlasSegmenter(context).use { segmenter ->
+            segmenter.segmentAtlas(atlasBitmap)
+        }
+        val segmentationElapsedMs = (System.nanoTime() - segStartNs) / 1_000_000L
+
         try {
-            // Bulk-read los canales una sola vez para reusar después.
-            val vBuf = ByteArray(w * h)
-            val sBuf = ByteArray(w * h)
-            vChannel.get(0, 0, vBuf)
-            sChannel.get(0, 0, sBuf)
+            // Paso 2: filtro CCA — quedarse con obstáculos conectados al borde inferior.
+            val obstacleMask = filterObstaclesConnectedToBottom(skyMask)
+            try {
+                // Paso 3: búsqueda del horizonte por columna.
+                val altByColumnDeg = findHorizonByColumn(obstacleMask, atlasConfig)
 
-            val calibrationYStart = AtlasMath.altitudeToY(params.calibrationMaxAltitudeDeg, atlasConfig)
-            val bandWidth = w / params.azimuthBands
-            val perBandThresholds = DoubleArray(params.azimuthBands)
-            val perBandSampleCounts = IntArray(params.azimuthBands)
-
-            // Paso 1: Otsu por banda sobre el ROI de calibración.
-            for (b in 0 until params.azimuthBands) {
-                val xStart = b * bandWidth
-                val xEnd = if (b == params.azimuthBands - 1) w else (b + 1) * bandWidth
-                val (thr, count) = calibrateOtsuOnRoi(
-                    vChannel, xStart, xEnd, calibrationYStart, h
+                // Paso 4: agregación a buckets + suavizado.
+                val altByBucketRaw = aggregateColumnsToBuckets(
+                    altByColumnDeg, atlasConfig, numBuckets, params.aggregationStrategy
                 )
-                perBandThresholds[b] = thr
-                perBandSampleCounts[b] = count
-            }
+                val altSmoothed = if (params.smoothingWindowDeg > 0) {
+                    smoothCircularProfile(altByBucketRaw, params.smoothingWindowDeg, numBuckets)
+                } else {
+                    altByBucketRaw
+                }
 
-            // Paso 2: sanity check + fallback a mediana de sanas.
-            val perBandSkyFractions = applyPerBandSanityCheck(
-                vBuf, perBandThresholds, params, w, h, bandWidth, params.azimuthBands
-            )
+                val profile = HorizonProfile(
+                    schemaVersion = HorizonProfile.CURRENT_SCHEMA_VERSION,
+                    sessionId = sessionId,
+                    createdAtUtcMs = System.currentTimeMillis(),
+                    sourceAtlasName = sourceAtlasName,
+                    azimuthBuckets = numBuckets,
+                    altByAzimuthDeg = altSmoothed.toList(),
+                    detectionParams = params
+                )
 
-            // Log post-fix para diagnóstico.
-            for (b in 0 until params.azimuthBands) {
-                Log.d(
+                val totalElapsedMs = (System.nanoTime() - startNs) / 1_000_000L
+                val debugInfo = if (generateDebugInfo) {
+                    val overlay = buildDebugOverlay(
+                        atlasBitmap, obstacleMask, altByColumnDeg, atlasConfig
+                    )
+                    DebugInfo(
+                        overlayBitmap = overlay,
+                        altByColumnDeg = altByColumnDeg,
+                        totalElapsedMs = totalElapsedMs,
+                        segmentationElapsedMs = segmentationElapsedMs
+                    )
+                } else null
+
+                val (minV, maxV, meanV) = stats(altSmoothed)
+                Log.i(
                     TAG,
-                    "band[$b] T=${"%.1f".format(perBandThresholds[b])} " +
-                            "skyFrac=${"%.2f".format(perBandSkyFractions[b])}"
+                    "Profile detected: $numBuckets buckets, " +
+                            "min=${"%.1f".format(minV)}° max=${"%.1f".format(maxV)}° " +
+                            "mean=${"%.1f".format(meanV)}° " +
+                            "segmentation=${segmentationElapsedMs}ms total=${totalElapsedMs}ms"
                 )
-            }
 
-            // Paso 3: máscara con V + S combinados.
-            val mask = buildSkyMaskWithSaturation(
-                vBuf, sBuf, w, h,
-                perBandThresholds, bandWidth, params.azimuthBands,
-                params.saturationMinForSky, params.veryHighVForcedSky
-            )
-            try {
-                val closedMask = morphClose(
-                    mask, params.morphCloseKernelWidth, params.morphCloseKernelHeight
-                )
-                try {
-                    val obstacleMask = filterObstaclesConnectedToBottom(closedMask)
-                    try {
-                        val altByColumnDeg = findHorizonByColumn(obstacleMask, atlasConfig)
-                        val altByBucketRaw = aggregateColumnsToBuckets(
-                            altByColumnDeg, atlasConfig, numBuckets, params.aggregationStrategy
-                        )
-                        val altSmoothed = if (params.smoothingWindowDeg > 0) {
-                            smoothCircularProfile(altByBucketRaw, params.smoothingWindowDeg, numBuckets)
-                        } else {
-                            altByBucketRaw
-                        }
-
-                        val profile = HorizonProfile(
-                            schemaVersion = HorizonProfile.CURRENT_SCHEMA_VERSION,
-                            sessionId = sessionId,
-                            createdAtUtcMs = System.currentTimeMillis(),
-                            sourceAtlasName = sourceAtlasName,
-                            azimuthBuckets = numBuckets,
-                            altByAzimuthDeg = altSmoothed.toList(),
-                            detectionParams = params
-                        )
-
-                        val debugInfo = if (generateDebugInfo) {
-                            val overlay = buildDebugOverlay(
-                                atlasBitmap, obstacleMask, altByColumnDeg,
-                                atlasConfig, params.azimuthBands, bandWidth
-                            )
-                            DebugInfo(
-                                perBandThresholds = perBandThresholds.toList(),
-                                perBandSampleCounts = perBandSampleCounts.toList(),
-                                perBandSkyFractions = perBandSkyFractions.toList(),
-                                overlayBitmap = overlay,
-                                altByColumnDeg = altByColumnDeg,
-                                totalElapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                            )
-                        } else null
-
-                        val (minV, maxV, meanV) = stats(altSmoothed)
-                        val elapsedMs = (System.nanoTime() - startNs) / 1_000_000L
-                        Log.i(
-                            TAG,
-                            "Profile detected: $numBuckets buckets, " +
-                                    "min=${"%.1f".format(minV)}° max=${"%.1f".format(maxV)}° " +
-                                    "mean=${"%.1f".format(meanV)}° elapsed=${elapsedMs}ms"
-                        )
-
-                        return Result(profile, debugInfo)
-                    } finally {
-                        obstacleMask.release()
-                    }
-                } finally {
-                    closedMask.release()
-                }
+                return Result(profile, debugInfo)
             } finally {
-                mask.release()
+                obstacleMask.release()
             }
         } finally {
-            vChannel.release()
-            sChannel.release()
+            skyMask.release()
         }
     }
 
-    // -- Pipeline steps ------------------------------------------------------
-
-    /** Bitmap RGBA → HSV → devuelve canales V y S clonados (CV_8UC1 cada uno). */
-    private fun extractVAndSChannels(bitmap: Bitmap): Pair<Mat, Mat> {
-        val rgba = Mat()
-        Utils.bitmapToMat(bitmap, rgba)
-        try {
-            val rgb = Mat()
-            Imgproc.cvtColor(rgba, rgb, Imgproc.COLOR_RGBA2RGB)
-            try {
-                val hsv = Mat()
-                Imgproc.cvtColor(rgb, hsv, Imgproc.COLOR_RGB2HSV)
-                try {
-                    val channels = mutableListOf<Mat>()
-                    Core.split(hsv, channels)
-                    try {
-                        // HSV → canal 0=H, 1=S, 2=V.
-                        return channels[2].clone() to channels[1].clone()
-                    } finally {
-                        channels.forEach { it.release() }
-                    }
-                } finally {
-                    hsv.release()
-                }
-            } finally {
-                rgb.release()
-            }
-        } finally {
-            rgba.release()
-        }
-    }
-
-    private fun calibrateOtsuOnRoi(
-        vChannel: Mat,
-        xStart: Int, xEnd: Int,
-        yStart: Int, yEnd: Int
-    ): Pair<Double, Int> {
-        val roiW = xEnd - xStart
-        val roiH = yEnd - yStart
-        if (roiW <= 0 || roiH <= 0) {
-            Log.w(TAG, "calibrateOtsuOnRoi: empty ROI ($xStart,$yStart)-($xEnd,$yEnd)")
-            return 127.0 to 0
-        }
-        val roi = vChannel.submat(yStart, yEnd, xStart, xEnd)
-        try {
-            val dst = Mat()
-            try {
-                val thr = Imgproc.threshold(
-                    roi, dst, 0.0, 255.0,
-                    Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU
-                )
-                return thr to (roiW * roiH)
-            } finally {
-                dst.release()
-            }
-        } finally {
-            roi.release()
-        }
-    }
+    // -- Pipeline steps preservados del detector v1 -------------------------
 
     /**
-     * Para cada banda, computa la fracción de pixels (sobre la banda completa)
-     * que quedan clasificados como cielo SOLO mirando V vs T_b. Si esa
-     * fracción cae fuera del rango sano, marca la banda como pathological y
-     * reemplaza T_b por la mediana de las bandas sanas.
-     *
-     * Modifica perBandThresholds in-place. Devuelve la lista final de skyFracs
-     * (re-evaluada después del reemplazo, para diagnóstico).
+     * Toma la máscara de cielo (255=cielo, 0=no-cielo) y devuelve una máscara
+     * donde solo quedan los píxeles no-cielo pertenecientes a componentes
+     * conectadas al borde inferior.
      */
-    private fun applyPerBandSanityCheck(
-        vBuf: ByteArray,
-        perBandThresholds: DoubleArray,
-        params: DetectionParams,
-        w: Int, h: Int,
-        bandWidth: Int,
-        numBands: Int
-    ): FloatArray {
-        val skyFractions = FloatArray(numBands)
-        for (b in 0 until numBands) {
-            val xStart = b * bandWidth
-            val xEnd = if (b == numBands - 1) w else (b + 1) * bandWidth
-            val bandPixels = (xEnd - xStart) * h
-            val T = perBandThresholds[b]
-            var skyCount = 0
-            for (y in 0 until h) {
-                val rowOff = y * w
-                for (x in xStart until xEnd) {
-                    val v = vBuf[rowOff + x].toInt() and 0xFF
-                    if (v >= T) skyCount++
-                }
-            }
-            skyFractions[b] = skyCount.toFloat() / bandPixels
-        }
-
-        // Identificar bandas sanas.
-        val healthyIndices = mutableListOf<Int>()
-        for (b in 0 until numBands) {
-            if (skyFractions[b] in params.healthyBandSkyFractionMin..params.healthyBandSkyFractionMax) {
-                healthyIndices.add(b)
-            }
-        }
-
-        if (healthyIndices.isEmpty()) {
-            Log.w(TAG, "Todas las bandas fallaron sanity check. Sin fallback posible — dejando T_b originales.")
-            return skyFractions
-        }
-
-        val healthyThresholds = healthyIndices.map { perBandThresholds[it] }.sorted()
-        val medianT = healthyThresholds[healthyThresholds.size / 2]
-
-        var replaced = 0
-        for (b in 0 until numBands) {
-            if (skyFractions[b] !in params.healthyBandSkyFractionMin..params.healthyBandSkyFractionMax) {
-                Log.w(
-                    TAG,
-                    "band[$b] PATHOLOGICAL (skyFrac=${"%.2f".format(skyFractions[b])}, " +
-                            "T=${"%.1f".format(perBandThresholds[b])}). Replacing with medianT=${"%.1f".format(medianT)}"
-                )
-                perBandThresholds[b] = medianT
-                replaced++
-
-                // Re-computar skyFraction para logging post-fix.
-                val xStart = b * bandWidth
-                val xEnd = if (b == numBands - 1) w else (b + 1) * bandWidth
-                val bandPixels = (xEnd - xStart) * h
-                var skyCount = 0
-                for (y in 0 until h) {
-                    val rowOff = y * w
-                    for (x in xStart until xEnd) {
-                        val v = vBuf[rowOff + x].toInt() and 0xFF
-                        if (v >= medianT) skyCount++
-                    }
-                }
-                skyFractions[b] = skyCount.toFloat() / bandPixels
-            }
-        }
-
-        if (replaced > 0) {
-            Log.i(TAG, "Sanity check: $replaced/$numBands bandas reemplazadas con medianT=${"%.1f".format(medianT)}")
-        }
-
-        return skyFractions
-    }
-
-    /**
-     * Construye la máscara binaria de cielo (255=cielo, 0=no-cielo) usando
-     * criterio combinado V+S:
-     *   is_sky = (V >= T_banda AND S >= S_min) OR (V >= V_alto)
-     */
-    private fun buildSkyMaskWithSaturation(
-        vBuf: ByteArray,
-        sBuf: ByteArray,
-        w: Int, h: Int,
-        perBandThresholds: DoubleArray,
-        bandWidth: Int,
-        numBands: Int,
-        sMin: Int,
-        vHigh: Int
-    ): Mat {
-        val outBuf = ByteArray(w * h)
-        for (b in 0 until numBands) {
-            val xStart = b * bandWidth
-            val xEnd = if (b == numBands - 1) w else (b + 1) * bandWidth
-            val vT = perBandThresholds[b].toInt()
-            for (y in 0 until h) {
-                val rowOff = y * w
-                for (x in xStart until xEnd) {
-                    val i = rowOff + x
-                    val v = vBuf[i].toInt() and 0xFF
-                    val s = sBuf[i].toInt() and 0xFF
-                    val isSky = (v >= vT && s >= sMin) || (v >= vHigh)
-                    if (isSky) outBuf[i] = 255.toByte()
-                }
-            }
-        }
-        val mask = Mat(h, w, CvType.CV_8UC1)
-        mask.put(0, 0, outBuf)
-        return mask
-    }
-
-    private fun morphClose(mask: Mat, kernelW: Int, kernelH: Int): Mat {
-        val kernel = Imgproc.getStructuringElement(
-            Imgproc.MORPH_RECT, Size(kernelW.toDouble(), kernelH.toDouble())
-        )
-        try {
-            val closed = Mat()
-            Imgproc.morphologyEx(mask, closed, Imgproc.MORPH_CLOSE, kernel)
-            return closed
-        } finally {
-            kernel.release()
-        }
-    }
-
     private fun filterObstaclesConnectedToBottom(skyMask: Mat): Mat {
         val nonSky = Mat()
         Core.bitwise_not(skyMask, nonSky)
@@ -404,14 +166,12 @@ object HorizonProfileDetector {
 
                 val labelsBuf = IntArray(w * h)
                 labels.get(0, 0, labelsBuf)
-
                 val outBytes = ByteArray(w * h)
                 for (i in 0 until w * h) {
                     if (labelsBuf[i] in bottomLabels) {
                         outBytes[i] = 255.toByte()
                     }
                 }
-
                 val result = Mat(h, w, CvType.CV_8UC1)
                 result.put(0, 0, outBytes)
                 Log.d(TAG, "CCA: kept ${bottomLabels.size} component(s) connected to bottom row")
@@ -440,8 +200,7 @@ object HorizonProfileDetector {
                     break
                 }
             }
-            result[x] = if (horizonY < 0) 0f
-            else AtlasMath.yToAltitude(horizonY, cfg)
+            result[x] = if (horizonY < 0) 0f else AtlasMath.yToAltitude(horizonY, cfg)
         }
         return result
     }
@@ -518,15 +277,14 @@ object HorizonProfileDetector {
         atlasBitmap: Bitmap,
         obstacleMask: Mat,
         altByColumnDeg: FloatArray,
-        cfg: AtlasConfig,
-        numBands: Int,
-        bandWidth: Int
+        cfg: AtlasConfig
     ): Bitmap {
         val out = atlasBitmap.copy(Bitmap.Config.ARGB_8888, true)
         val w = out.width
         val h = out.height
         val canvas = Canvas(out)
 
+        // Capa 1: tinte rojo translúcido en obstáculos.
         val maskBytes = ByteArray(w * h)
         obstacleMask.get(0, 0, maskBytes)
         val pixels = IntArray(w * h)
@@ -546,6 +304,7 @@ object HorizonProfileDetector {
         }
         out.setPixels(pixels, 0, w, 0, 0, w, h)
 
+        // Capa 2: polilínea verde del horizonte detectado.
         val horizonPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.argb(255, 0, 255, 0)
             this.style = Paint.Style.STROKE
@@ -560,16 +319,6 @@ object HorizonProfileDetector {
             else path.lineTo(x.toFloat(), y)
         }
         canvas.drawPath(path, horizonPaint)
-
-        val bandPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(170, 255, 255, 255)
-            this.style = Paint.Style.STROKE
-            strokeWidth = 1f
-        }
-        for (b in 1 until numBands) {
-            val x = (b * bandWidth).toFloat()
-            canvas.drawLine(x, 0f, x, h.toFloat(), bandPaint)
-        }
 
         return out
     }

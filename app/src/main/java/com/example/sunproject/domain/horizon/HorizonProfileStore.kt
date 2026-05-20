@@ -5,6 +5,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
+/**
+ * Persistencia del HorizonProfile en disco como JSON.
+ *
+ * Schema versionado en HorizonProfile.CURRENT_SCHEMA_VERSION. Versión 2
+ * corresponde al detector basado en TFLite. Versión 1 (clásico V+S+Otsu)
+ * tiene un set distinto de DetectionParams; si load() detecta v1, igual
+ * carga el perfil (altByAzimuthDeg sigue siendo válido) pero usa
+ * DetectionParams.DEFAULT para los nuevos params.
+ */
 object HorizonProfileStore {
 
     private const val TAG = "HorizonProfileStore"
@@ -22,15 +31,7 @@ object HorizonProfileStore {
 
         val paramsObj = JSONObject()
             .put("aggregationStrategy", profile.detectionParams.aggregationStrategy.name)
-            .put("azimuthBands", profile.detectionParams.azimuthBands)
-            .put("calibrationMaxAltitudeDeg", profile.detectionParams.calibrationMaxAltitudeDeg.toDouble())
             .put("smoothingWindowDeg", profile.detectionParams.smoothingWindowDeg)
-            .put("morphCloseKernelHeight", profile.detectionParams.morphCloseKernelHeight)
-            .put("morphCloseKernelWidth", profile.detectionParams.morphCloseKernelWidth)
-            .put("saturationMinForSky", profile.detectionParams.saturationMinForSky)
-            .put("veryHighVForcedSky", profile.detectionParams.veryHighVForcedSky)
-            .put("healthyBandSkyFractionMin", profile.detectionParams.healthyBandSkyFractionMin.toDouble())
-            .put("healthyBandSkyFractionMax", profile.detectionParams.healthyBandSkyFractionMax.toDouble())
 
         val obj = JSONObject()
             .put("schemaVersion", profile.schemaVersion)
@@ -42,7 +43,7 @@ object HorizonProfileStore {
             .put("detectionParams", paramsObj)
 
         file.writeText(obj.toString(2))
-        Log.i(TAG, "Saved horizon profile to ${file.absolutePath} (${profile.azimuthBuckets} buckets)")
+        Log.i(TAG, "Saved horizon profile to ${file.absolutePath} (${profile.azimuthBuckets} buckets, schema v${profile.schemaVersion})")
         return file
     }
 
@@ -57,8 +58,8 @@ object HorizonProfileStore {
             if (schemaVersion > HorizonProfile.CURRENT_SCHEMA_VERSION) {
                 Log.w(
                     TAG,
-                    "Profile schema version $schemaVersion newer than supported " +
-                            "(${HorizonProfile.CURRENT_SCHEMA_VERSION}). Ignoring."
+                    "Profile schema v$schemaVersion newer than supported " +
+                            "(v${HorizonProfile.CURRENT_SCHEMA_VERSION}). Ignoring."
                 )
                 return null
             }
@@ -77,15 +78,7 @@ object HorizonProfileStore {
 
             val params = DetectionParams(
                 aggregationStrategy = aggregation,
-                azimuthBands = paramsObj.optInt("azimuthBands", 12),
-                calibrationMaxAltitudeDeg = paramsObj.optDouble("calibrationMaxAltitudeDeg", 30.0).toFloat(),
-                smoothingWindowDeg = paramsObj.optInt("smoothingWindowDeg", 5),
-                morphCloseKernelHeight = paramsObj.optInt("morphCloseKernelHeight", 9),
-                morphCloseKernelWidth = paramsObj.optInt("morphCloseKernelWidth", 1),
-                saturationMinForSky = paramsObj.optInt("saturationMinForSky", 60),
-                veryHighVForcedSky = paramsObj.optInt("veryHighVForcedSky", 240),
-                healthyBandSkyFractionMin = paramsObj.optDouble("healthyBandSkyFractionMin", 0.20).toFloat(),
-                healthyBandSkyFractionMax = paramsObj.optDouble("healthyBandSkyFractionMax", 0.97).toFloat()
+                smoothingWindowDeg = paramsObj.optInt("smoothingWindowDeg", 5)
             )
 
             HorizonProfile(
