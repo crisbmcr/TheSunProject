@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RelativeLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#0F1115"
+    tools:context=".LossesActivity">
+
+    <!-- Estado de carga -->
+    <ProgressBar
+        android:id="@+id/lossesLoadingIndicator"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_centerInParent="true"
+        android:indeterminate="true" />
+
+    <TextView
+        android:id="@+id/lossesLoadingText"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_below="@id/lossesLoadingIndicator"
+        android:layout_marginTop="16dp"
+        android:paddingHorizontal="32dp"
+        android:gravity="center"
+        android:text="Calculando..."
+        android:textColor="#E0E0E0"
+        android:textSize="14sp" />
+
+    <!-- Contenido del resultado -->
+    <ScrollView
+        android:id="@+id/lossesContentContainer"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:fillViewport="true"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="16dp">
+
+            <!-- Título principal -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Análisis de pérdidas por sombreado"
+                android:textColor="#FFFFFF"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <!-- Info del sitio -->
+            <TextView
+                android:id="@+id/lblSite"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#B0B0B0"
+                android:textSize="13sp"
+                android:layout_marginTop="4dp"
+                tools:text="Sitio: lat -23.829°, lon -66.778°" />
+
+            <TextView
+                android:id="@+id/lblPanel"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="#B0B0B0"
+                android:textSize="13sp"
+                android:layout_marginTop="2dp"
+                android:layout_marginBottom="16dp"
+                tools:text="Panel: γ=0° (N), β=24°" />
+
+            <!-- Tarjeta principal: pérdida anual -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="20dp"
+                android:gravity="center"
+                android:background="#1E2128"
+                android:layout_marginBottom="20dp">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Pérdida anual estimada"
+                    android:textColor="#B0B0B0"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/lblAnnualLoss"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="#FF6B35"
+                    android:textSize="56sp"
+                    android:textStyle="bold"
+                    android:layout_marginTop="4dp"
+                    tools:text="7.42%" />
+
+                <TextView
+                    android:id="@+id/lblAnnualLossSub"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:gravity="center"
+                    android:textColor="#E0E0E0"
+                    android:textSize="13sp"
+                    android:layout_marginTop="4dp"
+                    tools:text="Pérdida moderada" />
+            </LinearLayout>
+
+            <!-- Gráfico mensual -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Pérdida por mes"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <com.github.mikephil.charting.charts.BarChart
+                android:id="@+id/monthlyChart"
+                android:layout_width="match_parent"
+                android:layout_height="240dp"
+                android:layout_marginBottom="24dp" />
+
+            <!-- Heatmap mes x hora -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Mapa de pérdida por hora del día"
+                android:textColor="#FFFFFF"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <com.example.sunproject.HeatmapView
+                android:id="@+id/heatmapView"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginBottom="24dp" />
+
+            <!-- Nota metodológica -->
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Método: integración geométrica horaria (paso 15 min) usando NOAA Solar Calculator y el perfil de horizonte detectado. v1 — no incluye datos meteorológicos reales."
+                android:textColor="#808080"
+                android:textSize="11sp"
+                android:textStyle="italic"
+                android:layout_marginBottom="24dp" />
+
+            <!-- Botón volver -->
+            <Button
+                android:id="@+id/btnBackLosses"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Volver al análisis" />
+
+        </LinearLayout>
+    </ScrollView>
+
+</RelativeLayout>

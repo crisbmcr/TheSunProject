@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">SunProject</string>
+    <string name="title_activity_losses">LossesActivity</string>
 </resources>

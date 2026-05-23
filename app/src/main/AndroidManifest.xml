@@ -49,6 +49,11 @@
             android:screenOrientation="portrait"
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@style/Theme.AppCompat.NoActionBar" />
+        <!-- Cálculo de pérdidas por sombreado (Fase C) -->
+        <activity
+            android:name=".LossesActivity"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.AppCompat.NoActionBar" />
         <uses-native-library
             android:name="libOpenCL.so"
             android:required="false" />

@@ -41,6 +41,7 @@ class AnalysisActivity : AppCompatActivity() {
     private lateinit var btnHorizonProfile: ToggleButton
     private lateinit var btnRegenerateProfile: Button
     private lateinit var btnOpen3d: Button
+    private lateinit var btnCalculateLosses: Button
     private lateinit var loadingIndicator: ProgressBar
 
     private var baseBitmap: Bitmap? = null
@@ -62,6 +63,7 @@ class AnalysisActivity : AppCompatActivity() {
         btnHorizonProfile = findViewById(R.id.btnHorizonProfile)
         btnRegenerateProfile = findViewById(R.id.btnRegenerateProfile)
         btnOpen3d = findViewById(R.id.btnOpen3d)
+        btnCalculateLosses = findViewById(R.id.btnCalculateLosses)
         loadingIndicator = findViewById(R.id.loadingIndicator)
 
         atlasPath = intent.getStringExtra("panorama_path")
@@ -97,6 +99,22 @@ class AnalysisActivity : AppCompatActivity() {
             startActivity(intent)
         }
 
+        btnCalculateLosses.setOnClickListener {
+            if (cachedProfile == null) {
+                Toast.makeText(this, "Activá el perfil de obstáculos primero", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val sessionDir = resolveSessionDir()
+            if (sessionDir == null) {
+                Toast.makeText(this, "No se encontró el directorio de la sesión", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val intent = Intent(this, LossesActivity::class.java).apply {
+                putExtra(LossesActivity.EXTRA_SESSION_DIR, sessionDir.absolutePath)
+            }
+            startActivity(intent)
+        }
+        updateLossButtonState()
     }
 
     /**
@@ -158,6 +176,7 @@ class AnalysisActivity : AppCompatActivity() {
                         return@Thread
                     }
                     cachedProfile = profile
+                    runOnUiThread { updateLossButtonState() }
                 }
 
                 runOnUiThread {
@@ -286,7 +305,8 @@ class AnalysisActivity : AppCompatActivity() {
                         return@runOnUiThread
                     }
                     cachedProfile = profile
-                    profilePngExported = false  // permitir re-exportar el PNG
+                    profilePngExported = false
+                    updateLossButtonState()
 
                     // Prender el toggle sin disparar el listener (lo hacemos
                     // ya nosotros llamando renderCurrentState explícitamente).
@@ -433,4 +453,23 @@ class AnalysisActivity : AppCompatActivity() {
         val lon: Double?,
         val startedAtUtcMs: Long
     )
+
+    /**
+     * Habilita o deshabilita el botón "Calcular pérdidas" según haya
+     * o no un perfil cargado en memoria. Llamarla cada vez que
+     * cachedProfile cambia.
+     */
+    private fun updateLossButtonState() {
+        btnCalculateLosses.isEnabled = (cachedProfile != null)
+    }
+
+    /**
+     * Resuelve el directorio de la sesión a partir del atlasPath.
+     * Convención: atlasPath = <sessionDir>/atlas/<archivo>.png
+     */
+    private fun resolveSessionDir(): File? {
+        val path = atlasPath ?: return null
+        val atlasFile = File(path)
+        return atlasFile.parentFile?.parentFile
+    }
 }

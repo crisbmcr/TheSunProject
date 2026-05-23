@@ -54,13 +54,28 @@
         android:layout_centerInParent="true"
         android:visibility="gone" />
 
-    <Button
-        android:id="@+id/btnOpen3d"
-        android:layout_width="wrap_content"
+    <!-- Botonera inferior: ver 3D + calcular pérdidas -->
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_alignParentBottom="true"
-        android:layout_alignParentEnd="true"
-        android:layout_margin="16dp"
-        android:text="Ver en 3D" />
+        android:orientation="horizontal"
+        android:padding="12dp"
+        android:gravity="end">
+
+        <Button
+            android:id="@+id/btnCalculateLosses"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Calcular pérdidas"
+            android:enabled="false"
+            android:layout_marginEnd="8dp"/>
+
+        <Button
+            android:id="@+id/btnOpen3d"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Ver en 3D" />
+    </LinearLayout>
 
 </RelativeLayout>

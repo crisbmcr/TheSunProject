@@ -82,6 +82,8 @@ dependencies {
     // --- DEPENDENCIA AL MÓDULO DE OPENCV ---
     implementation("org.opencv:opencv:4.10.0")
 
+    // --- graficas ---
+    implementation("com.github.PhilJay:MPAndroidChart:v3.1.0")
     // LiteRT (TensorFlow Lite rebrand) — segmentación semántica del cielo
     implementation("com.google.ai.edge.litert:litert:1.4.1")
     implementation("com.google.ai.edge.litert:litert-gpu:1.4.1")
@@ -105,6 +107,7 @@ dependencies {
 
     // --- DEPENDENCIA DE UBICACIÓN (GPS) ---
     implementation("com.google.android.gms:play-services-location:21.3.0")
+    implementation(libs.androidx.activity)
 
     // --- ¡CORREGIDAS! DEPENDENCIAS PARA CAMERAX CON SINTAXIS KOTLIN ---
     val camerax_version = "1.3.4" // Se usa 'val' en lugar de 'def'
