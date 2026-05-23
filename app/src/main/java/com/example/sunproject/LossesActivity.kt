@@ -5,8 +5,8 @@ import android.os.Bundle
 import android.util.Log
 import android.view.View
 import android.widget.Button
-import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -25,7 +25,6 @@ import com.github.mikephil.charting.data.BarEntry
 import com.github.mikephil.charting.formatter.IndexAxisValueFormatter
 import com.github.mikephil.charting.formatter.ValueFormatter
 import java.io.File
-import kotlin.math.abs
 
 /**
  * Pantalla de resultados del cálculo de pérdidas por sombreado.
@@ -54,7 +53,7 @@ class LossesActivity : AppCompatActivity() {
 
     private lateinit var loadingIndicator: ProgressBar
     private lateinit var loadingText: TextView
-    private lateinit var contentContainer: LinearLayout
+    private lateinit var contentContainer: ScrollView
 
     private lateinit var lblSite: TextView
     private lateinit var lblPanel: TextView
