@@ -8,7 +8,7 @@ plugins {
 
 android {
     namespace = "com.example.sunproject"
-    compileSdk = 35
+    compileSdk = 36
     sourceSets["main"].jniLibs.srcDirs("$opencvSdk/native/libs")
     androidResources {
         noCompress.add("tflite")
