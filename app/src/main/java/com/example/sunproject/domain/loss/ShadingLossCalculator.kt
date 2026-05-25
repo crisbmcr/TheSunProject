@@ -2,16 +2,21 @@ package com.example.sunproject.domain.loss
 
 import android.util.Log
 import com.example.sunproject.domain.horizon.HorizonProfile
+import com.example.sunproject.domain.loss.irradiance.IrradianceTimeSeries
 import com.example.sunproject.domain.solar.SolarGeometry
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import kotlin.math.cos
 
 /**
- * Motor de cálculo de pérdidas por sombreado por integración geométrica
- * sobre todo el año.
+ * Motor de cálculo de pérdidas por sombreado por integración anual.
  *
- * ## Algoritmo (modo GEOMETRIC_ONLY, único disponible hasta C.2.1)
+ * ## Modos de cálculo
+ *
+ * El motor soporta dos modos según [ShadingLossConfig.calculationMode]:
+ *
+ * ### GEOMETRIC_ONLY (default, C.1+)
  *
  *   Para cada instante t en el año (paso configurable):
  *     1. Computar la posición del sol con NOAA (lat, lon, t_UTC).
@@ -24,21 +29,56 @@ import java.time.ZoneOffset
  *
  *   % pérdida geométrica anual = (1 − real / potencial) × 100
  *
- * ## Modo ENERGY_FULL (C.2.2+)
+ * ### ENERGY_FULL (C.2.2+)
  *
- * En C.2.2 se agrega el modo que además multiplica cada contribución por
- * la POA real (DNI×cos(θ_inc) + DHI×FV_sky + GHI×albedo×FV_ground)
- * usando una `IrradianceTimeSeries` inyectada. En la presente fase (C.2.0)
- * el motor acepta [ShadingLossConfig.calculationMode] == `ENERGY_FULL` pero
- * no produce métricas energéticas — solo loguea un warning y devuelve los
- * campos `energy*` en `null`.
+ * Además del cómputo geométrico, integra la POA real con datos de
+ * irradiancia inyectados vía [IrradianceTimeSeries]:
+ *
+ *   POA_potencial(t) = DNI(t) · max(0, cos(θ_inc))
+ *                    + DHI(t) · FV_sky
+ *                    + GHI(t) · albedo · FV_ground
+ *
+ *   POA_real(t) = directaUtilizada(t)
+ *               + DHI(t) · FV_sky
+ *               + GHI(t) · albedo · FV_ground
+ *
+ *   directaUtilizada(t) = DNI(t) · cos(θ_inc)   si cos(θ_inc) > 0 y NO bloqueado
+ *                       = 0                      en otro caso
+ *
+ * Donde:
+ *   FV_sky    = (1 + cos(β)) / 2   factor de vista del cielo desde el panel
+ *   FV_ground = (1 − cos(β)) / 2   factor de vista del suelo desde el panel
+ *   β         = tilt del panel (ShadingLossConfig.panel.tiltDeg)
+ *
+ * % pérdida energética = (1 − POA_real_anual / POA_potencial_anual) × 100
+ *
+ * ## Diferencia importante en rango de integración
+ *
+ * El bloque geométrico solo cuenta instantes con cos(θ_inc) > 0 (sol
+ * delante del panel). El bloque energético cuenta TODOS los instantes
+ * con sol sobre el horizonte teórico, porque difusa y reflejada llegan
+ * aunque el sol esté detrás del panel.
+ *
+ * ## Limitaciones documentadas del modelo energético v2
+ *
+ *  - Solo la componente directa se reduce por obstáculos del horizonte.
+ *    La componente difusa mantiene DHI · FV_sky aunque el cielo esté
+ *    parcialmente obstruido. Una implementación rigurosa del Sky View
+ *    Factor obstruido requeriría integrar el HorizonProfile sobre el
+ *    hemisferio (planificado v3).
+ *  - Sin corrección térmica (T2m y WS10m no se usan aunque PVGIS los
+ *    descargue).
+ *  - Modelo isotrópico de difusa (no Hay-Davies ni Perez). PVGIS PVcalc
+ *    usa Hay-Davies; diferencia típica ±2-3% sobre el POA anual.
  *
  * ## Costo computacional
  *
- * ~35.040 iteraciones por defecto (año no bisiesto, paso 15 min). Cada
- * iteración hace 1 cómputo NOAA + 1 lookup en el perfil + trigonometría.
- * En mobile rinde ~250-500 ms. Apto para botón "Calcular pérdidas" en UI
- * sin loading prolongado.
+ * GEOMETRIC_ONLY: ~35.040 iteraciones (año no bisiesto, paso 15 min).
+ * Cada iteración: 1 NOAA + 1 lookup horizonte + trigonometría. Mobile ~250 ms.
+ *
+ * ENERGY_FULL: lo mismo + 1 lookup irradiance + 5 multiplicaciones por sample.
+ * El sobrecosto en mobile es <50 ms; total <400 ms. Sigue siendo apto
+ * para botón "Calcular pérdidas" sin loading prolongado.
  *
  * ## Thread safety
  *
@@ -47,32 +87,60 @@ import java.time.ZoneOffset
  */
 class ShadingLossCalculator(
     private val horizonProfile: HorizonProfile,
-    private val config: ShadingLossConfig
+    private val config: ShadingLossConfig,
+    private val irradiance: IrradianceTimeSeries? = null
 ) {
 
     fun compute(): ShadingLossResult {
         val tStart = System.currentTimeMillis()
 
-        // C.2.0: el modo ENERGY_FULL todavía no está implementado en el motor.
-        // Si el caller lo solicita, advertimos por log pero seguimos con el
-        // cálculo geométrico para no romper la UI. C.2.2 cierra esto.
-        if (config.calculationMode == CalculationMode.ENERGY_FULL) {
+        // Determinar si el cálculo energético está activo.
+        // Activo sii el caller pidió ENERGY_FULL Y proveyó una IrradianceTimeSeries.
+        // Si pidió ENERGY_FULL sin proveer fuente, degradamos a geométrico
+        // con warning — mismo patrón defensivo de C.2.0.
+        val computeEnergy = config.calculationMode == CalculationMode.ENERGY_FULL
+                && irradiance != null
+
+        if (config.calculationMode == CalculationMode.ENERGY_FULL && irradiance == null) {
             Log.w(
                 TAG,
-                "ENERGY_FULL solicitado pero IrradianceTimeSeries no está conectada (pendiente C.2.2). " +
+                "ENERGY_FULL solicitado pero irradiance es null. " +
                         "Devolviendo solo métricas geométricas; campos energy* quedarán en null."
             )
         }
 
-        // Acumuladores: total mes y matriz mes × hora_local.
+        // ============================================================
+        // Acumuladores geométricos (siempre activos)
+        // ============================================================
         val monthlyPotential = DoubleArray(12)
         val monthlyReal = DoubleArray(12)
         val matrixPotential = Array(12) { DoubleArray(24) }
         val matrixReal = Array(12) { DoubleArray(24) }
 
+        // ============================================================
+        // Acumuladores energéticos (alocados solo si computeEnergy)
+        // Unidades internas: Wh/m². Se convierten a kWh/m² al final.
+        // ============================================================
+        val monthlyEnergyPotentialWh: DoubleArray? = if (computeEnergy) DoubleArray(12) else null
+        val monthlyEnergyRealWh: DoubleArray? = if (computeEnergy) DoubleArray(12) else null
+        val matrixEnergyPotentialWh: Array<DoubleArray>? =
+            if (computeEnergy) Array(12) { DoubleArray(24) } else null
+        val matrixEnergyRealWh: Array<DoubleArray>? =
+            if (computeEnergy) Array(12) { DoubleArray(24) } else null
+
+        // ============================================================
+        // Constantes pre-calculadas para evitar trigonometría dentro del loop
+        // ============================================================
         val dtHours = config.timeStepMinutes / 60.0
         val dtMillis = config.timeStepMinutes * 60_000L
         val tzOffsetMillis = (config.timezoneOffsetHours * 3_600_000.0).toLong()
+
+        // Factores de vista del panel (Duffie & Beckman, transposición isotrópica)
+        val tiltRad = Math.toRadians(config.panel.tiltDeg)
+        val cosTilt = cos(tiltRad)
+        val fvSky = (1.0 + cosTilt) / 2.0
+        val fvGround = (1.0 - cosTilt) / 2.0
+        val albedo = config.albedo
 
         // Rango de integración: el año entero en UTC.
         val startEpochUtc = LocalDateTime.of(config.year, 1, 1, 0, 0)
@@ -80,6 +148,9 @@ class ShadingLossCalculator(
         val endEpochUtc = LocalDateTime.of(config.year, 12, 31, 23, 59)
             .toInstant(ZoneOffset.UTC).toEpochMilli()
 
+        // ============================================================
+        // Loop principal de integración
+        // ============================================================
         var epoch = startEpochUtc
         var samples = 0
         var sunUpSamples = 0
@@ -95,48 +166,94 @@ class ShadingLossCalculator(
                 epochMillisUtc = epoch
             )
 
-            if (!sun.belowHorizon) {
-                sunUpSamples++
+            if (sun.belowHorizon) {
+                // Sol bajo el horizonte teórico: ni geométrico ni energético
+                // tienen nada que aportar. PVGIS-ERA5 confirma que DNI/DHI/GHI=0
+                // en estos timestamps. Saltamos.
+                epoch += dtMillis
+                continue
+            }
 
-                val cosInc = PanelGeometry.cosIncidence(sun, config.panel)
+            sunUpSamples++
 
-                if (cosInc > 0.0) {
-                    inFrontSamples++
+            val cosInc = PanelGeometry.cosIncidence(sun, config.panel)
 
-                    val contribution = cosInc * dtHours
+            // Slot temporal local del instante (compartido entre geom y energ).
+            val localEpoch = epoch + tzOffsetMillis
+            val localDt = LocalDateTime.ofInstant(
+                Instant.ofEpochMilli(localEpoch),
+                ZoneOffset.UTC
+            )
+            val monthIdx = (localDt.monthValue - 1).coerceIn(0, 11)
+            val hourIdx = localDt.hour.coerceIn(0, 23)
 
-                    // Mes y hora locales del slot al que pertenece.
-                    val localEpoch = epoch + tzOffsetMillis
-                    val localDt = LocalDateTime.ofInstant(
-                        Instant.ofEpochMilli(localEpoch),
-                        ZoneOffset.UTC
-                    )
-                    val monthIdx = (localDt.monthValue - 1).coerceIn(0, 11)
-                    val hourIdx = localDt.hour.coerceIn(0, 23)
+            // Bloqueo por horizonte (compartido entre geom y energ).
+            val altHorizonDeg = horizonProfile
+                .altAtAzimuthDeg(sun.azimuthDeg.toFloat())
+                .toDouble()
+            val isBlocked = sun.altitudeDeg < altHorizonDeg
 
-                    monthlyPotential[monthIdx] += contribution
-                    matrixPotential[monthIdx][hourIdx] += contribution
+            // ----------------------------------------------------------
+            // Bloque GEOMÉTRICO — solo cuando cos(θ_inc) > 0
+            // ----------------------------------------------------------
+            if (cosInc > 0.0) {
+                inFrontSamples++
 
-                    // Consulta del perfil. azimuthDeg en [0, 360) — alineado.
-                    val altHorizonDeg = horizonProfile
-                        .altAtAzimuthDeg(sun.azimuthDeg.toFloat())
-                        .toDouble()
+                val contribution = cosInc * dtHours
+                monthlyPotential[monthIdx] += contribution
+                matrixPotential[monthIdx][hourIdx] += contribution
 
-                    val isBlocked = sun.altitudeDeg < altHorizonDeg
-
-                    if (!isBlocked) {
-                        monthlyReal[monthIdx] += contribution
-                        matrixReal[monthIdx][hourIdx] += contribution
-                    } else {
-                        blockedSamples++
-                    }
+                if (!isBlocked) {
+                    monthlyReal[monthIdx] += contribution
+                    matrixReal[monthIdx][hourIdx] += contribution
+                } else {
+                    blockedSamples++
                 }
+            }
+
+            // ----------------------------------------------------------
+            // Bloque ENERGÉTICO — activo siempre que computeEnergy y sol arriba
+            // del horizonte teórico. NO requiere cos(θ_inc) > 0 porque difusa
+            // y reflejada llegan también con sol detrás del panel.
+            // ----------------------------------------------------------
+            if (computeEnergy) {
+                val sample = irradiance!!.at(epoch)
+
+                // Componentes POA en W/m².
+                // Directa potencial: lo máximo que el panel podría captar
+                // si no hubiera obstáculos del horizonte.
+                val directPotentialWm2 =
+                    if (cosInc > 0.0) sample.dniWm2 * cosInc else 0.0
+                // Directa real: bloqueada si el horizonte obstruye la dirección
+                // del sol. La condición de "delante del panel" sigue siendo
+                // necesaria (no se puede recibir directa de atrás).
+                val directRealWm2 =
+                    if (cosInc > 0.0 && !isBlocked) sample.dniWm2 * cosInc else 0.0
+
+                // Difusa y reflejada: invariantes al bloqueo del horizonte
+                // en este modelo (v2). Iguales en potencial y real.
+                val diffuseWm2 = sample.dhiWm2 * fvSky
+                val reflectedWm2 = sample.ghiWm2 * albedo * fvGround
+
+                val poaPotentialWm2 = directPotentialWm2 + diffuseWm2 + reflectedWm2
+                val poaRealWm2 = directRealWm2 + diffuseWm2 + reflectedWm2
+
+                // Energía en Wh/m² para el sub-paso (W/m² × h = Wh/m²).
+                val energyPotentialWh = poaPotentialWm2 * dtHours
+                val energyRealWh = poaRealWm2 * dtHours
+
+                monthlyEnergyPotentialWh!![monthIdx] += energyPotentialWh
+                monthlyEnergyRealWh!![monthIdx] += energyRealWh
+                matrixEnergyPotentialWh!![monthIdx][hourIdx] += energyPotentialWh
+                matrixEnergyRealWh!![monthIdx][hourIdx] += energyRealWh
             }
 
             epoch += dtMillis
         }
 
-        // Reducciones finales — todas en el dominio geométrico.
+        // ============================================================
+        // Reducciones finales — GEOMÉTRICO
+        // ============================================================
         val geomAnnualPotential = monthlyPotential.sum()
         val geomAnnualReal = monthlyReal.sum()
         val geomAnnualLoss = lossPercent(geomAnnualReal, geomAnnualPotential)
@@ -151,28 +268,84 @@ class ShadingLossCalculator(
             }
         }
 
-        val elapsed = System.currentTimeMillis() - tStart
-        Log.i(
-            TAG,
-            "compute() samples=$samples sunUp=$sunUpSamples " +
-                    "inFront=$inFrontSamples blocked=$blockedSamples " +
-                    "geomAnnualLoss=${"%.2f".format(geomAnnualLoss)}% " +
-                    "elapsed=${elapsed}ms " +
-                    "lat=${"%.3f".format(config.latitudeDeg)} " +
-                    "lon=${"%.3f".format(config.longitudeDeg)} " +
-                    "panel=(γ=${"%.1f".format(config.panel.azimuthDeg)}, " +
-                    "β=${"%.1f".format(config.panel.tiltDeg)}) " +
-                    "mode=${config.calculationMode}"
-        )
+        // ============================================================
+        // Reducciones finales — ENERGÉTICO (si activo)
+        // Conversión Wh → kWh dividiendo por 1000.
+        // ============================================================
+        val energyAnnualLossPercent: Double?
+        val energyMonthlyLossPercent: DoubleArray?
+        val energyHourlyMatrix: Array<DoubleArray>?
+        val annualEnergyPotentialKwhM2: Double?
+        val annualEnergyRealKwhM2: Double?
+        val monthlyEnergyPotentialKwhM2: DoubleArray?
+        val monthlyEnergyRealKwhM2: DoubleArray?
 
+        if (computeEnergy) {
+            val pot = monthlyEnergyPotentialWh!!
+            val real = monthlyEnergyRealWh!!
+            val matPot = matrixEnergyPotentialWh!!
+            val matReal = matrixEnergyRealWh!!
+
+            monthlyEnergyPotentialKwhM2 = DoubleArray(12) { m -> pot[m] / 1000.0 }
+            monthlyEnergyRealKwhM2 = DoubleArray(12) { m -> real[m] / 1000.0 }
+            annualEnergyPotentialKwhM2 = monthlyEnergyPotentialKwhM2.sum()
+            annualEnergyRealKwhM2 = monthlyEnergyRealKwhM2.sum()
+
+            energyAnnualLossPercent = lossPercent(real.sum(), pot.sum())
+            energyMonthlyLossPercent = DoubleArray(12) { m -> lossPercent(real[m], pot[m]) }
+            energyHourlyMatrix = Array(12) { m ->
+                DoubleArray(24) { h -> lossPercent(matReal[m][h], matPot[m][h]) }
+            }
+        } else {
+            energyAnnualLossPercent = null
+            energyMonthlyLossPercent = null
+            energyHourlyMatrix = null
+            annualEnergyPotentialKwhM2 = null
+            annualEnergyRealKwhM2 = null
+            monthlyEnergyPotentialKwhM2 = null
+            monthlyEnergyRealKwhM2 = null
+        }
+
+        // ============================================================
+        // Logging
+        // ============================================================
+        val elapsed = System.currentTimeMillis() - tStart
+        val baseLog = "compute() samples=$samples sunUp=$sunUpSamples " +
+                "inFront=$inFrontSamples blocked=$blockedSamples " +
+                "geomAnnualLoss=${"%.2f".format(geomAnnualLoss)}% " +
+                "elapsed=${elapsed}ms " +
+                "lat=${"%.3f".format(config.latitudeDeg)} " +
+                "lon=${"%.3f".format(config.longitudeDeg)} " +
+                "panel=(γ=${"%.1f".format(config.panel.azimuthDeg)}, " +
+                "β=${"%.1f".format(config.panel.tiltDeg)}) " +
+                "mode=${config.calculationMode} " +
+                "energyComputed=$computeEnergy"
+
+        val energyLog = if (computeEnergy) {
+            " energyAnnualLoss=${"%.2f".format(energyAnnualLossPercent!!)}% " +
+                    "poaPotential=${"%.1f".format(annualEnergyPotentialKwhM2!!)} kWh/m²/año " +
+                    "poaReal=${"%.1f".format(annualEnergyRealKwhM2!!)} kWh/m²/año " +
+                    "albedo=${"%.2f".format(albedo)}"
+        } else ""
+
+        Log.i(TAG, baseLog + energyLog)
+
+        // ============================================================
+        // Construcción del resultado
+        // ============================================================
         return ShadingLossResult(
             geometricAnnualLossPercent = geomAnnualLoss,
             geometricMonthlyLossPercent = geomMonthlyLoss,
             geometricHourlyMatrix = geomHourlyMatrix,
             geometricAnnualPotential = geomAnnualPotential,
             geometricAnnualReal = geomAnnualReal,
-            // Campos energéticos quedan en null hasta que C.2.2 conecte
-            // la IrradianceTimeSeries y el modo ENERGY_FULL los compute.
+            energyAnnualLossPercent = energyAnnualLossPercent,
+            energyMonthlyLossPercent = energyMonthlyLossPercent,
+            energyHourlyMatrix = energyHourlyMatrix,
+            annualEnergyPotentialKwhM2 = annualEnergyPotentialKwhM2,
+            annualEnergyRealKwhM2 = annualEnergyRealKwhM2,
+            monthlyEnergyPotentialKwhM2 = monthlyEnergyPotentialKwhM2,
+            monthlyEnergyRealKwhM2 = monthlyEnergyRealKwhM2,
             config = config
         )
     }
