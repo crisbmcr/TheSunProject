@@ -11,36 +11,39 @@ import java.time.ZoneOffset
  * Motor de cálculo de pérdidas por sombreado por integración geométrica
  * sobre todo el año.
  *
- * Algoritmo (v1 — geométrico puro, sin datos meteorológicos):
+ * ## Algoritmo (modo GEOMETRIC_ONLY, único disponible hasta C.2.1)
  *
  *   Para cada instante t en el año (paso configurable):
  *     1. Computar la posición del sol con NOAA (lat, lon, t_UTC).
  *     2. Si el sol está sobre el horizonte teórico:
  *        a. Computar cos(θ_inc) entre el sol y el panel.
  *        b. Si cos(θ_inc) > 0 (sol delante del panel):
- *           - Acumular cos(θ_inc) · Δt al "potencial".
+ *           - Acumular cos(θ_inc) · Δt al "potencial geométrico".
  *           - Consultar el HorizonProfile en el azimut solar.
- *           - Si alt_sol >= alt_horizonte: acumular también al "real".
+ *           - Si alt_sol ≥ alt_horizonte: acumular también al "real".
  *
- *   % pérdida anual = (1 − real / potencial) × 100
+ *   % pérdida geométrica anual = (1 − real / potencial) × 100
  *
- * Limitaciones de v1:
- *   - No usa irradiancia real (asume cada watt geométrico vale lo mismo).
- *   - No considera radiación difusa (sería relevante para sombras parciales).
- *   - No considera albedo del suelo.
+ * ## Modo ENERGY_FULL (C.2.2+)
  *
- * Estas tres limitaciones se levantan en C.2/v3 reemplazando el factor
- * "cos(θ_inc)" por la fórmula POA completa con DNI, DHI, GHI inyectados
- * desde un IrradianceTimeSeries.
+ * En C.2.2 se agrega el modo que además multiplica cada contribución por
+ * la POA real (DNI×cos(θ_inc) + DHI×FV_sky + GHI×albedo×FV_ground)
+ * usando una `IrradianceTimeSeries` inyectada. En la presente fase (C.2.0)
+ * el motor acepta [ShadingLossConfig.calculationMode] == `ENERGY_FULL` pero
+ * no produce métricas energéticas — solo loguea un warning y devuelve los
+ * campos `energy*` en `null`.
  *
- * Costo computacional: ~35.040 iteraciones por defecto (año no bisiesto,
- * paso 15 min). Cada iteración hace 1 cómputo NOAA + 1 lookup en el perfil
- * + trigonometría. En mobile rinde ~1-2 segundos. Apto para botón
- * "Calcular pérdidas" en UI.
+ * ## Costo computacional
  *
- * Thread safety: la instancia NO es thread-safe; se asume llamada desde
- * un único coroutine (Dispatchers.Default). Crear una instancia por
- * cálculo es barato.
+ * ~35.040 iteraciones por defecto (año no bisiesto, paso 15 min). Cada
+ * iteración hace 1 cómputo NOAA + 1 lookup en el perfil + trigonometría.
+ * En mobile rinde ~250-500 ms. Apto para botón "Calcular pérdidas" en UI
+ * sin loading prolongado.
+ *
+ * ## Thread safety
+ *
+ * La instancia NO es thread-safe; se asume llamada desde un único coroutine
+ * (Dispatchers.Default). Crear una instancia por cálculo es barato.
  */
 class ShadingLossCalculator(
     private val horizonProfile: HorizonProfile,
@@ -49,6 +52,17 @@ class ShadingLossCalculator(
 
     fun compute(): ShadingLossResult {
         val tStart = System.currentTimeMillis()
+
+        // C.2.0: el modo ENERGY_FULL todavía no está implementado en el motor.
+        // Si el caller lo solicita, advertimos por log pero seguimos con el
+        // cálculo geométrico para no romper la UI. C.2.2 cierra esto.
+        if (config.calculationMode == CalculationMode.ENERGY_FULL) {
+            Log.w(
+                TAG,
+                "ENERGY_FULL solicitado pero IrradianceTimeSeries no está conectada (pendiente C.2.2). " +
+                        "Devolviendo solo métricas geométricas; campos energy* quedarán en null."
+            )
+        }
 
         // Acumuladores: total mes y matriz mes × hora_local.
         val monthlyPotential = DoubleArray(12)
@@ -122,16 +136,16 @@ class ShadingLossCalculator(
             epoch += dtMillis
         }
 
-        // Reducciones finales.
-        val annualPotential = monthlyPotential.sum()
-        val annualReal = monthlyReal.sum()
-        val annualLoss = lossPercent(annualReal, annualPotential)
+        // Reducciones finales — todas en el dominio geométrico.
+        val geomAnnualPotential = monthlyPotential.sum()
+        val geomAnnualReal = monthlyReal.sum()
+        val geomAnnualLoss = lossPercent(geomAnnualReal, geomAnnualPotential)
 
-        val monthlyLoss = DoubleArray(12) { m ->
+        val geomMonthlyLoss = DoubleArray(12) { m ->
             lossPercent(monthlyReal[m], monthlyPotential[m])
         }
 
-        val hourlyLossMatrix = Array(12) { m ->
+        val geomHourlyMatrix = Array(12) { m ->
             DoubleArray(24) { h ->
                 lossPercent(matrixReal[m][h], matrixPotential[m][h])
             }
@@ -142,20 +156,23 @@ class ShadingLossCalculator(
             TAG,
             "compute() samples=$samples sunUp=$sunUpSamples " +
                     "inFront=$inFrontSamples blocked=$blockedSamples " +
-                    "annualLoss=${"%.2f".format(annualLoss)}% " +
+                    "geomAnnualLoss=${"%.2f".format(geomAnnualLoss)}% " +
                     "elapsed=${elapsed}ms " +
                     "lat=${"%.3f".format(config.latitudeDeg)} " +
                     "lon=${"%.3f".format(config.longitudeDeg)} " +
                     "panel=(γ=${"%.1f".format(config.panel.azimuthDeg)}, " +
-                    "β=${"%.1f".format(config.panel.tiltDeg)})"
+                    "β=${"%.1f".format(config.panel.tiltDeg)}) " +
+                    "mode=${config.calculationMode}"
         )
 
         return ShadingLossResult(
-            annualLossPercent = annualLoss,
-            monthlyLossPercent = monthlyLoss,
-            hourlyMatrix = hourlyLossMatrix,
-            annualPotentialIntegral = annualPotential,
-            annualRealIntegral = annualReal,
+            geometricAnnualLossPercent = geomAnnualLoss,
+            geometricMonthlyLossPercent = geomMonthlyLoss,
+            geometricHourlyMatrix = geomHourlyMatrix,
+            geometricAnnualPotential = geomAnnualPotential,
+            geometricAnnualReal = geomAnnualReal,
+            // Campos energéticos quedan en null hasta que C.2.2 conecte
+            // la IrradianceTimeSeries y el modo ENERGY_FULL los compute.
             config = config
         )
     }

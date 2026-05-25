@@ -171,14 +171,14 @@ class LossesActivity : AppCompatActivity() {
         lblPanel.text = "Panel óptimo: γ=${"%.0f".format(cfg.panel.azimuthDeg)}° (${azimuthLabel(cfg.panel.azimuthDeg)}), β=${"%.0f".format(cfg.panel.tiltDeg)}°"
 
         // --- Número grande: pérdida anual ---
-        lblAnnualLoss.text = "${"%.2f".format(result.annualLossPercent)}%"
-        lblAnnualLossSub.text = lossSubtitle(result.annualLossPercent)
+        lblAnnualLoss.text = "${"%.2f".format(result.geometricAnnualLossPercent)}%"
+        lblAnnualLossSub.text = lossSubtitle(result.geometricAnnualLossPercent)
 
         // --- Bar chart mensual ---
-        setupMonthlyBarChart(result.monthlyLossPercent)
+        setupMonthlyBarChart(result.geometricMonthlyLossPercent)
 
         // --- Heatmap mes × hora ---
-        heatmapView.setMatrix(result.hourlyMatrix)
+        heatmapView.setMatrix(result.geometricHourlyMatrix)
     }
 
     private fun setupMonthlyBarChart(monthly: DoubleArray) {
