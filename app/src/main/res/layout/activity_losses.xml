@@ -71,7 +71,45 @@
                 android:layout_marginBottom="16dp"
                 tools:text="Panel: γ=0° (N), β=24°" />
 
-            <!-- Tarjeta principal: pérdida anual -->
+            <!-- Toggle: modo de cálculo (Geométrico / Energético) -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Modo de cálculo"
+                android:textColor="#808080"
+                android:textSize="11sp"
+                android:layout_marginBottom="4dp" />
+
+            <RadioGroup
+                android:id="@+id/modeRadioGroup"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:layout_marginBottom="16dp">
+
+                <RadioButton
+                    android:id="@+id/rbModeGeometric"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Geométrico"
+                    android:textColor="#E0E0E0"
+                    android:textSize="13sp"
+                    android:buttonTint="#FF6B35"
+                    android:checked="true" />
+
+                <RadioButton
+                    android:id="@+id/rbModeEnergy"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Energético (PVGIS)"
+                    android:textColor="#E0E0E0"
+                    android:textSize="13sp"
+                    android:buttonTint="#FF6B35" />
+            </RadioGroup>
+
+            <!-- Tarjeta principal: pérdida anual del modo activo -->
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -79,14 +117,15 @@
                 android:padding="20dp"
                 android:gravity="center"
                 android:background="#1E2128"
-                android:layout_marginBottom="20dp">
+                android:layout_marginBottom="12dp">
 
                 <TextView
+                    android:id="@+id/lblAnnualLossTitle"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
-                    android:text="Pérdida geométrica anual"
                     android:textColor="#B0B0B0"
-                    android:textSize="13sp" />
+                    android:textSize="13sp"
+                    tools:text="Pérdida geométrica anual" />
 
                 <TextView
                     android:id="@+id/lblAnnualLoss"
@@ -109,8 +148,65 @@
                     tools:text="Pérdida moderada" />
             </LinearLayout>
 
+            <!-- Tarjeta secundaria: kWh perdidos (solo modo energético) -->
+            <LinearLayout
+                android:id="@+id/energyCard"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp"
+                android:gravity="center"
+                android:background="#1E2128"
+                android:layout_marginBottom="20dp"
+                android:visibility="gone">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Energía perdida por sombreado"
+                    android:textColor="#B0B0B0"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/lblEnergyLost"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:textColor="#FFB84D"
+                    android:textSize="32sp"
+                    android:textStyle="bold"
+                    android:layout_marginTop="4dp"
+                    tools:text="168.4 kWh/m²/año" />
+
+                <View
+                    android:layout_width="match_parent"
+                    android:layout_height="1dp"
+                    android:background="#33FFFFFF"
+                    android:layout_marginTop="12dp"
+                    android:layout_marginBottom="10dp" />
+
+                <TextView
+                    android:id="@+id/lblPoaPotential"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#E0E0E0"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace"
+                    tools:text="POA potencial:  2879.1 kWh/m²/año" />
+
+                <TextView
+                    android:id="@+id/lblPoaReal"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:textColor="#E0E0E0"
+                    android:textSize="12sp"
+                    android:fontFamily="monospace"
+                    android:layout_marginTop="2dp"
+                    tools:text="POA real:       2710.7 kWh/m²/año" />
+            </LinearLayout>
+
             <!-- Gráfico mensual -->
             <TextView
+                android:id="@+id/lblMonthlyTitle"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="Pérdida por mes"
@@ -141,15 +237,27 @@
                 android:layout_height="wrap_content"
                 android:layout_marginBottom="24dp" />
 
-            <!-- Nota metodológica -->
+            <!-- Footer con metadata del dataset (solo modo energético) -->
             <TextView
+                android:id="@+id/lblDatasetFooter"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Método: integración geométrica horaria (paso 15 min) usando NOAA Solar Calculator y el perfil de horizonte detectado. v1 — no incluye datos meteorológicos reales."
+                android:textColor="#909090"
+                android:textSize="11sp"
+                android:layout_marginBottom="8dp"
+                android:visibility="gone"
+                tools:text="Datos: PVGIS-ERA5 TMY (años 2005-2023) | Elevación: 4003 m" />
+
+            <!-- Nota metodológica (texto dinámico según modo) -->
+            <TextView
+                android:id="@+id/lblMethodologyNote"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
                 android:textColor="#808080"
                 android:textSize="11sp"
                 android:textStyle="italic"
-                android:layout_marginBottom="24dp" />
+                android:layout_marginBottom="24dp"
+                tools:text="Método: integración geométrica horaria (paso 15 min)..." />
 
             <!-- Botón volver -->
             <Button

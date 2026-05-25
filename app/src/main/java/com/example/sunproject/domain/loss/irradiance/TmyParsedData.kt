@@ -13,7 +13,7 @@ package com.example.sunproject.domain.loss.irradiance
  * exactamente por eso: para no acoplar el almacenamiento al formato
  * de descarga.
  */
-internal object TmyParsedData {
+object TmyParsedData {
 
     /** Cantidad de muestras horarias en un año no bisiesto. */
     const val HOURS_PER_YEAR = 8760
