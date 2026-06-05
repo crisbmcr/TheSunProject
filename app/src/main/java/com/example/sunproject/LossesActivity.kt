@@ -19,6 +19,7 @@ import com.example.sunproject.data.storage.JsonSessionStore
 import com.example.sunproject.domain.horizon.HorizonProfile
 import com.example.sunproject.domain.horizon.HorizonProfileStore
 import com.example.sunproject.domain.loss.CalculationMode
+import com.example.sunproject.domain.loss.DiffuseModel
 import com.example.sunproject.domain.loss.PanelOrientation
 import com.example.sunproject.domain.loss.ShadingLossCalculator
 import com.example.sunproject.domain.loss.ShadingLossConfig
@@ -369,7 +370,12 @@ class LossesActivity : AppCompatActivity() {
             longitudeDeg = lon,
             panel = panel,
             timezoneOffsetHours = timezoneOffset,
-            calculationMode = CalculationMode.ENERGY_FULL
+            calculationMode = CalculationMode.ENERGY_FULL,
+            // Hay-Davies elegido como modelo default para uso global del
+            // motor, basado en el análisis multi-sitio (N=10) contra PVGIS
+            // PVcalc: mejor MBE (-2.18% vs -4.13% del isotrópico) y mejor
+            // MAE (3.82% vs 4.59%). Ver DiffuseModel.kt para detalles.
+            diffuseModel = DiffuseModel.HAY_DAVIES
         )
 
         val result = withContext(Dispatchers.Default) {

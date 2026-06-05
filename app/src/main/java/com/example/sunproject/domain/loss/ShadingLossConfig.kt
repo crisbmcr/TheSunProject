@@ -78,7 +78,20 @@ data class ShadingLossConfig(
      *  - Salar o desierto muy brillante:     0.30 - 0.35.
      *  - Suelo agrícola húmedo o pasto:      0.10 - 0.15.
      */
-    val albedo: Double = DEFAULT_ALBEDO
+    val albedo: Double = DEFAULT_ALBEDO,
+
+    /**
+     * Modelo de transposición de difusa. Solo aplica cuando
+     * [calculationMode] == [CalculationMode.ENERGY_FULL]. Ver [DiffuseModel]
+     * para la justificación de cada opción.
+     *
+     * Default [DiffuseModel.ISOTROPIC] por compatibilidad histórica
+     * (Liu-Jordan, comportamiento previo a C.2.5). El call site canónico
+     * en `LossesActivity` usa [DiffuseModel.HAY_DAVIES] explícitamente,
+     * basado en el análisis multi-sitio que mostró mejor MBE y MAE
+     * globales (ver doc del enum).
+     */
+    val diffuseModel: DiffuseModel = DiffuseModel.ISOTROPIC
 ) {
     init {
         require(latitudeDeg in -90.0..90.0) {
@@ -115,7 +128,7 @@ data class ShadingLossConfig(
         get() = (365 * 24 * 60) / timeStepMinutes
 
     companion object {
-        const val DEFAULT_YEAR = 2023
+        const val DEFAULT_YEAR = 2026
         const val DEFAULT_TIME_STEP_MIN = 15
         const val DEFAULT_ALBEDO = 0.20
 

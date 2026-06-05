@@ -7,7 +7,9 @@ import com.example.sunproject.domain.solar.SolarGeometry
 import java.time.Instant
 import java.time.LocalDateTime
 import java.time.ZoneOffset
+import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.sin
 
 /**
  * Motor de cálculo de pérdidas por sombreado por integración anual.
@@ -230,9 +232,64 @@ class ShadingLossCalculator(
                 val directRealWm2 =
                     if (cosInc > 0.0 && !isBlocked) sample.dniWm2 * cosInc else 0.0
 
-                // Difusa y reflejada: invariantes al bloqueo del horizonte
-                // en este modelo (v2). Iguales en potencial y real.
-                val diffuseWm2 = sample.dhiWm2 * fvSky
+                // Difusa según el modelo de transposición elegido.
+                //
+                // Ambos modelos producen IGUAL difusa potencial y real
+                // (la difusa no se bloquea por el horizonte en v2 del motor,
+                // ni la isotrópica ni la circumsolar de Hay-Davies — ver
+                // DiffuseModel.kt para la justificación).
+                val diffuseWm2: Double = when (config.diffuseModel) {
+                    DiffuseModel.ISOTROPIC -> {
+                        // Liu-Jordan 1963: difusa proyectada con factor de
+                        // vista del cielo, cielo isotrópico.
+                        sample.dhiWm2 * fvSky
+                    }
+                    DiffuseModel.HAY_DAVIES -> {
+                        // Hay-Davies 1980: separa la difusa en componente
+                        // circumsolar (tratada como directa, proyectada
+                        // con rb) e isotrópica residual.
+                        //
+                        // Referencia: Duffie & Beckman 2013 ec. 2.16.7
+                        // Validación: multi-sitio N=10 contra PVGIS PVcalc.
+
+                        // I_0n = irradiancia extraterrestre normal del día
+                        // (W/m²). Spencer 1971 con G_SC = 1361 W/m².
+                        val n = localDt.dayOfYear
+                        val I0n = G_SC * (1.0 + 0.033 * cos(2.0 * PI * n / 365.0))
+
+                        // cos(θ_z) = sin(altitudeSolar). En este punto sun
+                        // está arriba del horizonte (sunUp), entonces
+                        // altitudeDeg > 0 y cosZen > 0.
+                        val cosZen = sin(Math.toRadians(sun.altitudeDeg))
+
+                        // A_i = índice de anisotropía. Acotado a [0, 1] por
+                        // seguridad (DNI puede teóricamente exceder I_0n en
+                        // condiciones de refracción atmosférica extrema).
+                        val Ai = if (I0n > 0.0) {
+                            (sample.dniWm2 / I0n).coerceIn(0.0, 1.0)
+                        } else 0.0
+
+                        // r_b = razón de transposición de la directa para
+                        // la fracción circumsolar. Se evita dividir cuando
+                        // cosZen es muy chico (sol cerca del horizonte) para
+                        // no amplificar errores numéricos. Threshold 0.01
+                        // ≈ 89.4° de altitud cenital (sol a 0.6° del
+                        // horizonte teórico).
+                        val rb = if (cosZen > 0.01) {
+                            maxOf(0.0, cosInc) / cosZen
+                        } else 0.0
+
+                        // Difusa total = circumsolar + isotrópica residual.
+                        // Cuando A_i = 0 (sin DNI), se reduce exactamente al
+                        // isotrópico. Cuando A_i = 1 (DNI = extraterrestre,
+                        // cielo extremadamente limpio), toda la difusa se
+                        // trata como directa.
+                        sample.dhiWm2 * (Ai * rb + (1.0 - Ai) * fvSky)
+                    }
+                }
+
+                // Reflejada: igual en ambos modelos (no afecta al modelo
+                // de difusa, depende solo de GHI y del albedo del suelo).
                 val reflectedWm2 = sample.ghiWm2 * albedo * fvGround
 
                 val poaPotentialWm2 = directPotentialWm2 + diffuseWm2 + reflectedWm2
@@ -367,5 +424,13 @@ class ShadingLossCalculator(
 
     companion object {
         private const val TAG = "ShadingLossCalc"
+
+        /**
+         * Constante solar (W/m²). Valor SI recomendado por la WMO desde 2015.
+         * Usada solo por el modelo Hay-Davies para computar la irradiancia
+         * extraterrestre normal del día (necesaria para el índice de
+         * anisotropía A_i = DNI / I_0n).
+         */
+        private const val G_SC = 1361.0
     }
 }
