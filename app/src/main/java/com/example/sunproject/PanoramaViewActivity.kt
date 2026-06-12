@@ -16,6 +16,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.sunproject.data.storage.JsonSessionStore
 import com.example.sunproject.domain.atlas.AtlasProjector
+import com.example.sunproject.domain.horizon.HorizonProfileStore
 import com.example.sunproject.domain.render3d.PanoramaRenderer
 import com.example.sunproject.domain.render3d.abacus.SolarChartMesh3D
 import com.example.sunproject.domain.render3d.camera.GyroCameraController
@@ -48,6 +49,7 @@ class PanoramaViewActivity : AppCompatActivity() {
     // sólo desde el main thread, no necesita sincronización.
     private var hudBitmapState: String = "cargando..."
     private var hudChartState: String = "cargando..."
+    private var hudProfileState: String = "cargando..."
     private var hudYawCorrectionDeg: Float = 0f
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -155,6 +157,31 @@ class PanoramaViewActivity : AppCompatActivity() {
             hudChartState = "cargado"
             renderHud()
         }
+
+        // === Carga del perfil de obstrucción del horizonte en background, en
+        // paralelo al bitmap y al ábaco. Solo se carga si ya existe en disco
+        // (lo genera AnalysisActivity con el detector). Si no existe, el overlay
+        // no aparece y el panorama 3D sigue siendo usable — mismo criterio
+        // defensivo que el ábaco.
+        lifecycleScope.launch {
+            val profile = withContext(Dispatchers.IO) {
+                val atlasDir = File(panoramaPath).parentFile ?: return@withContext null
+                runCatching { HorizonProfileStore.load(atlasDir) }.getOrNull()
+            }
+
+            if (profile == null) {
+                Log.i(TAG, "No hay horizon_profile.json en disco — overlay de obstáculos omitido.")
+                hudProfileState = "no generado"
+                renderHud()
+                return@launch
+            }
+
+            Log.i(TAG, "Perfil de horizonte cargado — ${profile.azimuthBuckets} buckets")
+            newRenderer.setHorizonProfile(profile)
+
+            hudProfileState = "cargado"
+            renderHud()
+        }
     }
 
     override fun onResume() {
@@ -185,7 +212,7 @@ class PanoramaViewActivity : AppCompatActivity() {
         }
         hudText.text = "Panorama 3D — $hudBitmapState\n" +
                 "modo: giroscopio  |  $correctionStr\n" +
-                "ábaco: $hudChartState"
+                "ábaco: $hudChartState  |  perfil: $hudProfileState"
     }
 
     // ============================================================
