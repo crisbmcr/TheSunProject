@@ -30,6 +30,10 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
     // externa, los recursos se generan adentro en el primer draw).
     private val worldGrid = com.example.sunproject.domain.render3d.grid.WorldGridOverlay3D()
 
+    // Overlay del perfil de obstrucción del horizonte (banda obstruida + cresta).
+    // Se dibuja solo si se le inyecta un HorizonProfile vía setHorizonProfile().
+    private val horizonOverlay = com.example.sunproject.domain.render3d.horizon.HorizonObstacleOverlay3D()
+
     private var program = 0
 
     private var aPositionLoc = -1
@@ -107,6 +111,7 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
         // recreó y los handles viejos (program, VBOs, texturas) son inválidos.
         solarOverlay.onSurfaceCreated()
         worldGrid.onSurfaceCreated()
+        horizonOverlay.onSurfaceCreated()
 
         Log.i(TAG, "onSurfaceCreated OK — program=$program")
     }
@@ -177,6 +182,12 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
         // asumimos acá entre frames (depth ON, blend OFF).
         solarOverlay.draw(mvpMatrix)
 
+        // Perfil de obstrucción del horizonte (banda + cresta). Después del
+        // ábaco para que se vea cuándo la trayectoria solar entra en la zona
+        // obstruida; antes del worldGrid para que las etiquetas de azimut
+        // queden encima.
+        horizonOverlay.draw(mvpMatrix)
+
         // Referencias del mundo (horizonte + etiquetas azimut). Se dibuja
         // al final para que las etiquetas queden encima de cualquier otra
         // capa.
@@ -210,6 +221,16 @@ class PanoramaRenderer : GLSurfaceView.Renderer {
      */
     fun setSolarChartMesh(mesh: com.example.sunproject.domain.render3d.abacus.SolarChartMesh3D) {
         solarOverlay.setMesh(mesh)
+    }
+
+    /**
+     * Inyecta el perfil de obstrucción del horizonte para dibujar la banda
+     * obstruida + cresta sobre la esfera. Puede llamarse desde cualquier
+     * thread; el upload GL ocurre en el render thread durante el siguiente
+     * onDrawFrame. Pasar null elimina el overlay.
+     */
+    fun setHorizonProfile(profile: com.example.sunproject.domain.horizon.HorizonProfile?) {
+        horizonOverlay.setProfile(profile)
     }
 
     private fun updateProjection() {
