@@ -2275,35 +2275,17 @@ class CaptureActivity : AppCompatActivity(), SensorEventListener {
             .setTitle("Reproyectar sesión")
             .setItems(names) { _, which ->
                 val selected = sorted[which]
-                showReprojectFlagDialog(selected)
+                // MAD per-frame ON directo: el algoritmo es robusto a outliers
+                // por diseño y degrada con gracia a legacy si <3 frames tienen
+                // absAzimuth (computePerFrameYawOverrides devuelve null). No hay
+                // escenario donde OFF supere a ON, así que no se pregunta más.
+                runReproject(selected, forcePerFrameYaw = true)
             }
             .setNegativeButton("Cancelar", null)
             .show()
     }
 
-    /**
-     * Sub-diálogo: elegir si MAD per-frame está ON, OFF, o usar el default
-     * de la constante USE_PER_FRAME_YAW_CORRECTION del archivo.
-     */
-    private fun showReprojectFlagDialog(targetSessionDir: File) {
-        val options = arrayOf(
-            "MAD per-frame ON",
-            "MAD per-frame OFF",
-            "Default (constante del archivo)"
-        )
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Modo MAD para ${targetSessionDir.name}")
-            .setItems(options) { _, which ->
-                val flag: Boolean? = when (which) {
-                    0 -> true
-                    1 -> false
-                    else -> null
-                }
-                runReproject(targetSessionDir, flag)
-            }
-            .setNegativeButton("Cancelar", null)
-            .show()
-    }
+
 
     /**
      * Ejecuta la reproyección en el cameraExecutor (mismo thread pool
